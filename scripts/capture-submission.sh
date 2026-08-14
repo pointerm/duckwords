@@ -128,7 +128,7 @@ if [[ "$#" -ne 0 ]]; then
 fi
 if [[ "${live_reddit_api_approved}" != "true" || -z "${live_reddit_client_id}" ||
   -z "${live_reddit_client_secret}" || -z "${live_reddit_user_agent}" ]]; then
-  fail "explicit Reddit approval confirmation and all credential environment variables are required"
+  fail "REDDIT_API_ACCESS_APPROVED=true and all credential environment variables are required"
 fi
 
 cd "${repository_root}"

@@ -646,6 +646,27 @@ assert_quarantined_bundle() {
     "${case_name}: retained lock candidate"
 }
 
+# Bash privileged mode consistently refuses to import exported functions, but
+# versions differ in what happens to their encoded BASH_FUNC_* environment
+# entries. Bash 3.2 leaves those invalid shell-variable names visible so the
+# wrapper rejects them; Bash 5 removes them before the wrapper starts. Both
+# outcomes preserve the same security boundary, so detect the interpreter's
+# behavior and assert the corresponding fail-closed or successful path below.
+privileged_bash_preserves_exported_function_environment() {
+  (
+    capture_test_privileged_probe() { return 0; }
+    export -f capture_test_privileged_probe
+    /bin/bash -p -c '
+      while IFS= read -r environment_name; do
+        if [[ "${environment_name}" == "BASH_FUNC_capture_test_privileged_probe%%" ]]; then
+          exit 0
+        fi
+      done < <(compgen -e)
+      exit 1
+    '
+  )
+}
+
 test_success() {
   setup_case success 0
   run_wrapper 0
@@ -671,20 +692,29 @@ test_xtrace_secret_boundary() {
 
 test_exported_function_boundary() {
   setup_case exported-function-boundary 0
-  run_wrapper 2 false true
-  assert_path_absent "${case_repo}/artifacts/submission" \
-    'exported function publication'
-  assert_capture_lock_absent
-  assert_event_count 0 "go-env:${expected_go_version}" \
-    'exported function toolchain suppression'
-  assert_event_count 0 "live:arguments-verified" \
-    'exported function live suppression'
+  if privileged_bash_preserves_exported_function_environment; then
+    run_wrapper 2 false true
+    assert_path_absent "${case_repo}/artifacts/submission" \
+      'exported function publication'
+    assert_capture_lock_absent
+    assert_event_count 0 "go-env:${expected_go_version}" \
+      'exported function toolchain suppression'
+    assert_event_count 0 "live:arguments-verified" \
+      'exported function live suppression'
+    assert_contains "${case_state}/wrapper.stderr" \
+      'ambient environment contains an unsupported variable name' \
+      'exported function diagnostic'
+  else
+    run_wrapper 0 false true
+    assert_verified_preflight
+    assert_published_bundle 0
+    assert_contains "${case_state}/wrapper.stderr" \
+      'published one-run evidence at artifacts/submission (application exit 0)' \
+      'exported function safe-publication diagnostic'
+  fi
   assert_event_count 0 "live:exported-function-leaked" \
     'exported function live-child boundary'
-  assert_contains "${case_state}/wrapper.stderr" \
-    'ambient environment contains an unsupported variable name' \
-    'exported function diagnostic'
-  printf '%s\n' 'ok - inherited exported functions cannot intercept preflight or reach helpers'
+  printf '%s\n' 'ok - privileged Bash strips or rejects inherited exported functions'
 }
 
 test_invalid_environment_name() {

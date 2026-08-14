@@ -936,10 +936,10 @@ func parseOutcome(record logRecord) (OutcomeManifest, error) {
 	if err != nil {
 		return OutcomeManifest{}, err
 	}
-	// The current runner deliberately has no trusted skip signal: HTTP 403/404 are
-	// failures, not proof of deletion. Accepting a skipped record here would let a
-	// fabricated bundle claim a state the reviewed binary cannot produce.
-	status, err := enumField(record, "status", "completed", "failed", "incomplete")
+	// skipped is admitted only under the exact contract in validOutcomeFailure: the
+	// comments endpoint reported not_found, which is the one signal that proves a post
+	// is absent. A 403, or a 404 from an expansion endpoint, remains a failure.
+	status, err := enumField(record, "status", "completed", "skipped", "failed", "incomplete")
 	if err != nil {
 		return OutcomeManifest{}, err
 	}
@@ -997,6 +997,13 @@ func validOutcomeFailure(outcome OutcomeManifest) bool {
 	if outcome.Status == "completed" {
 		return true
 	}
+	// A skipped post is provably absent. That is proven either by HTTP 404 on the
+	// comments endpoint or by a validated empty post listing, which is a 200 response
+	// and therefore carries no HTTP status of its own.
+	if outcome.Status == "skipped" {
+		return outcome.Operation == "comments" && outcome.ErrorClass == "not_found" &&
+			(outcome.HTTPStatus == 404 || outcome.HTTPStatus == 0)
+	}
 	if outcome.Operation == "" {
 		return outcome.Status == "incomplete" && outcome.ErrorClass == "resource_limit" && outcome.HTTPStatus == 0
 	}
@@ -1004,7 +1011,9 @@ func validOutcomeFailure(outcome OutcomeManifest) bool {
 	case "forbidden":
 		return outcome.HTTPStatus == 403
 	case "not_found":
-		return outcome.HTTPStatus == 404
+		// The runner records an absent post as skipped, so a not_found failure can
+		// only come from an expansion endpoint that could not complete the tree.
+		return outcome.Status == "failed" && outcome.Operation != "comments" && outcome.HTTPStatus == 404
 	case "rate_limited":
 		return outcome.HTTPStatus == 429
 	case "server":
@@ -1304,7 +1313,9 @@ func reconcile(parsed parsedLog, resultWords []resultWord, exitCode int, finaliz
 	if (exitCode == 3) != parsed.summary.partial || (exitCode == 0) != !parsed.summary.partial {
 		return fmt.Errorf("%w: exit code and terminal status differ", ErrInvalidLog)
 	}
-	if parsed.summary.partial != (summary.PostsSkipped+summary.PostsFailed+summary.PostsIncomplete > 0) || summary.PostsSkipped != 0 {
+	// Skipped posts are provably absent and cannot be counted, so they never make a
+	// run partial. Only failed and incomplete posts withhold countable data.
+	if parsed.summary.partial != (summary.PostsFailed+summary.PostsIncomplete > 0) {
 		return fmt.Errorf("%w: terminal completeness status contradicts outcomes", ErrInvalidLog)
 	}
 	if summary.PostsCompleted+summary.PostsSkipped+summary.PostsFailed+summary.PostsIncomplete != summary.PostsTotal {
@@ -1907,16 +1918,27 @@ func boolField(record logRecord, key string) (bool, error) {
 	return value, nil
 }
 
+// durationField reads a canonical Go duration string such as "20s" or "1m30s". The
+// logging sink emits that form in both encodings, so the evidence log carries an
+// explicit unit rather than a bare integer whose scale a reader has to assume.
 func durationField(record logRecord, key string, minimum, maximum time.Duration) (time.Duration, error) {
 	raw, exists := record[key]
 	if !exists {
 		return 0, errors.New("missing duration field")
 	}
-	var nanoseconds int64
-	if err := json.Unmarshal(raw, &nanoseconds); err != nil {
+	var text string
+	if err := json.Unmarshal(raw, &text); err != nil {
 		return 0, errors.New("invalid duration field")
 	}
-	duration := time.Duration(nanoseconds)
+	duration, err := time.ParseDuration(text)
+	if err != nil {
+		return 0, errors.New("invalid duration field")
+	}
+	// Reject a value that does not round-trip so an unnormalized or padded encoding
+	// cannot smuggle a second representation of the same instant into the evidence.
+	if duration.String() != text {
+		return 0, errors.New("non-canonical duration field")
+	}
 	if duration < minimum || duration > maximum {
 		return 0, errors.New("duration outside limit")
 	}
