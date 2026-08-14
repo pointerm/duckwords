@@ -14,8 +14,9 @@ full assignment capture.
 - `synthetic-output.json` is the exact pretty-printed stdout produced by the CLI.
 - `synthetic-log.normalized.ndjson` is the structured stderr lifecycle log with only
   nondeterministic `time`, `duration`, `throttle_wait`, `throttle_waits`, `goos`, and
-  `goarch` fields removed. Object keys are sorted to make the sample reproducible
-  across supported platforms.
+  `goarch` fields removed. Concurrent `http_attempt` progress records are sorted by
+  post and operation, and object keys are sorted, so the sample is reproducible
+  across supported platforms without changing the raw completion-order log.
 
 The raw stdout and unmodified timestamped log are regenerated under the ignored
 `artifacts/review/synthetic-demo/` directory.

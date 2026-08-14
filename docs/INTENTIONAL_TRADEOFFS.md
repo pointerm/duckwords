@@ -57,15 +57,23 @@ could add a versioned checkpoint store, but that is unnecessary for 200 bounded 
 
 The implementation is intentionally narrow: one fixed public `old.reddit.com` JSON
 origin, the assignment's comment pages, and allowlisted input hosts. It does not
-support OAuth, browser cookies, user-login flows, arbitrary Reddit
-endpoints, arbitrary remote input origins, posting, moderation actions, or streaming.
+support OAuth, user-login flows, arbitrary Reddit endpoints, arbitrary remote input
+origins, posting, moderation actions, or streaming. The one exception is an explicit,
+local-only fallback that can replay the reviewer's own temporary browser cookie to
+the same fixed Reddit origin, optionally with a small allowlist of matching browser
+headers. It is disabled by default and is not a general-purpose authenticated client.
 Local input files remain available for deterministic and offline use.
 
-The cookie-free public-JSON choice follows the assignment owner's explicit direction
-and keeps the run reproducible and independent of a personal browser session. Current
-Reddit access policy may return `302` or `403` for that request profile, making a live
-capture impossible from some networks. DuckWords reports that limitation instead of
-replaying browser cookies or presenting synthetic output as live evidence.
+The cookie-free public-JSON default and canonical capture follow the assignment
+owner's explicit direction and keep submission evidence reproducible and independent
+of a personal browser session. Current Reddit access policy may return `302` or `403`
+for that request profile, making a live capture impossible from some networks. A
+reviewer may opt into the browser-session fallback for local diagnosis, but that run
+is authenticated rather than anonymous and the canonical capture rejects it. The
+cookie is supplied directly through the process environment, is never logged or
+persisted, and response `Set-Cookie` values are ignored; the session may therefore
+expire without being refreshed. Synthetic and browser-session output must not be
+presented as cookie-free live evidence.
 
 ## 8. Rich-text interpretation
 

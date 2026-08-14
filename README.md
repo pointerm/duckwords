@@ -62,16 +62,19 @@ is not a substitute for the assignment's 200-post application log.
 
 ### 2. Attempt the live assignment run
 
-The assignment owner directed this submission to use cookie-free `GET` requests to
-the fixed `https://old.reddit.com/.../.json` renderer rather than the OAuth Data API.
-DuckWords retains that narrow assignment-specific contract; this is not a claim that
-anonymous JSON access is currently supported or available from every network.
+The assignment owner directed the canonical submission to use cookie-free `GET`
+requests to the fixed `https://old.reddit.com/.../.json` renderer rather than the
+OAuth Data API. DuckWords retains that narrow assignment-specific default; this is
+not a claim that anonymous JSON access is currently supported or available from
+every network.
 
 On 2026-08-14 the candidate's cookie-free CLI received HTTP `302` redirects to
 `/login` or HTTP `403` HTML responses for the supplied URLs. An existing browser
 profile returned `200 application/json` only while sending Reddit session state, so
-that did not demonstrate anonymous access. DuckWords deliberately does not accept or
-replay browser cookies, login credentials, or tokens.
+that did not demonstrate anonymous access. The default and canonical capture paths
+do not send browser cookies, login credentials, or tokens. An explicitly enabled,
+local-only browser-session fallback is documented below for a reviewer who wants to
+try their own temporary session; it is not canonical evidence.
 
 Reddit's current [Data API Wiki](https://support.reddithelp.com/hc/en-us/articles/16160319875092-Reddit-Data-API-Wiki)
 states that traffic without OAuth or login credentials will be blocked. Reddit has
@@ -85,7 +88,16 @@ synthetic output must never be presented as live assignment evidence.
 
 ```bash
 go run ./cmd/duckwords > result.json 2> application.log
+
+# In another terminal, follow sanitized request progress as it is written.
+tail -f application.log
 ```
+
+After each physical Reddit HTTP attempt completes, the log immediately receives an
+`event=http_attempt` record with only the operation, post ID, one-based attempt,
+success/failure, status, and duration. These progress records use worker completion
+order. Authoritative `post_outcome` records remain source-ordered and are emitted at
+the end of processing.
 
 The binary supplies a descriptive User-Agent automatically. A reviewer may override
 it with a printable 8–256 byte value, but this is optional and non-secret:
@@ -93,6 +105,51 @@ it with a printable 8–256 byte value, but this is optional and non-secret:
 ```bash
 export REDDIT_USER_AGENT='duckwords/0.2.0 (+https://github.com/pointerm/duckwords)'
 ```
+
+#### Optional local browser-session fallback
+
+If cookie-free access is blocked, a reviewer may optionally retry the ordinary local
+CLI with their **own temporary Reddit browser session**. This fallback is disabled by
+default and is enabled only by a valid, non-empty `REDDIT_BROWSER_COOKIE`; an empty
+value is rejected. It is an authenticated browser-session request, not OAuth, not
+Reddit's public Data API, and not proof that anonymous `.json` access works.
+`make submission-capture` rejects this mode, so its output cannot be published as
+the canonical evidence bundle.
+
+Avoid placing the cookie in a command, shell history, `.env` file, repository,
+application log, issue, or message. Build before introducing the cookie so the Go
+toolchain never inherits it. Then, in a Bash shell, read it interactively, export it
+only for this run, and clear it immediately afterwards:
+
+```bash
+make build
+
+read -rsp 'Paste only your own temporary Reddit Cookie header value: ' REDDIT_BROWSER_COOKIE
+printf '\n'
+export REDDIT_BROWSER_COOKIE
+
+# Optional: copy matching non-secret values from the same browser request.
+export REDDIT_USER_AGENT='<your browser User-Agent header>'
+export REDDIT_BROWSER_ACCEPT_LANGUAGE='<your browser Accept-Language header>'
+export REDDIT_BROWSER_SEC_CH_UA='<your browser Sec-CH-UA header>'
+export REDDIT_BROWSER_SEC_CH_UA_MOBILE='?0' # only ?0 or ?1
+export REDDIT_BROWSER_SEC_CH_UA_PLATFORM='<your browser Sec-CH-UA-Platform header>'
+
+bin/duckwords > result.json 2> application.log
+
+unset REDDIT_BROWSER_COOKIE REDDIT_USER_AGENT REDDIT_BROWSER_ACCEPT_LANGUAGE
+unset REDDIT_BROWSER_SEC_CH_UA REDDIT_BROWSER_SEC_CH_UA_MOBILE
+unset REDDIT_BROWSER_SEC_CH_UA_PLATFORM
+```
+
+Environment variables are not a secret store: the cookie remains in this shell until
+it is unset and may be visible to same-user process inspection, crash diagnostics, or
+other tooling while DuckWords runs. Use only a session you are authorized to use,
+never reuse or share somebody else's cookie, and sign out/revoke the session when the
+test is finished. Browser sessions may expire at any time. DuckWords sends the
+configured cookie only to its fixed Reddit request origin, never logs it, keeps no
+cookie jar, and deliberately ignores response `Set-Cookie` values, so it neither
+refreshes nor persists the session.
 
 This `.json` renderer is the assignment's public-page access contract, not a claim
 that anonymous access is part of Reddit's current supported OAuth Data API. Reddit
@@ -126,9 +183,11 @@ make reddit-smoke LIVE_REDDIT_SMOKE=true LIVE_POSTS_FILE=/tmp/duckwords-one-post
 
 The smoke is deliberately opt-in and never runs in CI. It uses one worker, 0.5
 requests/second, strict completeness, and writes only ignored output under
-`artifacts/review/reddit-smoke/`. If it returns `302` or `403`, stop: do not attempt
-the canonical capture and do not work around the restriction with browser
-credentials, a proxy, or a hidden endpoint override.
+`artifacts/review/reddit-smoke/`. It strips every `REDDIT_BROWSER_*` value so a stale
+session cannot make this cookie-free check look successful. If it returns `302` or
+`403`, stop: do not attempt the canonical capture. The optional personal-session
+fallback above may be used only as a local authenticated diagnostic; never present it
+as cookie-free canonical evidence and do not use a proxy or hidden endpoint override.
 
 For the final candidate, build from a clean commit and run the guarded one-shot
 capture with the same metadata values in both commands:
@@ -154,7 +213,9 @@ docker run --rm \
   duckwords:review
 ```
 
-Pass `-e REDDIT_USER_AGENT` only when using the optional override.
+Pass `-e REDDIT_USER_AGENT` only when using the optional non-secret override. The
+direct-environment browser-session fallback is intentionally documented for local CLI
+use only; do not place a session cookie in an image, Compose file, or Docker command.
 
 **Requirements:** Go 1.26.6 (`make toolchain-check` verifies it); `jq` for synthetic
 log normalization; Docker for container parity and the secret-scan target.
@@ -175,15 +236,19 @@ log normalization; Docker for container parity and the secret-scan target.
 | `--request-timeout D` | 20s | One HTTP attempt. |
 | `--timeout D` | 30m | Whole run. |
 | `--max-retries N` | 3 | Transient retries per request. |
-| `--retry-budget D` | 45s | Total retry time per logical request. |
+| `--retry-budget D` | 45s | HTTP-attempt and retry-backoff time per logical request; shared rate-limit queueing is bounded by `--timeout`. |
 | `--failure-mode MODE` | best-effort | `best-effort` keeps going; `strict` aborts on the first failed post. |
 | `--log-level LEVEL` | info | debug, info, warn, error. |
 | `--log-format FORMAT` | text | text or json (NDJSON). |
 | `--version`, `--help` | | |
 
-DuckWords has no Reddit credential input. The only Reddit environment setting is the
-optional non-secret `REDDIT_USER_AGENT`; logs record only whether it was overridden
-and its SHA-256 digest, never the raw value.
+The default and canonical modes have no Reddit credential input. The optional
+`REDDIT_USER_AGENT` override is non-secret; logs record only whether it was overridden
+and its SHA-256 digest, never the raw value. Local browser-session fallback is enabled
+only by `REDDIT_BROWSER_COOKIE`; `REDDIT_BROWSER_ACCEPT_LANGUAGE`,
+`REDDIT_BROWSER_SEC_CH_UA`, `REDDIT_BROWSER_SEC_CH_UA_MOBILE`, and
+`REDDIT_BROWSER_SEC_CH_UA_PLATFORM` optionally supply matching browser headers.
+These values are accepted only through the environment, never as flags.
 
 | Exit code | Meaning | JSON on stdout |
 |---:|---|---|
