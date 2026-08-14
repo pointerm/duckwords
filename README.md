@@ -243,8 +243,8 @@ CI runs the same gates plus a secret scan and container parity on every push.
 - [docs/INTENTIONAL_TRADEOFFS.md](docs/INTENTIONAL_TRADEOFFS.md) — features and
   infrastructure deliberately kept outside the assignment scope, with the reason for
   each decision.
-- [BENCHMARKS.md](BENCHMARKS.md) — reproducible local text fixtures, measured
-  throughput, allocations, and interpretation limits.
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — what the word-counting path costs, why it is not
+  the bottleneck, and how it extrapolates to larger corpora.
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) — the single dependency
   (`golang.org/x/sync`) and its license.
 - [artifacts/](artifacts) — `review/` holds local, reproducible diagnostics;
