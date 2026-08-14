@@ -1,4 +1,4 @@
-package main
+package runlog
 
 import (
 	"strings"
@@ -81,7 +81,7 @@ func TestSafeLogBuildIdentityBoundsEveryField(t *testing.T) {
 	t.Parallel()
 
 	identity := safeLogBuildIdentity(buildinfo.Info{
-		Version:   strings.Repeat("v", maxSourceVersionBytes+1),
+		Version:   strings.Repeat("v", maxVersionLogBytes+1),
 		Commit:    strings.Repeat("a", maxCommitLogBytes+1),
 		BuildDate: "2026-08-13T12:00:00+03:00",
 		GoVersion: strings.Repeat("g", maxGoVersionLogBytes+1),

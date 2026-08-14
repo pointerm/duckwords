@@ -1,4 +1,4 @@
-package main
+package production
 
 import (
 	"strings"
@@ -17,6 +17,11 @@ const (
 // which belongs only on OAuth and Reddit API requests.
 func sourceDownloadUserAgent() string {
 	return sourceDownloadUserAgentForVersion(buildinfo.Current().Version)
+}
+
+// SourceDownloadUserAgent returns the sanitized identity used for public input downloads.
+func SourceDownloadUserAgent() string {
+	return sourceDownloadUserAgent()
 }
 
 func sourceDownloadUserAgentForVersion(version string) string {

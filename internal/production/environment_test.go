@@ -1,4 +1,4 @@
-package main
+package production
 
 import (
 	"errors"
@@ -19,6 +19,43 @@ func TestCredentialsFromEnvironmentRequiresExplicitApprovalBeforeCredentials(t *
 	}
 	if len(lookedUp) != 1 || lookedUp[0] != envRedditAPIApproved {
 		t.Fatalf("lookups = %v, want approval only", lookedUp)
+	}
+}
+
+// TestCredentialsFromEnvironmentRejectsCredentialsWithoutApproval proves that holding
+// an application's credentials is never treated as Reddit having approved this use.
+func TestCredentialsFromEnvironmentRejectsCredentialsWithoutApproval(t *testing.T) {
+	t.Parallel()
+
+	for _, approval := range []string{"", "false", "TRUE", "true ", "1", "yes"} {
+		approval := approval
+		t.Run("approval="+approval, func(t *testing.T) {
+			t.Parallel()
+
+			values := map[string]string{
+				envRedditAPIApproved:  approval,
+				envRedditClientID:     "client-id",
+				envRedditClientSecret: "client-secret",
+				envRedditUserAgent:    "darwin:duckwords:1.0 (by /u/example)",
+			}
+			credentials, err := credentialsFromEnvironment(mapLookup(values))
+			if credentials != (redditCredentials{}) || !errors.Is(err, errApprovalRequired) {
+				t.Fatalf("credentials = %+v, error = %v; complete credentials must not imply approval", credentials, err)
+			}
+		})
+	}
+}
+
+func TestCredentialsFromEnvironmentNamesTheMissingCredential(t *testing.T) {
+	t.Parallel()
+
+	values := map[string]string{envRedditAPIApproved: "true"}
+	credentials, err := credentialsFromEnvironment(mapLookup(values))
+	if credentials != (redditCredentials{}) || !errors.Is(err, errEnvironmentConfig) {
+		t.Fatalf("credentials = %+v, error = %v", credentials, err)
+	}
+	if !strings.Contains(err.Error(), envRedditClientID) {
+		t.Fatalf("error does not name the missing variable: %q", err)
 	}
 }
 

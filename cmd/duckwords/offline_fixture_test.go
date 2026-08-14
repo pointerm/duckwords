@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/pointerm/duckwords/internal/app"
+	"github.com/pointerm/duckwords/internal/cli"
 	"github.com/pointerm/duckwords/internal/config"
+	"github.com/pointerm/duckwords/internal/production"
 )
 
 const offlineFixtureProcessEnvironment = "DUCKWORDS_OFFLINE_FIXTURE_PROCESS"
@@ -32,25 +34,25 @@ func TestMain(m *testing.M) {
 
 func runOfflineFixtureProcess(stdout, stderr io.Writer) int {
 	fixtureEnvironment := map[string]string{
-		envRedditAPIApproved:  "true",
-		envRedditClientID:     "fixture-client-id",
-		envRedditClientSecret: "fixture-client-secret",
-		envRedditUserAgent:    "cli:duckwords:offline-fixture (by /u/example)",
+		"REDDIT_API_ACCESS_APPROVED": "true",
+		"REDDIT_CLIENT_ID":           "fixture-client-id",
+		"REDDIT_CLIENT_SECRET":       "fixture-client-secret",
+		"REDDIT_USER_AGENT":          "cli:duckwords:offline-fixture (by /u/example)",
 	}
-	dependencies := productionDependencies{
-		lookupEnv: func(name string) (string, bool) {
+	dependencies := production.NewDependencies(
+		func(name string) (string, bool) {
 			value, found := fixtureEnvironment[name]
 			return value, found
 		},
-		newHTTP: func(time.Duration, int) (*http.Client, error) {
+		func(time.Duration, int) (*http.Client, error) {
 			return &http.Client{
 				Transport: offlineFixtureTransport{},
 				Timeout:   time.Second,
 			}, nil
 		},
-		now: time.Now,
-	}
-	return run(
+		time.Now,
+	)
+	return cli.Run(
 		context.Background(),
 		[]string{
 			"--workers=1",
@@ -63,7 +65,7 @@ func runOfflineFixtureProcess(stdout, stderr io.Writer) int {
 		stdout,
 		stderr,
 		func(ctx context.Context, cfg config.Config, logger *slog.Logger) (app.Result, error) {
-			return executeProduction(ctx, cfg, logger, dependencies)
+			return production.ExecuteWithDependencies(ctx, cfg, logger, dependencies)
 		},
 	)
 }
@@ -85,12 +87,12 @@ func (offlineFixtureTransport) RoundTrip(request *http.Request) (*http.Response,
 
 	switch request.URL.String() {
 	case config.DefaultPostsURL:
-		if request.UserAgent() != sourceDownloadUserAgent() {
+		if request.UserAgent() != production.SourceDownloadUserAgent() {
 			return nil, errUnexpectedOfflineFixtureRequest
 		}
 		return response("text/plain; charset=utf-8", "https://redd.it/duck123\n")
 	case config.DefaultDictionaryURL:
-		if request.UserAgent() != sourceDownloadUserAgent() {
+		if request.UserAgent() != production.SourceDownloadUserAgent() {
 			return nil, errUnexpectedOfflineFixtureRequest
 		}
 		return response("text/plain; charset=utf-8", "duck\npond\nwater\n")
@@ -121,7 +123,7 @@ func TestOfflineFixtureProcessProducesGoldenJSON(t *testing.T) {
 	t.Parallel()
 
 	var stdout, stderr strings.Builder
-	if code := runOfflineFixtureProcess(&stdout, &stderr); code != exitSuccess {
+	if code := runOfflineFixtureProcess(&stdout, &stderr); code != cli.ExitSuccess {
 		t.Fatalf("offline fixture exit code = %d; stderr:\n%s", code, stderr.String())
 	}
 	const want = "[\n  {\n    \"word\": \"duck\",\n    \"count\": 2\n  },\n  {\n    \"word\": \"water\",\n    \"count\": 1\n  }\n]\n"

@@ -1,4 +1,4 @@
-package main
+package runlog
 
 import (
 	"context"
@@ -31,6 +31,7 @@ const (
 	unknownBuildLogValue   = "unknown"
 	maxCommitLogBytes      = 64
 	minCommitLogBytes      = 7
+	maxVersionLogBytes     = 64
 	maxGoVersionLogBytes   = 96
 	maxPlatformLogBytes    = 16
 	buildDateLogLayout     = "2006-01-02T15:04:05Z"
@@ -49,21 +50,25 @@ type logBuildIdentity struct {
 	goarch    string
 }
 
-type executionLogger struct {
+// Recorder writes the stable, sanitized lifecycle schema consumed by the evidence
+// finalizer. It owns only observation state; application decisions remain elsewhere.
+type Recorder struct {
 	logger        *slog.Logger
 	sourceRetries *atomic.Uint64
 }
 
-func newExecutionLogger(logger *slog.Logger) executionLogger {
-	return executionLogger{logger: logger, sourceRetries: new(atomic.Uint64)}
+// New returns an execution-log recorder backed by logger.
+func New(logger *slog.Logger) Recorder {
+	return Recorder{logger: logger, sourceRetries: new(atomic.Uint64)}
 }
 
-func (log executionLogger) runStarted(ctx context.Context, cfg config.Config) {
+// RunStarted records the validated execution configuration and bounded resource policy.
+func (log Recorder) RunStarted(ctx context.Context, cfg config.Config) {
 	if log.logger == nil {
 		return
 	}
 	traversalBudget := reddit.DefaultTraversalBudgetConfig()
-	sourceRetry := productionSourceRetryConfig(cfg, nil)
+	sourceRetry := sourceRetrySettings(cfg)
 	attributes := []slog.Attr{
 		logging.EventAttr(logging.EventRunStarted),
 		slog.Int("workers", cfg.Workers),
@@ -85,7 +90,8 @@ func (log executionLogger) runStarted(ctx context.Context, cfg config.Config) {
 	log.logger.LogAttrs(ctx, slog.LevelInfo, logMessageRunStarted, attributes...)
 }
 
-func (log executionLogger) retryObserver(ctx context.Context) reddit.RetryObserver {
+// RetryObserver returns the sanitized observer for Reddit HTTP retries.
+func (log Recorder) RetryObserver(ctx context.Context) reddit.RetryObserver {
 	return func(event reddit.RetryEvent) {
 		if log.logger == nil {
 			return
@@ -104,7 +110,8 @@ func (log executionLogger) retryObserver(ctx context.Context) reddit.RetryObserv
 	}
 }
 
-func (log executionLogger) sourceRetryObserver(ctx context.Context) acquire.RetryObserver {
+// SourceRetryObserver returns the sanitized observer for input-source retries.
+func (log Recorder) SourceRetryObserver(ctx context.Context) acquire.RetryObserver {
 	return func(event acquire.RetryEvent) {
 		if log.sourceRetries != nil {
 			log.sourceRetries.Add(1)
@@ -127,14 +134,64 @@ func (log executionLogger) sourceRetryObserver(ctx context.Context) acquire.Retr
 	}
 }
 
-func (log executionLogger) sourceRetryCount() uint64 {
+// SourceLoaded records sanitized acquisition provenance without raw URLs or paths.
+func (log Recorder) SourceLoaded(ctx context.Context, provenance acquire.Provenance) {
+	if log.logger == nil {
+		return
+	}
+	log.logger.InfoContext(
+		ctx,
+		logMessageSource,
+		logging.EventAttr(logging.EventSourceLoaded),
+		slog.String(logging.KeySourceKind, provenance.Kind.String()),
+		slog.String("source_mode", provenance.Mode.String()),
+		slog.String("source_origin", provenance.Origin),
+		slog.Int64("source_bytes", provenance.Bytes),
+		slog.String("source_sha256", provenance.SHA256),
+	)
+}
+
+// SourceParsed records bounded parser statistics and input identity.
+func (log Recorder) SourceParsed(ctx context.Context, kind string, entries int, digest string, postIDsDigest string) {
+	if log.logger == nil {
+		return
+	}
+	attributes := []slog.Attr{
+		logging.EventAttr(logging.EventSourceParsed),
+		slog.String(logging.KeySourceKind, kind),
+		slog.String("stage", "parsed"),
+		slog.Int("entries", entries),
+		slog.String("source_sha256", digest),
+	}
+	if kind == "posts" {
+		attributes = append(attributes, slog.String("posts_sha256", postIDsDigest))
+	}
+	log.logger.LogAttrs(ctx, slog.LevelInfo, "source parsed", attributes...)
+}
+
+func (log Recorder) sourceRetryCount() uint64 {
 	if log.sourceRetries == nil {
 		return 0
 	}
 	return log.sourceRetries.Load()
 }
 
-func (log executionLogger) outcomes(ctx context.Context, result app.Result) {
+// sourceRetrySettings mirrors the deliberately narrower acquisition ceiling in the
+// production composition. Both start logs and source execution derive from the same
+// acquisition defaults, so the recorded effective values cannot exceed that policy.
+func sourceRetrySettings(cfg config.Config) acquire.RetryConfig {
+	retry := acquire.DefaultRetryConfig()
+	if cfg.MaxRetries < retry.MaxRetries {
+		retry.MaxRetries = cfg.MaxRetries
+	}
+	if cfg.RetryBudget < retry.MaxElapsed {
+		retry.MaxElapsed = cfg.RetryBudget
+	}
+	return retry
+}
+
+// Outcomes records source-ordered post outcomes without comment content.
+func (log Recorder) Outcomes(ctx context.Context, result app.Result) {
 	if log.logger == nil {
 		return
 	}
@@ -163,7 +220,8 @@ func (log executionLogger) outcomes(ctx context.Context, result app.Result) {
 	}
 }
 
-func (log executionLogger) summary(
+// Summary records the terminal aggregate and provenance reconciliation fields.
+func (log Recorder) Summary(
 	ctx context.Context,
 	cfg config.Config,
 	result app.Result,
@@ -260,10 +318,24 @@ func appendBuildIdentityAttrs(attributes []slog.Attr, identity logBuildIdentity)
 }
 
 func safeVersionLogValue(value string) string {
-	if !validSourceVersion(value) || !isASCIILetterOrDigit(value[0]) {
+	if !validVersionLogValue(value) || !isASCIILetterOrDigit(value[0]) {
 		return unknownBuildLogValue
 	}
 	return value
+}
+
+func validVersionLogValue(value string) bool {
+	if value == "" || len(value) > maxVersionLogBytes || strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, char := range []byte(value) {
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' ||
+			char >= '0' && char <= '9' || strings.ContainsRune("._-+", rune(char)) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func safeCommitLogValue(value string) string {
@@ -321,7 +393,8 @@ func isASCIILetterOrDigit(char byte) bool {
 	return char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9'
 }
 
-func (log executionLogger) outputWritten(ctx context.Context, words int, resultHash string, partial bool) {
+// OutputWritten records the hash of the exact JSON bytes already written to stdout.
+func (log Recorder) OutputWritten(ctx context.Context, words int, resultHash string, partial bool) {
 	if log.logger == nil {
 		return
 	}
@@ -335,7 +408,8 @@ func (log executionLogger) outputWritten(ctx context.Context, words int, resultH
 	)
 }
 
-func (log executionLogger) cancelled(ctx context.Context, class string) {
+// Cancelled records the CLI-owned terminal cancellation event.
+func (log Recorder) Cancelled(ctx context.Context, class string) {
 	if log.logger == nil {
 		return
 	}
@@ -347,7 +421,8 @@ func (log executionLogger) cancelled(ctx context.Context, class string) {
 	)
 }
 
-func (log executionLogger) failed(ctx context.Context, class string, duration time.Duration) {
+// Failed records a sanitized terminal failure class.
+func (log Recorder) Failed(ctx context.Context, class string, duration time.Duration) {
 	if log.logger == nil {
 		return
 	}

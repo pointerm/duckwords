@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"bytes"
@@ -16,6 +16,10 @@ import (
 	"github.com/pointerm/duckwords/internal/aggregate"
 	"github.com/pointerm/duckwords/internal/app"
 	"github.com/pointerm/duckwords/internal/config"
+	"github.com/pointerm/duckwords/internal/logging"
+	"github.com/pointerm/duckwords/internal/production"
+	"github.com/pointerm/duckwords/internal/reddit"
+	"github.com/pointerm/duckwords/internal/runlog"
 )
 
 func TestRunInformationalPathsDoNotExecute(t *testing.T) {
@@ -26,7 +30,6 @@ func TestRunInformationalPathsDoNotExecute(t *testing.T) {
 		args []string
 		want string
 	}{
-		{name: "no arguments", want: "Usage:"},
 		{name: "help", args: []string{"--help"}, want: "Usage:"},
 		{name: "short help", args: []string{"-h"}, want: "Usage:"},
 		{name: "version", args: []string{"--version"}, want: "duckwords version="},
@@ -547,13 +550,13 @@ func TestRunParentDeadlineMapsToFailure(t *testing.T) {
 }
 
 func TestRunProductionExecutorFailsClosedWithoutApproval(t *testing.T) {
-	t.Setenv(envRedditAPIApproved, "")
-	t.Setenv(envRedditClientID, "")
-	t.Setenv(envRedditClientSecret, "")
-	t.Setenv(envRedditUserAgent, "")
+	t.Setenv("REDDIT_API_ACCESS_APPROVED", "")
+	t.Setenv("REDDIT_CLIENT_ID", "")
+	t.Setenv("REDDIT_CLIENT_SECRET", "")
+	t.Setenv("REDDIT_USER_AGENT", "")
 
 	var stdout, stderr strings.Builder
-	code := run(context.Background(), []string{"--workers=1"}, &stdout, &stderr, mainExecutor)
+	code := run(context.Background(), []string{"--workers=1"}, &stdout, &stderr, production.Execute)
 
 	if code != exitFailure {
 		t.Fatalf("run() exit code = %d, want %d", code, exitFailure)
@@ -563,16 +566,16 @@ func TestRunProductionExecutorFailsClosedWithoutApproval(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "event=run_started") ||
 		!strings.Contains(stderr.String(), "event=run_failed") ||
-		!strings.HasSuffix(stderr.String(), "duckwords: production setup failed; confirm Reddit approval and required environment configuration (see README)\n") {
+		!strings.HasSuffix(stderr.String(), "duckwords: Reddit Data API access is not confirmed; obtain Reddit's approval, then set REDDIT_API_ACCESS_APPROVED=true (see README)\n") {
 		t.Fatalf("stderr = %q, want structured fail-closed lifecycle and stable diagnostic", stderr.String())
 	}
 }
 
 func TestRunProductionExecutorFailureIsPureJSON(t *testing.T) {
-	t.Setenv(envRedditAPIApproved, "")
-	t.Setenv(envRedditClientID, "must-not-appear")
-	t.Setenv(envRedditClientSecret, "must-not-appear")
-	t.Setenv(envRedditUserAgent, "must-not-appear")
+	t.Setenv("REDDIT_API_ACCESS_APPROVED", "")
+	t.Setenv("REDDIT_CLIENT_ID", "must-not-appear")
+	t.Setenv("REDDIT_CLIENT_SECRET", "must-not-appear")
+	t.Setenv("REDDIT_USER_AGENT", "must-not-appear")
 
 	var stdout, stderr strings.Builder
 	code := run(
@@ -580,7 +583,7 @@ func TestRunProductionExecutorFailureIsPureJSON(t *testing.T) {
 		[]string{"--workers=1", "--log-format=json"},
 		&stdout,
 		&stderr,
-		mainExecutor,
+		production.Execute,
 	)
 
 	if code != exitFailure {
@@ -728,8 +731,8 @@ func TestRunRejectsInvalidLifecycleDependencies(t *testing.T) {
 			if stdout.Len() != 0 {
 				t.Fatalf("stdout = %q, want empty", stdout.String())
 			}
-			if stderr.String() != "duckwords: execution failed\n" {
-				t.Fatalf("stderr = %q, want stable lifecycle diagnostic", stderr.String())
+			if !strings.HasPrefix(stderr.String(), "duckwords: execution failed: ") {
+				t.Fatalf("stderr = %q, want a lifecycle diagnostic naming the cause", stderr.String())
 			}
 		})
 	}
@@ -787,4 +790,120 @@ func (writer *failOnWriteWriter) Write(payload []byte) (int, error) {
 		return 0, errors.New("injected terminal log failure")
 	}
 	return writer.Builder.Write(payload)
+}
+
+// TestRunWithoutArgumentsProcesses locks in the out-of-the-box contract: a bare
+// invocation runs the assignment configuration instead of printing usage.
+func TestRunWithoutArgumentsProcesses(t *testing.T) {
+	t.Parallel()
+
+	executed := false
+	var stdout, stderr strings.Builder
+	code := run(
+		context.Background(),
+		nil,
+		&stdout,
+		&stderr,
+		func(_ context.Context, cfg config.Config, _ *slog.Logger) (app.Result, error) {
+			executed = true
+			if cfg.Posts.Location != config.DefaultPostsURL || cfg.Dictionary.Location != config.DefaultDictionaryURL {
+				t.Fatalf("sources = %+v / %+v, want assignment defaults", cfg.Posts, cfg.Dictionary)
+			}
+			if cfg.Workers != config.DefaultWorkers || cfg.FailureMode != config.FailureModeBestEffort {
+				t.Fatalf("config = %+v, want documented defaults", cfg)
+			}
+			return app.Result{Words: []aggregate.WordCount{{Word: "duck", Count: 2}}}, nil
+		},
+	)
+
+	if !executed {
+		t.Fatal("a bare invocation did not execute")
+	}
+	if code != exitSuccess {
+		t.Fatalf("run() exit code = %d, want %d", code, exitSuccess)
+	}
+	const want = "[\n  {\n    \"word\": \"duck\",\n    \"count\": 2\n  }\n]\n"
+	if stdout.String() != want {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+	}
+}
+
+// TestConfigDiagnosticNamesTheDisallowedHost proves the usage-exit path explains the
+// origin allowlist rather than deferring to a generic setup failure.
+func TestConfigDiagnosticNamesTheDisallowedHost(t *testing.T) {
+	t.Parallel()
+
+	var stdout, stderr strings.Builder
+	code := run(
+		context.Background(),
+		[]string{"--posts-url=https://example.test/posts.txt"},
+		&stdout,
+		&stderr,
+		func(context.Context, config.Config, *slog.Logger) (app.Result, error) {
+			t.Fatal("executor was called for an invalid configuration")
+			return app.Result{}, nil
+		},
+	)
+
+	if code != exitUsage {
+		t.Fatalf("run() exit code = %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(stderr.String(), "gist.githubusercontent.com") ||
+		strings.Contains(stderr.String(), "Reddit approval") {
+		t.Fatalf("stderr = %q, want the allowed host and no Reddit-approval misdirection", stderr.String())
+	}
+}
+
+// TestSkippedOutcomeIsLoggedInTheEvidenceContract closes the runner → JSON log →
+// evidence-finalizer chain for a provably absent post. internal/evidence parses this
+// exact record shape, so a drift between the two would otherwise only surface after
+// the one approved live capture had already been spent.
+func TestSkippedOutcomeIsLoggedInTheEvidenceContract(t *testing.T) {
+	t.Parallel()
+
+	var stderr strings.Builder
+	sink, err := logging.New(&stderr, logging.Options{Level: logging.LevelInfo, Format: logging.FormatJSON})
+	if err != nil {
+		t.Fatalf("logging.New() error = %v", err)
+	}
+	result := app.Result{
+		Words: []aggregate.WordCount{{Word: "duck", Count: 2}},
+		Summary: app.Summary{
+			Total: 2, Completed: 1, Skipped: 1,
+			Comments: 1, BodiesVisited: 1, CountedTokens: 2, DistinctWords: 1,
+		},
+		Outcomes: []app.PostOutcome{
+			{PostID: "duck123", SourceLine: 1, Status: app.OutcomeCompleted, Comments: 1, BodiesVisited: 1, CountedTokens: 2},
+			{PostID: "gone456", SourceLine: 2, Status: app.OutcomeSkipped, ErrorClass: reddit.ErrorNotFound, Endpoint: reddit.EndpointComments},
+		},
+	}
+	runlog.New(sink.Logger()).Outcomes(context.Background(), result)
+	if err := sink.Err(); err != nil {
+		t.Fatalf("sink.Err() = %v", err)
+	}
+
+	var skipped map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(stderr.String()), "\n") {
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("operational log line is not JSON: %q", line)
+		}
+		if record["event"] == "post_outcome" && record["status"] == "skipped" {
+			skipped = record
+		}
+	}
+	if skipped == nil {
+		t.Fatalf("no skipped post_outcome record:\n%s", stderr.String())
+	}
+	// These are exactly the fields internal/evidence requires of a skipped record:
+	// absence proven by the comments endpoint, with no HTTP status of its own.
+	if skipped["error_class"] != "not_found" || skipped["operation"] != "comments" {
+		t.Fatalf("skipped record = %#v, want not_found on the comments endpoint", skipped)
+	}
+	if _, present := skipped["http_status"]; present {
+		t.Fatalf("skipped record carries an HTTP status: %#v", skipped)
+	}
+	if skipped["counted_tokens"] != float64(0) {
+		t.Fatalf("skipped record contributed tokens: %#v", skipped)
+	}
 }

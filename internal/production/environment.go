@@ -1,4 +1,4 @@
-package main
+package production
 
 import (
 	"errors"
@@ -28,8 +28,11 @@ type redditCredentials struct {
 }
 
 // credentialsFromEnvironment keeps credentials out of process arguments and fails
-// before source or Reddit I/O. The approval value is intentionally exact: possession
-// of credentials is not evidence that Reddit approved this use of its Data API.
+// before source or Reddit I/O. The approval value is checked first and its value is
+// intentionally exact: Reddit's Responsible Builder Policy requires approval before
+// Data API access, and holding a registered application's credentials is not that
+// approval. The CLI never infers one from the other, so an unapproved environment
+// cannot reach the network at all.
 func credentialsFromEnvironment(lookup environmentLookup) (redditCredentials, error) {
 	if lookup == nil {
 		return redditCredentials{}, fmt.Errorf("%w: environment lookup is required", errEnvironmentConfig)

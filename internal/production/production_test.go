@@ -1,4 +1,4 @@
-package main
+package production
 
 import (
 	"context"
@@ -17,6 +17,7 @@ import (
 	"github.com/pointerm/duckwords/internal/config"
 	"github.com/pointerm/duckwords/internal/logging"
 	"github.com/pointerm/duckwords/internal/reddit"
+	"github.com/pointerm/duckwords/internal/runlog"
 )
 
 func TestExecuteProductionRejectsApprovalBeforeHTTPOrSourceIO(t *testing.T) {
@@ -25,7 +26,7 @@ func TestExecuteProductionRejectsApprovalBeforeHTTPOrSourceIO(t *testing.T) {
 	var logs strings.Builder
 	sink := mustTestLogSink(t, &logs)
 	httpCalls := 0
-	result, err := executeProduction(context.Background(), productionTestConfig(), sink.Logger(), productionDependencies{
+	result, err := executeProduction(context.Background(), productionTestConfig(), sink.Logger(), Dependencies{
 		lookupEnv: mapLookup(map[string]string{}),
 		newHTTP: func(time.Duration, int) (*http.Client, error) {
 			httpCalls++
@@ -33,7 +34,7 @@ func TestExecuteProductionRejectsApprovalBeforeHTTPOrSourceIO(t *testing.T) {
 		},
 		now: fixedProductionClock(),
 	})
-	if !errors.Is(err, errProductionConfig) || httpCalls != 0 {
+	if !errors.Is(err, ErrConfig) || httpCalls != 0 {
 		t.Fatalf("result = %+v, error = %v, HTTP factory calls = %d", result, err, httpCalls)
 	}
 	if strings.Contains(logs.String(), "event=run_started") || !strings.Contains(logs.String(), "event=run_failed") {
@@ -53,12 +54,12 @@ func TestExecuteProductionRejectsBothSourcePoliciesBeforeFilesystemIO(t *testing
 		t.Fatal("network request occurred")
 		return nil, nil
 	}), Timeout: time.Second}
-	result, err := executeProduction(context.Background(), cfg, slog.New(slog.NewTextHandler(&strings.Builder{}, nil)), productionDependencies{
+	result, err := executeProduction(context.Background(), cfg, slog.New(slog.NewTextHandler(&strings.Builder{}, nil)), Dependencies{
 		lookupEnv: mapLookup(validProductionEnvironment()),
 		newHTTP:   func(time.Duration, int) (*http.Client, error) { return client, nil },
 		now:       fixedProductionClock(),
 	})
-	if !errors.Is(err, errProductionConfig) {
+	if !errors.Is(err, ErrConfig) {
 		t.Fatalf("result = %+v, error = %v, want production config error", result, err)
 	}
 	if _, statErr := os.Stat(missing); !errors.Is(statErr, os.ErrNotExist) {
@@ -91,7 +92,7 @@ func TestExecuteProductionLocalSourcesFailOnlyAtFixedRedditEndpoint(t *testing.T
 	})
 	client := &http.Client{Transport: transport, Timeout: time.Second}
 
-	result, err := executeProduction(context.Background(), cfg, sink.Logger(), productionDependencies{
+	result, err := executeProduction(context.Background(), cfg, sink.Logger(), Dependencies{
 		lookupEnv: mapLookup(validProductionEnvironment()),
 		newHTTP:   func(time.Duration, int) (*http.Client, error) { return client, nil },
 		now:       fixedProductionClock(),
@@ -111,7 +112,7 @@ func TestExecuteProductionLocalSourcesFailOnlyAtFixedRedditEndpoint(t *testing.T
 	}
 }
 
-func TestRunComposesProductionOfflineEndToEnd(t *testing.T) {
+func TestExecuteProductionComposesOfflineEndToEnd(t *testing.T) {
 	postsFile := filepath.Join(t.TempDir(), "posts.txt")
 	dictionaryFile := filepath.Join(t.TempDir(), "dictionary.txt")
 	if err := os.WriteFile(postsFile, []byte("https://redd.it/duck123\n"), 0o600); err != nil {
@@ -142,34 +143,20 @@ func TestRunComposesProductionOfflineEndToEnd(t *testing.T) {
 		}
 	})
 	client := &http.Client{Transport: transport, Timeout: time.Second}
-	dependencies := productionDependencies{
+	dependencies := Dependencies{
 		lookupEnv: mapLookup(validProductionEnvironment()),
 		newHTTP:   func(time.Duration, int) (*http.Client, error) { return client, nil },
 		now:       time.Now,
 	}
-	var result app.Result
-	var stdout, logs strings.Builder
-	code := run(
-		context.Background(),
-		[]string{
-			"--posts-file=" + postsFile,
-			"--dictionary-file=" + dictionaryFile,
-			"--workers=1",
-			"--rate-limit=1.5",
-			"--request-timeout=1s",
-			"--max-retries=0",
-			"--retry-budget=1s",
-		},
-		&stdout,
-		&logs,
-		func(ctx context.Context, cfg config.Config, logger *slog.Logger) (app.Result, error) {
-			var err error
-			result, err = executeProduction(ctx, cfg, logger, dependencies)
-			return result, err
-		},
-	)
-	if code != exitSuccess {
-		t.Fatalf("run() exit code = %d, want %d; logs:\n%s", code, exitSuccess, logs.String())
+	cfg := productionTestConfig()
+	cfg.Posts = config.InputSource{Kind: config.SourceFile, Location: postsFile}
+	cfg.Dictionary = config.InputSource{Kind: config.SourceFile, Location: dictionaryFile}
+	cfg.RateLimit = config.MaxRateLimit
+	var logs strings.Builder
+	sink := mustTestLogSink(t, &logs)
+	result, err := executeProduction(context.Background(), cfg, sink.Logger(), dependencies)
+	if err != nil {
+		t.Fatalf("executeProduction() error = %v; logs:\n%s", err, logs.String())
 	}
 	if len(result.Words) != 2 || result.Words[0].Word != "duck" || result.Words[0].Count != 2 ||
 		result.Words[1].Word != "water" || result.Words[1].Count != 1 {
@@ -181,11 +168,7 @@ func TestRunComposesProductionOfflineEndToEnd(t *testing.T) {
 	if len(requests) != 2 || requests[0] != "www.reddit.com/api/v1/access_token" || requests[1] != "oauth.reddit.com/comments/duck123" {
 		t.Fatalf("requests = %v, want fixed OAuth then comments endpoints", requests)
 	}
-	const wantJSON = "[\n  {\n    \"word\": \"duck\",\n    \"count\": 2\n  },\n  {\n    \"word\": \"water\",\n    \"count\": 1\n  }\n]\n"
-	if stdout.String() != wantJSON {
-		t.Fatalf("stdout mismatch:\ngot:\n%s\nwant:\n%s", stdout.String(), wantJSON)
-	}
-	for _, want := range []string{"event=run_started", "event=source_parsed", "event=post_outcome", "status=completed", "event=run_summary", "source_retries=0", "reddit_http_attempts=2", "reddit_retries=0", "event=output_written"} {
+	for _, want := range []string{"event=source_parsed", "event=post_outcome", "status=completed", "event=run_summary", "source_retries=0", "reddit_http_attempts=2", "reddit_retries=0"} {
 		if !strings.Contains(logs.String(), want) {
 			t.Fatalf("logs do not contain %q:\n%s", want, logs.String())
 		}
@@ -218,7 +201,7 @@ func TestExecuteProductionLeavesTerminalCancellationLoggingToCLI(t *testing.T) {
 
 	var logs strings.Builder
 	sink := mustTestLogSink(t, &logs)
-	_, err := executeProduction(ctx, cfg, sink.Logger(), productionDependencies{
+	_, err := executeProduction(ctx, cfg, sink.Logger(), Dependencies{
 		lookupEnv: mapLookup(validProductionEnvironment()),
 		newHTTP:   func(time.Duration, int) (*http.Client, error) { return client, nil },
 		now:       fixedProductionClock(),
@@ -234,18 +217,18 @@ func TestExecuteProductionLeavesTerminalCancellationLoggingToCLI(t *testing.T) {
 func TestExecuteProductionRejectsInvalidDependencies(t *testing.T) {
 	t.Parallel()
 
-	dependencies := defaultProductionDependencies()
+	dependencies := defaultDependencies()
 	tests := []struct {
 		name   string
 		ctx    context.Context
 		logger *slog.Logger
-		change func(*productionDependencies)
+		change func(*Dependencies)
 	}{
 		{name: "nil context", logger: slog.Default()},
 		{name: "nil logger", ctx: context.Background()},
-		{name: "nil environment", ctx: context.Background(), logger: slog.Default(), change: func(deps *productionDependencies) { deps.lookupEnv = nil }},
-		{name: "nil HTTP factory", ctx: context.Background(), logger: slog.Default(), change: func(deps *productionDependencies) { deps.newHTTP = nil }},
-		{name: "nil clock", ctx: context.Background(), logger: slog.Default(), change: func(deps *productionDependencies) { deps.now = nil }},
+		{name: "nil environment", ctx: context.Background(), logger: slog.Default(), change: func(deps *Dependencies) { deps.lookupEnv = nil }},
+		{name: "nil HTTP factory", ctx: context.Background(), logger: slog.Default(), change: func(deps *Dependencies) { deps.newHTTP = nil }},
+		{name: "nil clock", ctx: context.Background(), logger: slog.Default(), change: func(deps *Dependencies) { deps.now = nil }},
 	}
 	for _, test := range tests {
 		test := test
@@ -257,7 +240,7 @@ func TestExecuteProductionRejectsInvalidDependencies(t *testing.T) {
 				test.change(&deps)
 			}
 			result, err := executeProduction(test.ctx, productionTestConfig(), test.logger, deps)
-			if result.Words != nil || !errors.Is(err, errProductionConfig) {
+			if result.Words != nil || !errors.Is(err, ErrConfig) {
 				t.Fatalf("result = %+v, error = %v", result, err)
 			}
 		})
@@ -303,15 +286,15 @@ func TestSourceRetryLoggingIsSanitizedAndCountedInSummary(t *testing.T) {
 	t.Parallel()
 
 	var logs strings.Builder
-	log := newExecutionLogger(mustTestLogSink(t, &logs).Logger())
-	log.sourceRetryObserver(context.Background())(acquire.RetryEvent{
+	log := runlog.New(mustTestLogSink(t, &logs).Logger())
+	log.SourceRetryObserver(context.Background())(acquire.RetryEvent{
 		Kind:       acquire.KindPosts,
 		Reason:     acquire.RetryReasonHTTPStatus,
 		StatusCode: http.StatusServiceUnavailable,
 		Attempt:    2,
 		Delay:      250 * time.Millisecond,
 	})
-	log.summary(
+	log.Summary(
 		context.Background(),
 		productionTestConfig(),
 		app.Result{},

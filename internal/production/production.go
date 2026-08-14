@@ -1,4 +1,4 @@
-package main
+package production
 
 import (
 	"context"
@@ -12,8 +12,8 @@ import (
 	"github.com/pointerm/duckwords/internal/acquire"
 	"github.com/pointerm/duckwords/internal/app"
 	"github.com/pointerm/duckwords/internal/config"
-	"github.com/pointerm/duckwords/internal/logging"
 	"github.com/pointerm/duckwords/internal/reddit"
+	"github.com/pointerm/duckwords/internal/runlog"
 	"github.com/pointerm/duckwords/internal/source"
 	"github.com/pointerm/duckwords/internal/words"
 )
@@ -24,25 +24,57 @@ const (
 )
 
 var (
-	errProductionConfig  = errors.New("invalid production execution configuration")
-	errSourceAcquisition = errors.New("input acquisition failed")
-	errSourceParsing     = errors.New("input parsing failed")
-	errRedditSetup       = errors.New("reddit client setup failed")
+	// ErrConfig classifies invalid production composition without exposing secrets.
+	ErrConfig = errors.New("invalid production execution configuration")
+	// These wrap errProductionConfig so existing classification keeps working while
+	// the CLI can name the precise cause instead of one catch-all setup message.
+	ErrApproval          = fmt.Errorf("%w: Reddit Data API approval", ErrConfig)
+	ErrCredentials       = fmt.Errorf("%w: Reddit credentials", ErrConfig)
+	ErrSourceConfig      = fmt.Errorf("%w: input source", ErrConfig)
+	ErrSourceAcquisition = errors.New("input acquisition failed")
+	ErrSourceParsing     = errors.New("input parsing failed")
+	ErrRedditSetup       = errors.New("reddit client setup failed")
 	errRunnerSetup       = errors.New("application runner setup failed")
 )
 
-type productionDependencies struct {
+// Dependencies contains the process adapters used by production composition.
+// Fields remain private so callers construct a complete set atomically.
+type Dependencies struct {
 	lookupEnv environmentLookup
 	newHTTP   func(time.Duration, int) (*http.Client, error)
 	now       func() time.Time
 }
 
-func defaultProductionDependencies() productionDependencies {
-	return productionDependencies{
+func defaultDependencies() Dependencies {
+	return Dependencies{
 		lookupEnv: os.LookupEnv,
 		newHTTP:   newProductionHTTPClient,
 		now:       time.Now,
 	}
+}
+
+// NewDependencies constructs a complete dependency set for deterministic integration tests.
+func NewDependencies(
+	lookupEnv func(string) (string, bool),
+	newHTTP func(time.Duration, int) (*http.Client, error),
+	now func() time.Time,
+) Dependencies {
+	return Dependencies{lookupEnv: lookupEnv, newHTTP: newHTTP, now: now}
+}
+
+// Execute runs the production composition with operating-system dependencies.
+func Execute(ctx context.Context, cfg config.Config, logger *slog.Logger) (app.Result, error) {
+	return ExecuteWithDependencies(ctx, cfg, logger, defaultDependencies())
+}
+
+// ExecuteWithDependencies runs production composition with explicit process adapters.
+func ExecuteWithDependencies(
+	ctx context.Context,
+	cfg config.Config,
+	logger *slog.Logger,
+	dependencies Dependencies,
+) (app.Result, error) {
+	return executeProduction(ctx, cfg, logger, dependencies)
 }
 
 // executeProduction assembles exactly one dictionary, token source, request policy,
@@ -52,40 +84,44 @@ func executeProduction(
 	ctx context.Context,
 	cfg config.Config,
 	logger *slog.Logger,
-	dependencies productionDependencies,
+	dependencies Dependencies,
 ) (app.Result, error) {
 	if ctx == nil || logger == nil || dependencies.lookupEnv == nil ||
 		dependencies.newHTTP == nil || dependencies.now == nil {
-		return app.Result{}, errProductionConfig
+		return app.Result{}, ErrConfig
 	}
 	startedAt := dependencies.now()
-	log := newExecutionLogger(logger)
+	log := runlog.New(logger)
 
 	credentials, err := credentialsFromEnvironment(dependencies.lookupEnv)
 	if err != nil {
-		log.failed(ctx, "configuration", elapsed(dependencies.now, startedAt))
-		return app.Result{}, fmt.Errorf("%w: credentials or approval", errProductionConfig)
+		if errors.Is(err, errApprovalRequired) {
+			log.Failed(ctx, "approval", elapsed(dependencies.now, startedAt))
+			return app.Result{}, ErrApproval
+		}
+		log.Failed(ctx, "credentials", elapsed(dependencies.now, startedAt))
+		return app.Result{}, ErrCredentials
 	}
 	httpClient, err := dependencies.newHTTP(cfg.RequestTimeout, cfg.Workers)
 	if err != nil {
-		log.failed(ctx, "configuration", elapsed(dependencies.now, startedAt))
-		return app.Result{}, fmt.Errorf("%w: HTTP policy", errProductionConfig)
+		log.Failed(ctx, "configuration", elapsed(dependencies.now, startedAt))
+		return app.Result{}, fmt.Errorf("%w: HTTP policy", ErrConfig)
 	}
 	defer closeIdleConnections(httpClient)
 
 	postLimits := source.DefaultPostListLimits()
 	dictionaryLimits := words.DefaultDictionaryLimits()
 	sourceUserAgent := sourceDownloadUserAgent()
-	sourceRetry := productionSourceRetryConfig(cfg, log.sourceRetryObserver(ctx))
+	sourceRetry := productionSourceRetryConfig(cfg, log.SourceRetryObserver(ctx))
 	postsSpec, postsAcquireConfig := acquisitionConfig(cfg.Posts, acquire.KindPosts, httpClient, sourceUserAgent, postLimits.MaxBytes, sourceRetry)
 	dictionarySpec, dictionaryAcquireConfig := acquisitionConfig(cfg.Dictionary, acquire.KindDictionary, httpClient, sourceUserAgent, dictionaryLimits.MaxBytes, sourceRetry)
 	if err := acquire.Validate(postsSpec, postsAcquireConfig); err != nil {
-		log.failed(ctx, "configuration", elapsed(dependencies.now, startedAt))
-		return app.Result{}, fmt.Errorf("%w: posts", errProductionConfig)
+		log.Failed(ctx, "source_config", elapsed(dependencies.now, startedAt))
+		return app.Result{}, fmt.Errorf("%w: posts", ErrSourceConfig)
 	}
 	if err := acquire.Validate(dictionarySpec, dictionaryAcquireConfig); err != nil {
-		log.failed(ctx, "configuration", elapsed(dependencies.now, startedAt))
-		return app.Result{}, fmt.Errorf("%w: dictionary", errProductionConfig)
+		log.Failed(ctx, "source_config", elapsed(dependencies.now, startedAt))
+		return app.Result{}, fmt.Errorf("%w: dictionary", ErrSourceConfig)
 	}
 
 	policy, err := reddit.NewRequestPolicy(reddit.RequestPolicyConfig{
@@ -94,11 +130,11 @@ func executeProduction(
 		MaxRetryElapsed:   cfg.RetryBudget,
 		InitialBackoff:    policyInitialBackoff,
 		MaxBackoff:        policyMaximumBackoff,
-		Observer:          log.retryObserver(ctx),
+		Observer:          log.RetryObserver(ctx),
 	})
 	if err != nil {
-		log.failed(ctx, "configuration", elapsed(dependencies.now, startedAt))
-		return app.Result{}, fmt.Errorf("%w: request policy", errProductionConfig)
+		log.Failed(ctx, "configuration", elapsed(dependencies.now, startedAt))
+		return app.Result{}, fmt.Errorf("%w: request policy", ErrConfig)
 	}
 	tokenSource, err := reddit.NewTokenSource(reddit.TokenConfig{
 		ClientID:          credentials.clientID,
@@ -109,8 +145,8 @@ func executeProduction(
 		APIAccessApproved: credentials.approved,
 	})
 	if err != nil {
-		log.failed(ctx, "configuration", elapsed(dependencies.now, startedAt))
-		return app.Result{}, errRedditSetup
+		log.Failed(ctx, "configuration", elapsed(dependencies.now, startedAt))
+		return app.Result{}, ErrRedditSetup
 	}
 	redditClient, err := reddit.NewClient(reddit.ClientConfig{
 		HTTPClient:    httpClient,
@@ -118,53 +154,53 @@ func executeProduction(
 		RequestPolicy: policy,
 	})
 	if err != nil {
-		log.failed(ctx, "configuration", elapsed(dependencies.now, startedAt))
-		return app.Result{}, errRedditSetup
+		log.Failed(ctx, "configuration", elapsed(dependencies.now, startedAt))
+		return app.Result{}, ErrRedditSetup
 	}
 
 	postsDocument, err := acquire.Load(ctx, postsSpec, postsAcquireConfig)
 	if err != nil {
 		if !errors.Is(err, acquire.ErrCanceled) {
-			log.failed(ctx, acquisitionErrorClass(err), elapsed(dependencies.now, startedAt))
+			log.Failed(ctx, acquisitionErrorClass(err), elapsed(dependencies.now, startedAt))
 		}
-		return app.Result{}, preserveCancellation(err, errSourceAcquisition)
+		return app.Result{}, preserveCancellation(err, ErrSourceAcquisition)
 	}
-	logSourceLoaded(ctx, logger, postsDocument.Provenance())
+	log.SourceLoaded(ctx, postsDocument.Provenance())
 	posts, postStats, err := source.LoadPostList(postsDocument.Reader(), postLimits)
 	if err != nil {
-		log.failed(ctx, "source_parse", elapsed(dependencies.now, startedAt))
-		return app.Result{}, errSourceParsing
+		log.Failed(ctx, "source_parse", elapsed(dependencies.now, startedAt))
+		return app.Result{}, ErrSourceParsing
 	}
 	if postStats.SHA256 != postsDocument.Provenance().SHA256 {
-		log.failed(ctx, "source_integrity", elapsed(dependencies.now, startedAt))
-		return app.Result{}, errSourceParsing
+		log.Failed(ctx, "source_integrity", elapsed(dependencies.now, startedAt))
+		return app.Result{}, ErrSourceParsing
 	}
-	logSourceParsed(ctx, logger, "posts", postStats.Posts, postStats.SHA256, postStats.PostsSHA256)
+	log.SourceParsed(ctx, "posts", postStats.Posts, postStats.SHA256, postStats.PostsSHA256)
 
 	dictionaryDocument, err := acquire.Load(ctx, dictionarySpec, dictionaryAcquireConfig)
 	if err != nil {
 		if !errors.Is(err, acquire.ErrCanceled) {
-			log.failed(ctx, acquisitionErrorClass(err), elapsed(dependencies.now, startedAt))
+			log.Failed(ctx, acquisitionErrorClass(err), elapsed(dependencies.now, startedAt))
 		}
-		return app.Result{}, preserveCancellation(err, errSourceAcquisition)
+		return app.Result{}, preserveCancellation(err, ErrSourceAcquisition)
 	}
-	logSourceLoaded(ctx, logger, dictionaryDocument.Provenance())
+	log.SourceLoaded(ctx, dictionaryDocument.Provenance())
 	dictionary, dictionaryStats, err := words.LoadDictionary(dictionaryDocument.Reader(), dictionaryLimits)
 	if err != nil {
-		log.failed(ctx, "source_parse", elapsed(dependencies.now, startedAt))
-		return app.Result{}, errSourceParsing
+		log.Failed(ctx, "source_parse", elapsed(dependencies.now, startedAt))
+		return app.Result{}, ErrSourceParsing
 	}
 	// Acquisition and parsers intentionally compute their digests independently. A
 	// mismatch would mean the bytes changed across an internal trust boundary.
 	if dictionaryStats.SHA256 != dictionaryDocument.Provenance().SHA256 {
-		log.failed(ctx, "source_integrity", elapsed(dependencies.now, startedAt))
-		return app.Result{}, errSourceParsing
+		log.Failed(ctx, "source_integrity", elapsed(dependencies.now, startedAt))
+		return app.Result{}, ErrSourceParsing
 	}
-	logSourceParsed(ctx, logger, "dictionary", dictionary.Len(), dictionaryStats.SHA256, "")
+	log.SourceParsed(ctx, "dictionary", dictionary.Len(), dictionaryStats.SHA256, "")
 
 	matcher, err := words.NewMatcher(cfg.Filters)
 	if err != nil {
-		log.failed(ctx, "configuration", elapsed(dependencies.now, startedAt))
+		log.Failed(ctx, "configuration", elapsed(dependencies.now, startedAt))
 		return app.Result{}, errRunnerSetup
 	}
 	runner, err := app.New(
@@ -174,14 +210,14 @@ func executeProduction(
 		matcher,
 	)
 	if err != nil {
-		log.failed(ctx, "configuration", elapsed(dependencies.now, startedAt))
+		log.Failed(ctx, "configuration", elapsed(dependencies.now, startedAt))
 		return app.Result{}, errRunnerSetup
 	}
 
 	result, runErr := runner.Run(ctx, posts)
-	log.outcomes(ctx, result)
+	log.Outcomes(ctx, result)
 	if runErr == nil || runErr == app.ErrPartialResult {
-		log.summary(
+		log.Summary(
 			ctx,
 			cfg,
 			result,
@@ -199,7 +235,7 @@ func executeProduction(
 	// as well as the returned cause because an injected walker may report its
 	// cancellation class without wrapping context.Canceled.
 	if ctx.Err() == nil && !errors.Is(runErr, context.Canceled) && !errors.Is(runErr, context.DeadlineExceeded) {
-		log.failed(ctx, runErrorClass(runErr), elapsed(dependencies.now, startedAt))
+		log.Failed(ctx, runErrorClass(runErr), elapsed(dependencies.now, startedAt))
 	}
 	return result, runErr
 }
@@ -247,39 +283,6 @@ func closeIdleConnections(client *http.Client) {
 		return
 	}
 	client.CloseIdleConnections()
-}
-
-func logSourceLoaded(ctx context.Context, logger *slog.Logger, provenance acquire.Provenance) {
-	if logger == nil {
-		return
-	}
-	logger.InfoContext(
-		ctx,
-		logMessageSource,
-		logging.EventAttr(logging.EventSourceLoaded),
-		slog.String(logging.KeySourceKind, provenance.Kind.String()),
-		slog.String("source_mode", provenance.Mode.String()),
-		slog.String("source_origin", provenance.Origin),
-		slog.Int64("source_bytes", provenance.Bytes),
-		slog.String("source_sha256", provenance.SHA256),
-	)
-}
-
-func logSourceParsed(ctx context.Context, logger *slog.Logger, kind string, entries int, digest string, postsDigest string) {
-	if logger == nil {
-		return
-	}
-	attributes := []slog.Attr{
-		logging.EventAttr(logging.EventSourceParsed),
-		slog.String(logging.KeySourceKind, kind),
-		slog.String("stage", "parsed"),
-		slog.Int("entries", entries),
-		slog.String("source_sha256", digest),
-	}
-	if kind == "posts" {
-		attributes = append(attributes, slog.String("posts_sha256", postsDigest))
-	}
-	logger.LogAttrs(ctx, slog.LevelInfo, "source parsed", attributes...)
 }
 
 func elapsed(now func() time.Time, startedAt time.Time) time.Duration {
