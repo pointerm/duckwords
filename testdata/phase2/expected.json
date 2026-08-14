@@ -6,14 +6,14 @@
     "Feather wing."
   ],
   "stats": {
-    "things": 11,
+    "things": 13,
     "comments": 7,
     "bodies_visited": 4,
     "bodies_skipped": 3,
-    "duplicate_comments": 1,
+    "duplicate_comments": 0,
     "more_ids": 3,
     "unique_more_ids": 3,
     "duplicate_more_ids": 0,
-    "more_requests": 2
+    "expansion_requests": 3
   }
 }

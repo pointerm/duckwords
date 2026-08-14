@@ -1,0 +1,31 @@
+[
+  {
+    "kind": "Listing",
+    "data": {
+      "children": [
+        {
+          "kind": "t3",
+          "data": {"id": "synth001", "name": "t3_synth001"}
+        }
+      ]
+    }
+  },
+  {
+    "kind": "Listing",
+    "data": {
+      "children": [
+        {
+          "kind": "t1",
+          "data": {
+            "id": "a4",
+            "name": "t1_a4",
+            "link_id": "t3_synth001",
+            "parent_id": "t3_synth001",
+            "body": "Feather wing duck.",
+            "replies": ""
+          }
+        }
+      ]
+    }
+  }
+]

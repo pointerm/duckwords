@@ -31,3 +31,25 @@ func TestSourceDownloadUserAgentIsGenericVersionedAndHeaderSafe(t *testing.T) {
 		})
 	}
 }
+
+func TestRedditUserAgentIsTruthfulVersionedAndHeaderSafe(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		version string
+		want    string
+	}{
+		{version: "dev", want: "duckwords/dev (+https://github.com/pointerm/duckwords)"},
+		{version: "v0.2.0", want: "duckwords/v0.2.0 (+https://github.com/pointerm/duckwords)"},
+		{version: "bad\r\nCookie: secret", want: "duckwords/unknown (+https://github.com/pointerm/duckwords)"},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.version, func(t *testing.T) {
+			t.Parallel()
+			if got := redditUserAgentForVersion(test.version); got != test.want {
+				t.Fatalf("redditUserAgentForVersion() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}

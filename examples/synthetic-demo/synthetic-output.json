@@ -1,0 +1,42 @@
+[
+  {
+    "word": "duck",
+    "count": 6
+  },
+  {
+    "word": "pond",
+    "count": 3
+  },
+  {
+    "word": "water",
+    "count": 3
+  },
+  {
+    "word": "bird",
+    "count": 2
+  },
+  {
+    "word": "duckling",
+    "count": 2
+  },
+  {
+    "word": "ducks",
+    "count": 2
+  },
+  {
+    "word": "lake",
+    "count": 2
+  },
+  {
+    "word": "quack",
+    "count": 2
+  },
+  {
+    "word": "river",
+    "count": 2
+  },
+  {
+    "word": "feather",
+    "count": 1
+  }
+]

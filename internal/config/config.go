@@ -25,7 +25,7 @@ const (
 	DefaultDictionaryURL = "https://raw.githubusercontent.com/dwyl/english-words/master/words.txt"
 
 	// DefaultWorkers overlaps independent network waits while keeping the number of
-	// simultaneously retained comment trees conservative until live memory evidence
+	// simultaneously retained comment trees conservative until live memory measurements
 	// supports a higher value.
 	DefaultWorkers = 4
 	// MinWorkers is the smallest supported post worker pool.
@@ -57,16 +57,17 @@ const (
 	// MaxRequestTimeout prevents a single stuck attempt from consuming the run.
 	MaxRequestTimeout = 2 * time.Minute
 
-	// DefaultMaxRetries permits a small number of transient retries without hiding a
-	// persistent failure.
+	// DefaultMaxRetries permits a small number of transient HTTP or proven
+	// no-progress continuation retries without hiding a persistent failure.
 	DefaultMaxRetries = 3
 	// MinMaxRetries allows retries to be disabled explicitly.
 	MinMaxRetries = 0
 	// MaxMaxRetries caps amplification of a failed request.
 	MaxMaxRetries = 5
 
-	// DefaultRetryBudget bounds total elapsed retry-session time for one logical
-	// request from session creation, including limiter waits and HTTP attempts.
+	// DefaultRetryBudget bounds cumulative HTTP-attempt, observer, and retry-backoff
+	// work for one logical request. Shared limiter/gate waits remain bounded by the
+	// global run timeout and do not consume this per-request budget.
 	DefaultRetryBudget = 45 * time.Second
 	// MinRetryBudget rejects zero and negative retry windows.
 	MinRetryBudget = time.Second
@@ -147,7 +148,7 @@ Reliability:
   --request-timeout DURATION    one HTTP attempt (default 20s; range 1s..2m)
   --timeout DURATION            global execution timeout (default 30m; range 1s..2h)
   --max-retries N               transient retries (default 3; range 0..5)
-  --retry-budget DURATION       total retry session (default 45s; range 1s..5m)
+  --retry-budget DURATION       HTTP/retry work per request (default 45s; range 1s..5m)
   --failure-mode MODE           best-effort or strict (default best-effort)
 Observability:
   --log-level LEVEL             debug, info, warn, or error (default info)
@@ -156,11 +157,12 @@ Information:
   --version                     print build and toolchain information
   -h, --help                    show this help
 
-Environment (all required for processing; values are never accepted as flags):
-  REDDIT_API_ACCESS_APPROVED    exact value "true"; set only after Reddit approval
-  REDDIT_CLIENT_ID              approved confidential OAuth client ID
-  REDDIT_CLIENT_SECRET          approved confidential OAuth client secret
-  REDDIT_USER_AGENT             platform:app:version (by /u/name)
+Environment (optional; values are never accepted as flags):
+  REDDIT_USER_AGENT             override the built-in public-request identity
+  REDDIT_BROWSER_COOKIE         own Cookie value; name=value pairs, max 16 KiB (sensitive)
+  REDDIT_BROWSER_ACCEPT_LANGUAGE, REDDIT_BROWSER_SEC_CH_UA,
+  REDDIT_BROWSER_SEC_CH_UA_MOBILE, REDDIT_BROWSER_SEC_CH_UA_PLATFORM
+                                optional printable-ASCII browser-session headers
 
 Examples:
   duckwords
@@ -195,9 +197,9 @@ type InputSource struct {
 	Location string
 }
 
-// Config contains validated process configuration. OAuth credentials and the API
-// approval acknowledgement intentionally remain outside this value so they cannot
-// be exposed through process arguments or generic configuration formatting.
+// Config contains validated process configuration. The optional Reddit User-Agent
+// override remains outside this value so it cannot be exposed through process
+// arguments or generic configuration formatting.
 type Config struct {
 	Posts          InputSource
 	Dictionary     InputSource
@@ -257,7 +259,7 @@ func Parse(args []string) (Config, error) {
 	flags.Float64Var(&cfg.RateLimit, "rate-limit", cfg.RateLimit, "requests per second")
 	flags.DurationVar(&cfg.RequestTimeout, "request-timeout", cfg.RequestTimeout, "one HTTP attempt timeout")
 	flags.DurationVar(&cfg.Timeout, "timeout", cfg.Timeout, "global execution timeout")
-	flags.IntVar(&cfg.MaxRetries, "max-retries", cfg.MaxRetries, "transient retries")
+	flags.IntVar(&cfg.MaxRetries, "max-retries", cfg.MaxRetries, "transient HTTP and no-progress continuation retries")
 	flags.DurationVar(&cfg.RetryBudget, "retry-budget", cfg.RetryBudget, "total retry session")
 	flags.StringVar(&failureMode, "failure-mode", failureMode, "best-effort or strict")
 	flags.StringVar(&logLevel, "log-level", logLevel, "debug, info, warn, or error")

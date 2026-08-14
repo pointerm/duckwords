@@ -10,11 +10,11 @@ const (
 	sourceUserAgentProduct         = "duckwords"
 	sourceUserAgentFallbackVersion = "unknown"
 	maxSourceVersionBytes          = 64
+	redditUserAgentRepository      = "https://github.com/pointerm/duckwords"
 )
 
 // sourceDownloadUserAgent returns a generic, versioned product identity for public
-// assignment-file downloads. It deliberately excludes the Reddit contact identity,
-// which belongs only on OAuth and Reddit API requests.
+// assignment-file downloads.
 func sourceDownloadUserAgent() string {
 	return sourceDownloadUserAgentForVersion(buildinfo.Current().Version)
 }
@@ -29,6 +29,17 @@ func sourceDownloadUserAgentForVersion(version string) string {
 		version = sourceUserAgentFallbackVersion
 	}
 	return sourceUserAgentProduct + "/" + version
+}
+
+func redditUserAgent() string {
+	return redditUserAgentForVersion(buildinfo.Current().Version)
+}
+
+func redditUserAgentForVersion(version string) string {
+	if !validSourceVersion(version) {
+		version = sourceUserAgentFallbackVersion
+	}
+	return sourceUserAgentProduct + "/" + version + " (+" + redditUserAgentRepository + ")"
 }
 
 func validSourceVersion(version string) bool {

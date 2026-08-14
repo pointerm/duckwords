@@ -12,14 +12,13 @@ import (
 )
 
 const (
-	moreChildrenBatchSize = 100
-	maxPostIDBytes        = 16
-	maxCommentIDBytes     = 32
+	maxPostIDBytes    = 16
+	maxCommentIDBytes = 32
 
 	defaultMaxThings               = 500_000
 	defaultMaxComments             = 250_000
 	defaultMaxMoreIDs              = 250_000
-	defaultMaxMoreRequests         = 5_000
+	defaultMaxExpansionRequests    = 5_000
 	defaultMaxContinuationRequests = 5_000
 	defaultMaxBodyBytes            = 1 << 20
 	defaultMaxTotalBodyBytes       = 256 << 20
@@ -28,7 +27,7 @@ const (
 	absoluteMaxThings               = 2_000_000
 	absoluteMaxComments             = 1_000_000
 	absoluteMaxMoreIDs              = 1_000_000
-	absoluteMaxMoreRequests         = 20_000
+	absoluteMaxExpansionRequests    = 20_000
 	absoluteMaxContinuationRequests = 20_000
 	absoluteMaxBodyBytes            = 16 << 20
 	absoluteMaxTotalBodyBytes       = 1 << 30
@@ -54,15 +53,18 @@ const (
 var (
 	errInvalidThingLimits       = errors.New("invalid reddit thing limits")
 	errInvalidPostID            = errors.New("invalid reddit post ID")
-	errNilMoreFetcher           = errors.New("nil morechildren fetcher")
+	errInvalidPostRef           = errors.New("invalid reddit post reference")
+	errNilExpansionFetcher      = errors.New("nil comment-expansion fetcher")
 	errNilCommentVisitor        = errors.New("nil comment visitor")
 	errMalformedResponse        = errors.New("malformed reddit response")
-	errPostNotFound             = errors.New("reddit post does not exist")
 	errIncompleteTree           = errors.New("incomplete reddit comment tree")
+	errContinuationNoProgress   = fmt.Errorf("%w: continuation made no progress", errIncompleteTree)
+	errContinuationRepeated     = fmt.Errorf("%w: continuation marker repeated", errIncompleteTree)
+	errContinuationChildrenGone = fmt.Errorf("%w: continuation child IDs unavailable", errIncompleteTree)
 	errThingLimit               = errors.New("reddit thing limit exceeded")
 	errCommentLimit             = errors.New("reddit comment limit exceeded")
 	errMoreIDLimit              = errors.New("reddit more-child ID limit exceeded")
-	errMoreRequestLimit         = errors.New("reddit morechildren request limit exceeded")
+	errExpansionRequestLimit    = errors.New("reddit comment-expansion request limit exceeded")
 	errContinuationRequestLimit = errors.New("reddit continuation request limit exceeded")
 	errCommentBodyTooLarge      = errors.New("reddit comment body limit exceeded")
 	errCommentBodiesTooLarge    = errors.New("reddit cumulative comment-body limit exceeded")
@@ -80,7 +82,7 @@ type ThingLimits struct {
 	MaxThings               int
 	MaxComments             int
 	MaxMoreIDs              int
-	MaxMoreRequests         int
+	MaxExpansionRequests    int
 	MaxContinuationRequests int
 	MaxBodyBytes            int
 	MaxTotalBodyBytes       int64
@@ -88,13 +90,13 @@ type ThingLimits struct {
 }
 
 // DefaultThingLimits returns limits well above a normal Reddit comment tree while
-// still preventing one post from consuming unbounded memory or API requests.
+// still preventing one post from consuming unbounded memory or HTTP requests.
 func DefaultThingLimits() ThingLimits {
 	return ThingLimits{
 		MaxThings:               defaultMaxThings,
 		MaxComments:             defaultMaxComments,
 		MaxMoreIDs:              defaultMaxMoreIDs,
-		MaxMoreRequests:         defaultMaxMoreRequests,
+		MaxExpansionRequests:    defaultMaxExpansionRequests,
 		MaxContinuationRequests: defaultMaxContinuationRequests,
 		MaxBodyBytes:            defaultMaxBodyBytes,
 		MaxTotalBodyBytes:       defaultMaxTotalBodyBytes,
@@ -123,16 +125,24 @@ type WalkStats struct {
 	MoreIDs              int
 	UniqueMoreIDs        int
 	DuplicateMoreIDs     int
-	MoreRequests         int
+	ExpansionRequests    int
 	ContinuationRequests int
 	BodyBytes            int64
 	ResponseBytes        int64
 }
 
-type moreFetcher func(context.Context, []string) ([]byte, error)
+type expansionFetcher func(context.Context, []string) ([]byte, error)
 type continuationFetcher func(context.Context, string) ([]byte, error)
-type admittedMoreFetcher func(context.Context, []string) (responsePayload, error)
-type admittedContinuationFetcher func(context.Context, string) (responsePayload, error)
+type admittedExpansionFetcher func(context.Context, string) (responsePayload, error)
+type continuationReplay func(context.Context, error) (responsePayload, error)
+
+type continuationResponse struct {
+	payload   responsePayload
+	replay    continuationReplay
+	canReplay func() bool
+}
+
+type admittedContinuationFetcher func(context.Context, string) (continuationResponse, error)
 type commentVisitor func(Comment) error
 
 type visitError struct {
@@ -148,20 +158,20 @@ type queuedThing struct {
 	endpoint       Endpoint
 }
 
-type moreGroup struct {
-	parent string
-	ids    []string
-}
-
-type moreBatch struct {
-	parent string
-	ids    []string
-}
-
 type continuationCheckpoint struct {
 	comments      int
 	uniqueMoreIDs int
 	continuations int
+	parentID      string
+	replay        continuationReplay
+	canReplay     func() bool
+	unresolved    error
+}
+
+type pendingContinuation struct {
+	parentID  string
+	replay    continuationReplay
+	canReplay func() bool
 }
 
 type jsonObject map[string]any
@@ -172,7 +182,7 @@ func walkDecoded(
 	ctx context.Context,
 	postID string,
 	initial []byte,
-	fetch moreFetcher,
+	fetch expansionFetcher,
 	visit commentVisitor,
 ) (WalkStats, error) {
 	return walkDecodedWithLimits(ctx, postID, initial, DefaultThingLimits(), fetch, visit)
@@ -183,7 +193,7 @@ func walkDecodedWithLimits(
 	postID string,
 	initial []byte,
 	limits ThingLimits,
-	fetch moreFetcher,
+	fetch expansionFetcher,
 	visit commentVisitor,
 ) (WalkStats, error) {
 	return walkDecodedCompleteWithLimits(ctx, postID, initial, limits, fetch, nil, visit)
@@ -198,7 +208,7 @@ func walkDecodedCompleteWithLimits(
 	postID string,
 	initial []byte,
 	limits ThingLimits,
-	fetch moreFetcher,
+	fetch expansionFetcher,
 	fetchContinuation continuationFetcher,
 	visit commentVisitor,
 ) (WalkStats, error) {
@@ -214,18 +224,20 @@ func walkDecodedCompleteWithLimits(
 		initialPayload.take(),
 		limits,
 		budget,
-		adaptMoreFetcher(fetch),
+		adaptExpansionFetcher(fetch),
 		adaptContinuationFetcher(fetchContinuation),
 		visit,
 	)
 }
 
-func adaptMoreFetcher(fetch moreFetcher) admittedMoreFetcher {
+func adaptExpansionFetcher(fetch expansionFetcher) admittedExpansionFetcher {
 	if fetch == nil {
 		return nil
 	}
-	return func(ctx context.Context, ids []string) (responsePayload, error) {
-		payload, err := fetch(ctx, ids)
+	return func(ctx context.Context, id string) (responsePayload, error) {
+		// The slice-only facade keeps pure decoder tests convenient. Production uses
+		// the scalar admitted hook directly and allocates no one-element batch.
+		payload, err := fetch(ctx, []string{id})
 		owned := responsePayload{data: payload}
 		payload = nil
 		return owned.take(), err
@@ -236,11 +248,11 @@ func adaptContinuationFetcher(fetch continuationFetcher) admittedContinuationFet
 	if fetch == nil {
 		return nil
 	}
-	return func(ctx context.Context, parentID string) (responsePayload, error) {
+	return func(ctx context.Context, parentID string) (continuationResponse, error) {
 		payload, err := fetch(ctx, parentID)
 		owned := responsePayload{data: payload}
 		payload = nil
-		return owned.take(), err
+		return continuationResponse{payload: owned.take()}, err
 	}
 }
 
@@ -250,7 +262,7 @@ func walkDecodedCompleteWithBudget(
 	initial responsePayload,
 	limits ThingLimits,
 	budget *TraversalBudget,
-	fetch admittedMoreFetcher,
+	fetch admittedExpansionFetcher,
 	fetchContinuation admittedContinuationFetcher,
 	visit commentVisitor,
 ) (WalkStats, error) {
@@ -270,7 +282,7 @@ func walkDecodedCompleteWithBudget(
 		return stats, newError(ErrorInvalidInput, EndpointComments, postID, 0, err)
 	}
 	if fetch == nil {
-		return stats, newError(ErrorInvalidInput, EndpointMoreChildren, postID, 0, errNilMoreFetcher)
+		return stats, newError(ErrorInvalidInput, EndpointCommentExpansion, postID, 0, errNilExpansionFetcher)
 	}
 	if visit == nil {
 		return stats, newError(ErrorInvalidInput, EndpointComments, postID, 0, errNilCommentVisitor)
@@ -300,11 +312,11 @@ func walkDecodedCompleteWithBudget(
 	if err != nil {
 		return stats, protocolError(EndpointComments, postID, err)
 	}
-	// A deleted or never-existing post returns a well-formed listing with no post
-	// thing. That is an expected terminal absence, not a protocol violation, so it
-	// is classified exactly like an HTTP 404 and callers can skip it explicitly.
+	// An empty HTTP-200 post listing does not prove why the post thing is absent.
+	// Only an actual HTTP 404/410 can be reconciled as a skipped post, so this
+	// otherwise well-formed response fails closed as incomplete.
 	if len(postChildren) == 0 {
-		return stats, newError(ErrorNotFound, EndpointComments, postID, 0, errPostNotFound)
+		return stats, newError(ErrorIncomplete, EndpointComments, postID, 0, errIncompleteTree)
 	}
 	if len(postChildren) != 1 {
 		return stats, protocolError(EndpointComments, postID, errMalformedResponse)
@@ -337,13 +349,13 @@ func walkDecodedCompleteWithBudget(
 	commentOrigins := make(map[string]Endpoint, initialCommentCapacity)
 	commentOrder := make([]string, 0, initialCommentCapacity)
 	moreParents := make(map[string]string)
-	pendingMore := make([]moreGroup, 0)
-	pendingContinuations := make([]string, 0)
+	pendingMore := make([]string, 0)
+	pendingContinuations := make([]pendingContinuation, 0)
 	seenContinuations := make(map[string]struct{})
-	var requested map[string]string
 	var activeContinuation *continuationCheckpoint
+	var retryContinuation *pendingContinuation
 
-	for len(stack) > 0 || len(pendingMore) > 0 || len(pendingContinuations) > 0 || requested != nil || activeContinuation != nil {
+	for len(stack) > 0 || len(pendingMore) > 0 || len(pendingContinuations) > 0 || activeContinuation != nil || retryContinuation != nil {
 		if err := ctx.Err(); err != nil {
 			return stats, newError(ErrorCanceled, EndpointComments, postID, 0, err)
 		}
@@ -363,11 +375,20 @@ func walkDecodedCompleteWithBudget(
 			}
 			switch kind {
 			case "t1":
-				err = processComment(ctx, data, item.expectedParent, item.endpoint, postID, limits, visit, commentParents, commentOrigins, &commentOrder, moreParents, requested, &stack, &stats, &retained)
+				err = processComment(ctx, data, item.expectedParent, item.endpoint, postID, limits, visit, commentParents, commentOrigins, &commentOrder, moreParents, &stack, &stats, &retained)
 			case "more":
-				err = processMore(ctx, data, item.expectedParent, postID, limits, fetchContinuation != nil, commentParents, moreParents, seenContinuations, &pendingMore, &pendingContinuations, &stats, &retained)
+				err = processMore(ctx, data, item.expectedParent, item.endpoint, postID, limits, fetchContinuation != nil, commentParents, moreParents, seenContinuations, &pendingMore, &pendingContinuations, &stats, &retained)
 			default:
 				err = errMalformedResponse
+			}
+			if (errors.Is(err, errContinuationRepeated) || errors.Is(err, errContinuationChildrenGone)) &&
+				item.endpoint == EndpointContinuation && activeContinuation != nil {
+				// Finish the accepted focal response before deciding whether it made
+				// progress. An unresolved marker mixed with new comments is not replayed:
+				// combining two mutable snapshots after visitor side effects would be
+				// unsafe. A duplicate-only response remains replayable below.
+				activeContinuation.unresolved = err
+				err = nil
 			}
 			if err != nil {
 				return stats, classifyTreeError(item.endpoint, postID, err)
@@ -375,70 +396,86 @@ func walkDecodedCompleteWithBudget(
 			continue
 		}
 		if activeContinuation != nil {
-			if stats.Comments == activeContinuation.comments &&
+			noProgress := stats.Comments == activeContinuation.comments &&
 				stats.UniqueMoreIDs == activeContinuation.uniqueMoreIDs &&
-				len(seenContinuations) == activeContinuation.continuations {
-				return stats, protocolError(EndpointContinuation, postID, errIncompleteTree)
+				len(seenContinuations) == activeContinuation.continuations
+			if activeContinuation.unresolved != nil && !noProgress {
+				return stats, protocolError(EndpointContinuation, postID, activeContinuation.unresolved)
+			}
+			if noProgress {
+				if activeContinuation.replay == nil ||
+					(activeContinuation.canReplay != nil && !activeContinuation.canReplay()) {
+					return stats, protocolError(EndpointContinuation, postID, errContinuationNoProgress)
+				}
+				retryContinuation = &pendingContinuation{
+					parentID:  activeContinuation.parentID,
+					replay:    activeContinuation.replay,
+					canReplay: activeContinuation.canReplay,
+				}
 			}
 			activeContinuation = nil
-		}
-
-		if requested != nil {
-			if len(requested) != 0 {
-				return stats, protocolError(EndpointMoreChildren, postID, errIncompleteTree)
-			}
-			requested = nil
-			continue
-		}
-
-		if len(pendingMore) > 0 {
-			batch := takeMoreBatch(&pendingMore, commentParents)
-			if len(batch.ids) == 0 {
+			if retryContinuation != nil {
 				continue
 			}
-			if stats.MoreRequests == limits.MaxMoreRequests {
-				return stats, resourceError(EndpointMoreChildren, postID, errMoreRequestLimit)
-			}
-			stats.MoreRequests++
-			requested = make(map[string]string, len(batch.ids))
-			for _, id := range batch.ids {
-				requested[id] = batch.parent
-			}
+		}
 
-			payload, fetchErr := fetch(ctx, batch.ids)
-			if err := classifyFetchError(ctx, EndpointMoreChildren, postID, fetchErr); err != nil {
+		if retryContinuation == nil && len(pendingMore) > 0 {
+			childID, found := takeMoreID(&pendingMore, commentParents)
+			if !found {
+				continue
+			}
+			if stats.ExpansionRequests == limits.MaxExpansionRequests {
+				return stats, resourceError(EndpointCommentExpansion, postID, errExpansionRequestLimit)
+			}
+			stats.ExpansionRequests++
+
+			payload, fetchErr := fetch(ctx, childID)
+			if err := classifyFetchError(ctx, EndpointCommentExpansion, postID, fetchErr); err != nil {
 				payload.releaseNow()
 				return stats, err
 			}
 			activeResponse = payload.take()
 			if err := accountResponseBytes(&stats, limits, len(activeResponse.data)); err != nil {
-				return stats, resourceError(EndpointMoreChildren, postID, err)
+				return stats, resourceError(EndpointCommentExpansion, postID, err)
 			}
 			if err := ensureResponseAdmission(ctx, budget, &activeResponse); err != nil {
-				return stats, classifyTreeError(EndpointMoreChildren, postID, err)
+				return stats, classifyTreeError(EndpointCommentExpansion, postID, err)
 			}
 			if err := preflightResponse(ctx, activeResponse.data, limits, stats); err != nil {
-				return stats, classifyTreeError(EndpointMoreChildren, postID, err)
+				return stats, classifyTreeError(EndpointCommentExpansion, postID, err)
 			}
 
-			things, err := decodeMoreResponseContext(ctx, activeResponse.data)
+			focal, err := decodeExpansionResponseContext(ctx, activeResponse.data, postID, childID)
 			if err != nil {
-				return stats, classifyTreeError(EndpointMoreChildren, postID, err)
+				return stats, classifyTreeError(EndpointCommentExpansion, postID, err)
 			}
-			if err := enqueueThings(&stack, things, "", EndpointMoreChildren, &stats, limits); err != nil {
-				return stats, resourceError(EndpointMoreChildren, postID, err)
+			// A focal public listing contains one freshly decoded t3 post thing in
+			// addition to the requested t1 below. Count both occurrences so repeated
+			// expansions cannot bypass the per-post work budget.
+			if err := accountThings(&stats, limits, 1); err != nil {
+				return stats, resourceError(EndpointCommentExpansion, postID, err)
 			}
-			things = nil
+			if err := enqueueThings(&stack, []any{focal}, "", EndpointCommentExpansion, &stats, limits); err != nil {
+				return stats, resourceError(EndpointCommentExpansion, postID, err)
+			}
+			focal = nil
 			activeResponse.data = nil
 			continue
 		}
-		if len(pendingContinuations) == 0 {
+		if retryContinuation == nil && len(pendingContinuations) == 0 {
 			continue
 		}
 
-		parentID := pendingContinuations[0]
-		pendingContinuations[0] = ""
-		pendingContinuations = pendingContinuations[1:]
+		var pending pendingContinuation
+		if retryContinuation != nil {
+			pending = *retryContinuation
+			retryContinuation = nil
+		} else {
+			pending = pendingContinuations[0]
+			pendingContinuations[0] = pendingContinuation{}
+			pendingContinuations = pendingContinuations[1:]
+		}
+		parentID := pending.parentID
 		if _, present := commentParents[parentID]; !present {
 			return stats, protocolError(EndpointContinuation, postID, errIncompleteTree)
 		}
@@ -446,7 +483,23 @@ func walkDecodedCompleteWithBudget(
 			return stats, resourceError(EndpointContinuation, postID, errContinuationRequestLimit)
 		}
 		stats.ContinuationRequests++
-		payload, fetchErr := fetchContinuation(ctx, parentID)
+		var response continuationResponse
+		var fetchErr error
+		if pending.replay != nil {
+			response.payload, fetchErr = pending.replay(ctx, errContinuationNoProgress)
+			response.replay = pending.replay
+			response.canReplay = pending.canReplay
+		} else {
+			response, fetchErr = fetchContinuation(ctx, parentID)
+		}
+		payload := response.payload.take()
+		if errors.Is(fetchErr, errContinuationNoProgress) {
+			payload.releaseNow()
+			if pending.replay != nil {
+				stats.ContinuationRequests--
+			}
+			return stats, protocolError(EndpointContinuation, postID, fetchErr)
+		}
 		if err := classifyFetchError(ctx, EndpointContinuation, postID, fetchErr); err != nil {
 			payload.releaseNow()
 			return stats, err
@@ -463,6 +516,12 @@ func walkDecodedCompleteWithBudget(
 		}
 		focal, err := decodeContinuationResponseContext(ctx, activeResponse.data, postID, parentID)
 		if err != nil {
+			if errors.Is(err, errContinuationNoProgress) && response.replay != nil &&
+				(response.canReplay == nil || response.canReplay()) {
+				activeResponse.releaseNow()
+				retryContinuation = &pendingContinuation{parentID: parentID, replay: response.replay, canReplay: response.canReplay}
+				continue
+			}
 			return stats, classifyTreeError(EndpointContinuation, postID, err)
 		}
 		// A focal response contains a freshly decoded t3 post thing in addition
@@ -480,6 +539,9 @@ func walkDecodedCompleteWithBudget(
 			comments:      stats.Comments,
 			uniqueMoreIDs: stats.UniqueMoreIDs,
 			continuations: len(seenContinuations),
+			parentID:      parentID,
+			replay:        response.replay,
+			canReplay:     response.canReplay,
 		}
 	}
 	activeResponse.releaseNow()
@@ -518,8 +580,8 @@ func validateThingLimits(limits ThingLimits) error {
 	if limits.MaxMoreIDs <= 0 || limits.MaxMoreIDs > absoluteMaxMoreIDs {
 		return fmt.Errorf("%w: MaxMoreIDs must be between 1 and %d", errInvalidThingLimits, absoluteMaxMoreIDs)
 	}
-	if limits.MaxMoreRequests <= 0 || limits.MaxMoreRequests > absoluteMaxMoreRequests {
-		return fmt.Errorf("%w: MaxMoreRequests must be between 1 and %d", errInvalidThingLimits, absoluteMaxMoreRequests)
+	if limits.MaxExpansionRequests <= 0 || limits.MaxExpansionRequests > absoluteMaxExpansionRequests {
+		return fmt.Errorf("%w: MaxExpansionRequests must be between 1 and %d", errInvalidThingLimits, absoluteMaxExpansionRequests)
 	}
 	if limits.MaxContinuationRequests <= 0 || limits.MaxContinuationRequests > absoluteMaxContinuationRequests {
 		return fmt.Errorf("%w: MaxContinuationRequests must be between 1 and %d", errInvalidThingLimits, absoluteMaxContinuationRequests)
@@ -631,7 +693,6 @@ func processComment(
 	commentOrigins map[string]Endpoint,
 	commentOrder *[]string,
 	moreParents map[string]string,
-	requested map[string]string,
 	stack *[]queuedThing,
 	stats *WalkStats,
 	retained *retainedLease,
@@ -657,9 +718,6 @@ func processComment(
 	if moreParent, expected := moreParents[id]; expected && moreParent != parent {
 		return errMalformedResponse
 	}
-	if requestedParent, expected := requested[id]; expected && requestedParent != parent {
-		return errMalformedResponse
-	}
 
 	repliesValue, repliesPresent := data["replies"]
 	if !repliesPresent {
@@ -683,10 +741,6 @@ func processComment(
 		}
 		stats.BodyBytes += bodyBytes
 	}
-	if requested != nil {
-		delete(requested, id)
-	}
-
 	if stats.Comments+stats.DuplicateComments == limits.MaxComments {
 		return errCommentLimit
 	}
@@ -722,14 +776,15 @@ func processMore(
 	ctx context.Context,
 	data jsonObject,
 	expectedParent string,
+	endpoint Endpoint,
 	postID string,
 	limits ThingLimits,
 	allowContinuation bool,
 	commentParents map[string]string,
 	moreParents map[string]string,
 	seenContinuations map[string]struct{},
-	pendingMore *[]moreGroup,
-	pendingContinuations *[]string,
+	pendingMore *[]string,
+	pendingContinuations *[]pendingContinuation,
 	stats *WalkStats,
 	retained *retainedLease,
 ) error {
@@ -746,17 +801,23 @@ func processMore(
 		return errMalformedResponse
 	}
 	if count > 0 && len(children) == 0 {
+		if endpoint == EndpointContinuation {
+			return errContinuationChildrenGone
+		}
 		return errIncompleteTree
 	}
 	if count == 0 && len(children) == 0 {
 		// Reddit uses the exact t1__ / "_" placeholder for a depth-truncated
-		// "continue this thread" branch. It cannot be expanded through
-		// /api/morechildren; callers without the focal-comment hook fail explicitly.
+		// "continue this thread" branch. It must query the focal parent rather
+		// than a child ID; callers without that hook fail explicitly.
 		id, idErr := decodeRequiredString(data["id"])
 		name, nameErr := decodeRequiredString(data["name"])
 		if idErr == nil && nameErr == nil && id == "_" && name == "t1__" && strings.HasPrefix(parent, "t1_") {
 			parentID := strings.TrimPrefix(parent, "t1_")
 			if _, duplicate := seenContinuations[parentID]; duplicate {
+				if endpoint == EndpointContinuation {
+					return errContinuationRepeated
+				}
 				return errIncompleteTree
 			}
 			if !allowContinuation {
@@ -766,7 +827,7 @@ func processMore(
 				return err
 			}
 			seenContinuations[parentID] = struct{}{}
-			*pendingContinuations = append(*pendingContinuations, parentID)
+			*pendingContinuations = append(*pendingContinuations, pendingContinuation{parentID: parentID})
 			return nil
 		}
 		return errMalformedResponse
@@ -783,7 +844,6 @@ func processMore(
 		return errMalformedResponse
 	}
 
-	group := moreGroup{parent: parent, ids: make([]string, 0, min(len(children), maxTraversalPreallocation))}
 	for index, rawID := range children {
 		if index%256 == 0 {
 			if err := ctx.Err(); err != nil {
@@ -819,11 +879,8 @@ func processMore(
 			stats.DuplicateMoreIDs++
 			continue
 		}
-		group.ids = append(group.ids, id)
+		*pendingMore = append(*pendingMore, id)
 		stats.UniqueMoreIDs++
-	}
-	if len(group.ids) > 0 {
-		*pendingMore = append(*pendingMore, group)
 	}
 	return nil
 }
@@ -839,40 +896,6 @@ func decodeReplies(value any) ([]any, error) {
 		return nil, nil
 	}
 	return decodeListing(value)
-}
-
-func decodeMoreResponseContext(ctx context.Context, payload []byte) ([]any, error) {
-	value, err := decodeOneContext(ctx, payload)
-	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return nil, err
-		}
-		return nil, errMalformedResponse
-	}
-	envelope, ok := asJSONObject(value)
-	if !ok {
-		return nil, errMalformedResponse
-	}
-	response, err := decodeRequiredObject(envelope, "json")
-	if err != nil {
-		return nil, errMalformedResponse
-	}
-	apiErrors, err := decodeRequiredArray(response, "errors")
-	if err != nil {
-		return nil, errMalformedResponse
-	}
-	if len(apiErrors) != 0 {
-		return nil, errIncompleteTree
-	}
-	data, err := decodeRequiredObject(response, "data")
-	if err != nil {
-		return nil, errMalformedResponse
-	}
-	things, err := decodeRequiredArray(data, "things")
-	if err != nil {
-		return nil, errMalformedResponse
-	}
-	return things, nil
 }
 
 func decodeThing(value any) (string, jsonObject, error) {
@@ -1079,32 +1102,59 @@ func accountResponseBytes(stats *WalkStats, limits ThingLimits, additional int) 
 	return nil
 }
 
-// takeMoreBatch consumes IDs from exactly one Reddit MoreComments stub. The API
-// accepts a list of IDs, but does not guarantee complete results when unrelated
-// placeholder depths are mixed; retaining the stub boundary avoids that ambiguity.
-func takeMoreBatch(pending *[]moreGroup, commentParents map[string]string) moreBatch {
+// takeMoreID consumes at most one unresolved ID. Public old.reddit.com expands a
+// kind:"more" placeholder through one focal-comment GET per ID, so no request can
+// silently omit another ID from a batch. Returning scalars avoids allocating a
+// one-element request slice for every production expansion.
+func takeMoreID(pending *[]string, commentParents map[string]string) (string, bool) {
 	for len(*pending) > 0 {
-		group := &(*pending)[0]
-		batch := moreBatch{parent: group.parent, ids: make([]string, 0, min(moreChildrenBatchSize, len(group.ids)))}
-		consumed := 0
-		for consumed < len(group.ids) && len(batch.ids) < moreChildrenBatchSize {
-			id := group.ids[consumed]
-			group.ids[consumed] = ""
-			consumed++
-			if _, resolved := commentParents[id]; !resolved {
-				batch.ids = append(batch.ids, id)
-			}
-		}
-		group.ids = group.ids[consumed:]
-		if len(group.ids) == 0 {
-			(*pending)[0] = moreGroup{}
-			*pending = (*pending)[1:]
-		}
-		if len(batch.ids) > 0 {
-			return batch
+		id := (*pending)[0]
+		(*pending)[0] = ""
+		*pending = (*pending)[1:]
+		if _, resolved := commentParents[id]; !resolved {
+			return id, true
 		}
 	}
-	return moreBatch{}
+	return "", false
+}
+
+// decodeExpansionResponseContext validates a focal listing used to resolve one
+// regular kind:"more" child. A leaf comment is valid; completeness is established
+// by the comment's required replies field and the normal traversal checks.
+func decodeExpansionResponseContext(ctx context.Context, payload []byte, postID, commentID string) (any, error) {
+	roots, err := decodeInitialContext(ctx, payload)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		return nil, errMalformedResponse
+	}
+	postChildren, err := decodeListing(roots[0])
+	if err != nil || len(postChildren) != 1 || validatePostThing(postChildren[0], postID) != nil {
+		return nil, errMalformedResponse
+	}
+	comments, err := decodeListing(roots[1])
+	if err != nil {
+		return nil, err
+	}
+	if len(comments) == 0 {
+		return nil, errIncompleteTree
+	}
+	if len(comments) != 1 {
+		return nil, errMalformedResponse
+	}
+	kind, data, err := decodeThing(comments[0])
+	if err != nil || kind != "t1" {
+		return nil, errMalformedResponse
+	}
+	id, err := decodeRequiredString(data["id"])
+	if err != nil || id != commentID {
+		return nil, errIncompleteTree
+	}
+	if _, present := data["replies"]; !present {
+		return nil, errMalformedResponse
+	}
+	return comments[0], nil
 }
 
 func classifyFetchError(ctx context.Context, endpoint Endpoint, postID string, err error) error {
@@ -1165,15 +1215,18 @@ func decodeContinuationResponseContext(ctx context.Context, payload []byte, post
 		return nil, errMalformedResponse
 	}
 	replies, err := decodeReplies(repliesValue)
-	if err != nil || len(replies) == 0 {
-		return nil, errIncompleteTree
+	if err != nil {
+		return nil, err
+	}
+	if len(replies) == 0 {
+		return nil, errContinuationNoProgress
 	}
 	return comments[0], nil
 }
 
 // validateCommentGraph proves that every t1 parent is present in the accepted post
 // tree and that the canonical parent relation is acyclic. It runs after all flat
-// morechildren responses have been reconciled so response order is irrelevant.
+// focal expansion responses have been reconciled so response order is irrelevant.
 func validateCommentGraph(ctx context.Context, parents map[string]string, origins map[string]Endpoint, order []string, postID string) (Endpoint, error) {
 	root := "t3_" + postID
 	checked := 0
@@ -1247,7 +1300,7 @@ func classifyTreeError(endpoint Endpoint, postID string, err error) error {
 		return newError(ErrorCanceled, endpoint, postID, 0, err)
 	}
 	if errors.Is(err, errThingLimit) || errors.Is(err, errCommentLimit) || errors.Is(err, errMoreIDLimit) ||
-		errors.Is(err, errMoreRequestLimit) || errors.Is(err, errContinuationRequestLimit) ||
+		errors.Is(err, errExpansionRequestLimit) || errors.Is(err, errContinuationRequestLimit) ||
 		errors.Is(err, errCommentBodyTooLarge) || errors.Is(err, errCommentBodiesTooLarge) || errors.Is(err, errResponsesTooLarge) ||
 		errors.Is(err, errInFlightResponseBudget) || errors.Is(err, errRetainedThingBudget) {
 		return resourceError(endpoint, postID, err)

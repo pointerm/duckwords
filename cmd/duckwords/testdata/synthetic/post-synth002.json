@@ -1,0 +1,59 @@
+[
+  {
+    "kind": "Listing",
+    "data": {
+      "children": [
+        {
+          "kind": "t3",
+          "data": {"id": "synth002", "name": "t3_synth002"}
+        }
+      ]
+    }
+  },
+  {
+    "kind": "Listing",
+    "data": {
+      "children": [
+        {
+          "kind": "t1",
+          "data": {
+            "id": "b1",
+            "name": "t1_b1",
+            "link_id": "t3_synth002",
+            "parent_id": "t3_synth002",
+            "body": "Ducks ducks quack by river.",
+            "replies": {
+              "kind": "Listing",
+              "data": {
+                "children": [
+                  {
+                    "kind": "t1",
+                    "data": {
+                      "id": "b2",
+                      "name": "t1_b2",
+                      "link_id": "t3_synth002",
+                      "parent_id": "t1_b1",
+                      "body": "Bird nest reed lake.",
+                      "replies": ""
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "id": "b3",
+            "name": "t1_b3",
+            "link_id": "t3_synth002",
+            "parent_id": "t3_synth002",
+            "body": "water-bird duck's pond",
+            "replies": ""
+          }
+        }
+      ]
+    }
+  }
+]

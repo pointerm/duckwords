@@ -33,8 +33,8 @@ func TestExecuteJSON(t *testing.T) {
 		{name: "created is not the endpoint contract", status: 201, contentType: "application/json", body: `{"value":"ok"}`, limit: 64, wantClass: ErrorProtocol, wantCause: errUnexpectedHTTPStatus},
 		{name: "accepted is not the endpoint contract", status: 202, contentType: "application/json", body: `{"value":"ok"}`, limit: 64, wantClass: ErrorProtocol, wantCause: errUnexpectedHTTPStatus},
 		{name: "partial content cannot prove completeness", status: 206, contentType: "application/json", body: `{"value":"ok"}`, limit: 64, wantClass: ErrorProtocol, wantCause: errUnexpectedHTTPStatus},
-		{name: "authentication", status: 401, contentType: "text/html", body: "planted-secret-body", limit: 64, wantClass: ErrorAuthentication},
-		{name: "forbidden", status: 403, contentType: "application/json", body: `{}`, limit: 64, wantClass: ErrorForbidden},
+		{name: "login required", status: 401, contentType: "text/html", body: "planted-secret-body", limit: 64, wantClass: ErrorAccess},
+		{name: "access denied", status: 403, contentType: "application/json", body: `{}`, limit: 64, wantClass: ErrorAccess},
 		{name: "not found", status: 404, contentType: "application/json", body: `{}`, limit: 64, wantClass: ErrorNotFound},
 		{name: "rate limited", status: 429, contentType: "application/json", body: `{}`, limit: 64, wantClass: ErrorRateLimited},
 		{name: "server", status: 503, contentType: "application/json", body: `{}`, limit: 64, wantClass: ErrorServer},
@@ -214,7 +214,7 @@ func TestExecutePayloadResponseBodyLifecycle(t *testing.T) {
 		wantClass     ErrorClass
 		wantRead      bool
 	}{
-		{name: "status rejected before read", status: http.StatusUnauthorized, contentType: "application/json", payload: []byte("must-not-read"), limit: 64, wantClass: ErrorAuthentication},
+		{name: "status rejected before read", status: http.StatusUnauthorized, contentType: "application/json", payload: []byte("must-not-read"), limit: 64, wantClass: ErrorAccess},
 		{name: "retryable status is bounded-drained", status: http.StatusServiceUnavailable, contentType: "application/json", payload: []byte("small error"), limit: 64, wantClass: ErrorServer, wantRead: true},
 		{name: "declared large retryable body is not drained", status: http.StatusServiceUnavailable, contentType: "application/json", payload: []byte("must-not-read"), contentLength: maxRetryableResponseDrainBytes + 1, limit: 64, wantClass: ErrorServer},
 		{name: "unselected server status is not drained", status: http.StatusNotImplemented, contentType: "application/json", payload: []byte("must-not-read"), limit: 64, wantClass: ErrorServer},

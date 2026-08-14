@@ -23,19 +23,29 @@ const testTimeout = 5 * time.Second
 
 type walkerFunc func(context.Context, string, func(reddit.Comment) error) (reddit.WalkStats, error)
 
+type refWalkerFunc func(context.Context, reddit.PostRef, func(reddit.Comment) error) (reddit.WalkStats, error)
+
 func (walk walkerFunc) WalkComments(
 	ctx context.Context,
-	postID string,
+	post reddit.PostRef,
 	visit func(reddit.Comment) error,
 ) (reddit.WalkStats, error) {
-	return walk(ctx, postID, visit)
+	return walk(ctx, post.ID, visit)
+}
+
+func (walk refWalkerFunc) WalkComments(
+	ctx context.Context,
+	post reddit.PostRef,
+	visit func(reddit.Comment) error,
+) (reddit.WalkStats, error) {
+	return walk(ctx, post, visit)
 }
 
 type pointerWalker struct{}
 
 func (*pointerWalker) WalkComments(
 	context.Context,
-	string,
+	reddit.PostRef,
 	func(reddit.Comment) error,
 ) (reddit.WalkStats, error) {
 	return reddit.WalkStats{}, nil
@@ -107,6 +117,31 @@ func TestDefaultConfigUsesConservativeMemoryAndConcurrencyBounds(t *testing.T) {
 	}
 }
 
+func TestRunPassesValidatedPostIDAndJSONPathToWalker(t *testing.T) {
+	t.Parallel()
+
+	posts, _, err := source.LoadPostList(
+		strings.NewReader("https://old.reddit.com/r/Duck_Pictures/comments/AbC123/a_title/\n"),
+		source.DefaultPostListLimits(),
+	)
+	if err != nil {
+		t.Fatalf("LoadPostList() error = %v", err)
+	}
+	var got reddit.PostRef
+	walker := refWalkerFunc(func(_ context.Context, post reddit.PostRef, _ func(reddit.Comment) error) (reddit.WalkStats, error) {
+		got = post
+		return reddit.WalkStats{}, nil
+	})
+	runner := newRunner(t, 1, FailureModeStrict, walker, nil)
+	if _, err := runner.Run(context.Background(), posts); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	want := reddit.PostRef{ID: "abc123", JSONPath: "/r/duck_pictures/comments/abc123/a_title/.json"}
+	if got != want {
+		t.Fatalf("walker post ref = %#v, want %#v", got, want)
+	}
+}
+
 func TestRunMergesOnlyCompletePostsAndRanksDeterministically(t *testing.T) {
 	t.Parallel()
 
@@ -128,7 +163,7 @@ func TestRunMergesOnlyCompletePostsAndRanksDeterministically(t *testing.T) {
 		}
 		stats := reddit.WalkStats{Comments: len(bodies[postID]), BodiesVisited: len(bodies[postID])}
 		if postID == "p1" {
-			stats.MoreRequests = 1
+			stats.ExpansionRequests = 1
 		}
 		return stats, nil
 	})
@@ -149,7 +184,7 @@ func TestRunMergesOnlyCompletePostsAndRanksDeterministically(t *testing.T) {
 	}
 	wantSummary := Summary{
 		Total: 2, Completed: 2, Comments: 3, BodiesVisited: 3,
-		MoreRequests: 1, CountedTokens: 7, DistinctWords: 4,
+		ExpansionRequests: 1, CountedTokens: 7, DistinctWords: 4,
 	}
 	if result.Summary != wantSummary {
 		t.Fatalf("Summary = %#v, want %#v", result.Summary, wantSummary)
@@ -244,7 +279,7 @@ func TestRunBestEffortDiscardsIncompletePostAsAUnit(t *testing.T) {
 			if err := visit(reddit.Comment{ID: "partial", Body: "duck duck duck"}); err != nil {
 				return reddit.WalkStats{}, err
 			}
-			return reddit.WalkStats{Comments: 1, BodiesVisited: 1}, adapterError(reddit.ErrorIncomplete, reddit.EndpointMoreChildren, postID, 0)
+			return reddit.WalkStats{Comments: 1, BodiesVisited: 1}, adapterError(reddit.ErrorIncomplete, reddit.EndpointCommentExpansion, postID, 0)
 		case "good":
 			if err := visit(reddit.Comment{ID: "complete", Body: "water water"}); err != nil {
 				return reddit.WalkStats{}, err
@@ -271,7 +306,7 @@ func TestRunBestEffortDiscardsIncompletePostAsAUnit(t *testing.T) {
 		t.Fatalf("Summary = %#v, want %#v", result.Summary, wantSummary)
 	}
 	if result.Outcomes[0].Status != OutcomeIncomplete || result.Outcomes[0].ErrorClass != reddit.ErrorIncomplete ||
-		result.Outcomes[0].Endpoint != reddit.EndpointMoreChildren || result.Outcomes[0].CountedTokens != 0 {
+		result.Outcomes[0].Endpoint != reddit.EndpointCommentExpansion || result.Outcomes[0].CountedTokens != 0 {
 		t.Fatalf("incomplete outcome = %#v", result.Outcomes[0])
 	}
 }
@@ -287,11 +322,10 @@ func TestRunBestEffortFailureMatrix(t *testing.T) {
 	}{
 		{name: "resource limit", class: reddit.ErrorResourceLimit, wantStatus: OutcomeIncomplete},
 		{name: "protocol", class: reddit.ErrorProtocol, wantStatus: OutcomeFailed},
-		{name: "forbidden", class: reddit.ErrorForbidden, wantStatus: OutcomeFailed},
+		{name: "access", class: reddit.ErrorAccess, wantStatus: OutcomeFailed},
 		{name: "rate limited", class: reddit.ErrorRateLimited, wantStatus: OutcomeFailed},
 		{name: "server", class: reddit.ErrorServer, wantStatus: OutcomeFailed},
 		{name: "transport", class: reddit.ErrorTransport, wantStatus: OutcomeFailed},
-		{name: "authentication", class: reddit.ErrorAuthentication, wantStatus: OutcomeFailed, wantFatal: true},
 		{name: "invalid input", class: reddit.ErrorInvalidInput, wantStatus: OutcomeFailed, wantFatal: true},
 		{name: "visitor", class: reddit.ErrorVisitor, wantStatus: OutcomeFailed, wantFatal: true},
 		{name: "canceled", class: reddit.ErrorCanceled, wantStatus: OutcomeFailed, wantFatal: true},
@@ -341,6 +375,34 @@ func TestRunBestEffortFailureMatrix(t *testing.T) {
 				t.Fatalf("Words = %#v", result.Words)
 			}
 		})
+	}
+}
+
+func TestNotFoundIsSkippedOnlyForInitialHTTP404Or410(t *testing.T) {
+	t.Parallel()
+
+	for _, statusCode := range []int{404, 410} {
+		status, fatal, class, endpoint, gotStatus := classifyPostError(
+			adapterError(reddit.ErrorNotFound, reddit.EndpointComments, "post1", statusCode), nil,
+		)
+		if status != OutcomeSkipped || fatal || class != reddit.ErrorNotFound || endpoint != reddit.EndpointComments || gotStatus != statusCode {
+			t.Fatalf("status %d classification = %q fatal=%t class=%q endpoint=%q HTTP=%d", statusCode, status, fatal, class, endpoint, gotStatus)
+		}
+	}
+
+	for _, test := range []struct {
+		name       string
+		endpoint   reddit.Endpoint
+		statusCode int
+	}{
+		{name: "statusless initial", endpoint: reddit.EndpointComments},
+		{name: "expansion 404", endpoint: reddit.EndpointCommentExpansion, statusCode: 404},
+		{name: "continuation 410", endpoint: reddit.EndpointContinuation, statusCode: 410},
+	} {
+		status, fatal, _, _, _ := classifyPostError(adapterError(reddit.ErrorNotFound, test.endpoint, "post1", test.statusCode), nil)
+		if status != OutcomeFailed || fatal {
+			t.Errorf("%s classification = %q fatal=%t, want recoverable failed", test.name, status, fatal)
+		}
 	}
 }
 

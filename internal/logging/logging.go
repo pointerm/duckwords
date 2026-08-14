@@ -57,6 +57,8 @@ const (
 	EventSourceParsed Event = "source_parsed"
 	// EventRetry records a scheduled transient-request retry.
 	EventRetry Event = "request_retry"
+	// EventHTTPAttempt records one sanitized completed Reddit HTTP attempt.
+	EventHTTPAttempt Event = "http_attempt"
 	// EventPostOutcome records one sanitized per-post terminal outcome.
 	EventPostOutcome Event = "post_outcome"
 	// EventRunSummary records reconciled processing counters and provenance.
@@ -96,7 +98,7 @@ type Options struct {
 
 // Sink owns a structured logger and records the first handler/write error. slog's
 // Logger methods intentionally do not return handler errors, so process composition
-// must inspect Err before declaring a successful evidence log.
+// must inspect Err before declaring a successful application log.
 type Sink struct {
 	logger   *slog.Logger
 	firstErr atomic.Pointer[recordedError]
@@ -139,7 +141,7 @@ func New(w io.Writer, options Options) (*Sink, error) {
 			if attr.Key == slog.TimeKey && attr.Value.Kind() == slog.KindTime {
 				attr.Value = slog.TimeValue(attr.Value.Time().UTC())
 			}
-			// Primitive structured fields make the evidence log reviewable. Arbitrary
+			// Primitive structured fields make the application log reviewable. Arbitrary
 			// values can invoke String or JSON methods that expose an error or payload,
 			// so redact KindAny as a defense-in-depth boundary.
 			sensitiveGroup := false

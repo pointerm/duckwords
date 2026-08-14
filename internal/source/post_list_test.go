@@ -15,8 +15,8 @@ func TestLoadPostListNormalizesDeduplicatesAndReportsProvenance(t *testing.T) {
 
 	const input = "  https://old.reddit.com/r/duck/comments/ABC123/first  \r\n" +
 		"\r\n" +
-		"https://redd.it/def456?utm_source=share\n" +
-		"https://www.reddit.com/comments/abc123/duplicate#context\n" +
+		"https://redd.it/def456\n" +
+		"https://www.reddit.com/comments/abc123/duplicate\n" +
 		"https://reddit.com/r/duck/comments/789xyz/final"
 
 	list, stats, err := LoadPostList(strings.NewReader(input), DefaultPostListLimits())
@@ -24,9 +24,9 @@ func TestLoadPostListNormalizesDeduplicatesAndReportsProvenance(t *testing.T) {
 		t.Fatalf("LoadPostList() error = %v", err)
 	}
 	wantPosts := []Post{
-		{ID: "abc123", SourceLine: 1},
-		{ID: "def456", SourceLine: 3},
-		{ID: "789xyz", SourceLine: 5},
+		{ID: "abc123", JSONPath: "/r/duck/comments/abc123/first/.json", SourceLine: 1},
+		{ID: "def456", JSONPath: "/comments/def456/.json", SourceLine: 3},
+		{ID: "789xyz", JSONPath: "/r/duck/comments/789xyz/final/.json", SourceLine: 5},
 	}
 	if got := list.Posts(); !reflect.DeepEqual(got, wantPosts) {
 		t.Fatalf("Posts() = %#v, want %#v", got, wantPosts)

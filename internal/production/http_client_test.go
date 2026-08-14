@@ -30,9 +30,9 @@ func TestNewProductionHTTPClientUsesFiniteSharedTransportPolicy(t *testing.T) {
 	if !transport.ForceAttemptHTTP2 {
 		t.Fatal("ForceAttemptHTTP2 = false")
 	}
-	if transport.MaxConnsPerHost != 12 || transport.MaxIdleConnsPerHost != 12 {
+	if transport.MaxConnsPerHost != 10 || transport.MaxIdleConnsPerHost != 10 {
 		t.Fatalf(
-			"connection bounds = max %d, idle %d, want 12",
+			"connection bounds = max %d, idle %d, want 10",
 			transport.MaxConnsPerHost,
 			transport.MaxIdleConnsPerHost,
 		)

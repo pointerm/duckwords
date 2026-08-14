@@ -1,7 +1,8 @@
 # Deny by default. This excludes VCS data, .env files, IDE metadata, artifacts,
-# local binaries, caches, logs, general documentation, and checked data fixtures from
-# the build context. Go test files remain available to the explicit fixture stage;
-# the required redistribution notice is the sole documentation exception.
+# local binaries, caches, logs, general documentation, and top-level testdata from
+# the build context. Go test files and their embedded fixtures under cmd/ remain
+# available to the explicit fixture stage; the required redistribution notice is the
+# sole documentation exception.
 **
 
 !go.mod

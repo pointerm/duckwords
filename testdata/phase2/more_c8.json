@@ -1,8 +1,16 @@
-{
-  "json": {
-    "errors": [],
+[
+  {
+    "kind": "Listing",
     "data": {
-      "things": [
+      "children": [
+        {"kind": "t3", "data": {"id": "duck123", "name": "t3_duck123"}}
+      ]
+    }
+  },
+  {
+    "kind": "Listing",
+    "data": {
+      "children": [
         {
           "kind": "t1",
           "data": {
@@ -17,4 +25,4 @@
       ]
     }
   }
-}
+]

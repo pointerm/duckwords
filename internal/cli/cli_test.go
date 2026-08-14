@@ -17,7 +17,6 @@ import (
 	"github.com/pointerm/duckwords/internal/app"
 	"github.com/pointerm/duckwords/internal/config"
 	"github.com/pointerm/duckwords/internal/logging"
-	"github.com/pointerm/duckwords/internal/production"
 	"github.com/pointerm/duckwords/internal/reddit"
 	"github.com/pointerm/duckwords/internal/runlog"
 )
@@ -62,6 +61,27 @@ func TestRunInformationalPathsDoNotExecute(t *testing.T) {
 				t.Fatalf("stderr = %q, want empty", stderr.String())
 			}
 		})
+	}
+}
+
+func TestRunInformationalPathsDoNotReadBrowserSession(t *testing.T) {
+	t.Setenv("REDDIT_BROWSER_COOKIE", "invalid browser session that has no equals sign")
+
+	for _, arguments := range [][]string{{"--help"}, {"--version"}} {
+		var stdout, stderr strings.Builder
+		code := run(
+			context.Background(),
+			arguments,
+			&stdout,
+			&stderr,
+			func(context.Context, config.Config, *slog.Logger) (app.Result, error) {
+				t.Fatal("executor was called on an informational path")
+				return app.Result{}, nil
+			},
+		)
+		if code != exitSuccess || stdout.Len() == 0 || stderr.Len() != 0 {
+			t.Fatalf("run(%v) = code %d, stdout %q, stderr %q", arguments, code, stdout.String(), stderr.String())
+		}
 	}
 }
 
@@ -549,14 +569,20 @@ func TestRunParentDeadlineMapsToFailure(t *testing.T) {
 	}
 }
 
-func TestRunProductionExecutorFailsClosedWithoutApproval(t *testing.T) {
-	t.Setenv("REDDIT_API_ACCESS_APPROVED", "")
-	t.Setenv("REDDIT_CLIENT_ID", "")
-	t.Setenv("REDDIT_CLIENT_SECRET", "")
+func TestRunRejectsInvalidUserAgentBeforeExecutor(t *testing.T) {
 	t.Setenv("REDDIT_USER_AGENT", "")
 
 	var stdout, stderr strings.Builder
-	code := run(context.Background(), []string{"--workers=1"}, &stdout, &stderr, production.Execute)
+	code := run(
+		context.Background(),
+		[]string{"--workers=1"},
+		&stdout,
+		&stderr,
+		func(context.Context, config.Config, *slog.Logger) (app.Result, error) {
+			t.Fatal("executor was called with an invalid User-Agent override")
+			return app.Result{}, nil
+		},
+	)
 
 	if code != exitFailure {
 		t.Fatalf("run() exit code = %d, want %d", code, exitFailure)
@@ -564,18 +590,41 @@ func TestRunProductionExecutorFailsClosedWithoutApproval(t *testing.T) {
 	if stdout.Len() != 0 {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
-	if !strings.Contains(stderr.String(), "event=run_started") ||
+	if strings.Contains(stderr.String(), "event=run_started") ||
 		!strings.Contains(stderr.String(), "event=run_failed") ||
-		!strings.HasSuffix(stderr.String(), "duckwords: Reddit Data API access is not confirmed; obtain Reddit's approval, then set REDDIT_API_ACCESS_APPROVED=true (see README)\n") {
-		t.Fatalf("stderr = %q, want structured fail-closed lifecycle and stable diagnostic", stderr.String())
+		!strings.HasSuffix(stderr.String(), "duckwords: Reddit client setup failed; check the optional REDDIT_USER_AGENT and REDDIT_BROWSER_* values documented by --help\n") {
+		t.Fatalf("stderr = %q, want fail-closed user-agent diagnostic", stderr.String())
 	}
 }
 
-func TestRunProductionExecutorFailureIsPureJSON(t *testing.T) {
-	t.Setenv("REDDIT_API_ACCESS_APPROVED", "")
-	t.Setenv("REDDIT_CLIENT_ID", "must-not-appear")
-	t.Setenv("REDDIT_CLIENT_SECRET", "must-not-appear")
-	t.Setenv("REDDIT_USER_AGENT", "must-not-appear")
+func TestRunRejectsInvalidBrowserSessionWithoutEchoingIt(t *testing.T) {
+	const canary = "browser-session-private-canary"
+	t.Setenv("REDDIT_BROWSER_COOKIE", "reddit_session="+canary+"\r\nAuthorization: planted")
+
+	var stdout, stderr strings.Builder
+	code := run(
+		context.Background(),
+		[]string{"--workers=1"},
+		&stdout,
+		&stderr,
+		func(context.Context, config.Config, *slog.Logger) (app.Result, error) {
+			t.Fatal("executor was called with an invalid browser session")
+			return app.Result{}, nil
+		},
+	)
+
+	if code != exitFailure || stdout.Len() != 0 {
+		t.Fatalf("run() exit code = %d, stdout = %q", code, stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "event=run_failed") ||
+		!strings.HasSuffix(stderr.String(), "duckwords: Reddit client setup failed; check the optional REDDIT_USER_AGENT and REDDIT_BROWSER_* values documented by --help\n") ||
+		strings.Contains(stderr.String(), canary) {
+		t.Fatalf("stderr = %q, want sanitized browser-session rejection", stderr.String())
+	}
+}
+
+func TestRunInvalidUserAgentFailureIsPureJSON(t *testing.T) {
+	t.Setenv("REDDIT_USER_AGENT", "must-not-appear\r\nX-Test: secret")
 
 	var stdout, stderr strings.Builder
 	code := run(
@@ -583,7 +632,10 @@ func TestRunProductionExecutorFailureIsPureJSON(t *testing.T) {
 		[]string{"--workers=1", "--log-format=json"},
 		&stdout,
 		&stderr,
-		production.Execute,
+		func(context.Context, config.Config, *slog.Logger) (app.Result, error) {
+			t.Fatal("executor was called with an invalid User-Agent override")
+			return app.Result{}, nil
+		},
 	)
 
 	if code != exitFailure {
@@ -638,7 +690,7 @@ func TestRunOutputFailures(t *testing.T) {
 	}
 }
 
-func TestRunFailsWhenTerminalEvidenceLogCannotBeWritten(t *testing.T) {
+func TestRunFailsWhenTerminalApplicationLogCannotBeWritten(t *testing.T) {
 	t.Parallel()
 
 	stderr := &failOnWriteWriter{failAt: 2}
@@ -849,16 +901,14 @@ func TestConfigDiagnosticNamesTheDisallowedHost(t *testing.T) {
 		t.Fatalf("run() exit code = %d, want %d", code, exitUsage)
 	}
 	if !strings.Contains(stderr.String(), "gist.githubusercontent.com") ||
-		strings.Contains(stderr.String(), "Reddit approval") {
-		t.Fatalf("stderr = %q, want the allowed host and no Reddit-approval misdirection", stderr.String())
+		strings.Contains(stderr.String(), "REDDIT_API_ACCESS_APPROVED") {
+		t.Fatalf("stderr = %q, want the allowed host and no legacy-access misdirection", stderr.String())
 	}
 }
 
-// TestSkippedOutcomeIsLoggedInTheEvidenceContract closes the runner → JSON log →
-// evidence-finalizer chain for a provably absent post. internal/evidence parses this
-// exact record shape, so a drift between the two would otherwise only surface after
-// the one approved live capture had already been spent.
-func TestSkippedOutcomeIsLoggedInTheEvidenceContract(t *testing.T) {
+// TestSkippedOutcomeIsLoggedWithStableFields proves a missing post remains
+// machine-readable in the application log without contributing counts.
+func TestSkippedOutcomeIsLoggedWithStableFields(t *testing.T) {
 	t.Parallel()
 
 	var stderr strings.Builder
@@ -895,8 +945,7 @@ func TestSkippedOutcomeIsLoggedInTheEvidenceContract(t *testing.T) {
 	if skipped == nil {
 		t.Fatalf("no skipped post_outcome record:\n%s", stderr.String())
 	}
-	// These are exactly the fields internal/evidence requires of a skipped record:
-	// absence proven by the comments endpoint, with no HTTP status of its own.
+	// The comments endpoint proves absence without a synthetic HTTP status.
 	if skipped["error_class"] != "not_found" || skipped["operation"] != "comments" {
 		t.Fatalf("skipped record = %#v, want not_found on the comments endpoint", skipped)
 	}

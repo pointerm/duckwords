@@ -9,7 +9,7 @@ import (
 func BenchmarkLoadPostList(b *testing.B) {
 	var input strings.Builder
 	for i := 0; i < 10_000; i++ {
-		fmt.Fprintf(&input, "https://old.reddit.com/r/duck/comments/%x/synthetic_title/%s\n", i+1, strings.Repeat("x", 16))
+		fmt.Fprintf(&input, "https://old.reddit.com/r/duck/comments/%x/%s/\n", i+1, strings.Repeat("x", 16))
 	}
 	source := input.String()
 	limits := DefaultPostListLimits()

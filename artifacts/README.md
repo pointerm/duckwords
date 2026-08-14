@@ -1,35 +1,20 @@
-# Evidence artifacts
+# Artifacts
 
-This directory separates reproducible local review output from the canonical
-assignment evidence:
+Most generated files under this directory are intentionally ignored by Git.
 
-- `review/` is ignored scratch evidence from deterministic tests, Docker checks,
-  and other non-submission diagnostics. Raw stdout/stderr from a failed or
-  interrupted live capture is never copied here; the capture helper securely
-  discards its private staging directory.
-- `submission/` is created exactly once by the Phase 6 capture helper after a
-  complete (`0`) or explicitly partial (`3`) approved live run. It contains
-  `result.json`, `application.log`, `full-application.log`,
-  `run-manifest.json`, and `RUN.md` from that one invocation.
+- `review/` contains deterministic fixture, Docker-parity, and one-post smoke output.
+- `run/` is created by `make assignment-run` and contains `result.json`,
+  `application.log`, and `full-application.log` from one invocation.
+- `captured-runs/` contains deliberately committed, manually reviewed result-only
+  snapshots. Each capture documents its provenance and completeness limitations;
+  these examples are not canonical submission evidence.
 
-The capture helper refuses to replace an existing `submission/` directory. Review
-the generated bundle for secrets and reconcile it against the submitted full commit
-before attaching the directory separately to the submission. `submission/` is
-ignored intentionally and must never be committed to the candidate branch: adding
-the evidence would create a different commit from the SHA that the evidence proves.
-Preserve the directory byte for byte and identify it by the full candidate SHA in its
-manifest and in the submission portal or cover note. No live bundle is present until
-Reddit Data API approval, final candidate metadata, and the documented capture
-prerequisites all exist.
+`full-application.log` is the application log followed by a fixed marker and the
+exact JSON result, matching the assignment's attachment requirement. Check the
+process exit status before submitting it: exit `0` is complete, exit `3` is partial,
+and exit `1` is a failed run.
 
-A hard termination may leave `submission.capture-lock/` with a safe PID and candidate
-SHA. The wrapper deliberately refuses to guess that it is stale; inspect running
-processes and the candidate before removing it manually. If the evidence finalizer
-fails after creating the destination, the wrapper writes `CAPTURE_FAILED`, retains
-the lock, and exits nonzero. That directory is quarantined diagnostic output, not a
-submission bundle.
-
-Canonical wrapper invocations are serialized before live I/O. Because Go exposes no
-portable atomic rename-with-no-replace operation, an unrelated same-user process that
-creates an empty destination directory in the final publication window is outside
-this guarantee; use a controlled candidate workspace for the one final capture.
+Do not commit arbitrary generated run output, browser cookies, raw Reddit responses,
+or other session material. A file belongs under `captured-runs/` only after manual
+review and a blocking secret scan. Review every file again before attaching anything
+to the submission.

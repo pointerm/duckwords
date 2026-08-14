@@ -20,24 +20,25 @@ import (
 	"github.com/pointerm/duckwords/internal/runlog"
 )
 
-func TestExecuteProductionRejectsApprovalBeforeHTTPOrSourceIO(t *testing.T) {
+func TestExecuteProductionRejectsInvalidUserAgentBeforeHTTPOrSourceIO(t *testing.T) {
 	t.Parallel()
 
 	var logs strings.Builder
 	sink := mustTestLogSink(t, &logs)
 	httpCalls := 0
 	result, err := executeProduction(context.Background(), productionTestConfig(), sink.Logger(), Dependencies{
-		lookupEnv: mapLookup(map[string]string{}),
+		lookupEnv: mapLookup(map[string]string{envRedditUserAgent: ""}),
 		newHTTP: func(time.Duration, int) (*http.Client, error) {
 			httpCalls++
 			return nil, errors.New("must not run")
 		},
 		now: fixedProductionClock(),
 	})
-	if !errors.Is(err, ErrConfig) || httpCalls != 0 {
+	if !errors.Is(err, ErrRedditSetup) || httpCalls != 0 {
 		t.Fatalf("result = %+v, error = %v, HTTP factory calls = %d", result, err, httpCalls)
 	}
-	if strings.Contains(logs.String(), "event=run_started") || !strings.Contains(logs.String(), "event=run_failed") {
+	if strings.Contains(logs.String(), "event=run_started") || !strings.Contains(logs.String(), "event=run_failed") ||
+		strings.Contains(logs.String(), "REDDIT_USER_AGENT") {
 		t.Fatalf("logs = %q, want production failure without duplicating the CLI-owned start event", logs.String())
 	}
 }
@@ -85,7 +86,8 @@ func TestExecuteProductionLocalSourcesFailOnlyAtFixedRedditEndpoint(t *testing.T
 	var logs strings.Builder
 	sink := mustTestLogSink(t, &logs)
 	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		if request.URL.String() != "https://www.reddit.com/api/v1/access_token" {
+		if request.URL.Scheme != "https" || request.URL.Host != RedditOrigin ||
+			request.URL.Path != "/comments/duck123/.json" {
 			t.Fatalf("unexpected network destination %s", request.URL.Redacted())
 		}
 		return nil, errors.New("injected offline transport failure")
@@ -105,7 +107,7 @@ func TestExecuteProductionLocalSourcesFailOnlyAtFixedRedditEndpoint(t *testing.T
 			t.Fatalf("logs do not contain %q:\n%s", want, logs.String())
 		}
 	}
-	for _, canary := range []string{"client-secret", postsFile, dictionaryFile, "injected offline transport failure"} {
+	for _, canary := range []string{postsFile, dictionaryFile, "injected offline transport failure"} {
 		if strings.Contains(logs.String(), canary) || strings.Contains(err.Error(), canary) {
 			t.Fatalf("secret %q leaked: error=%q logs=%q", canary, err, logs.String())
 		}
@@ -127,26 +129,29 @@ func TestExecuteProductionComposesOfflineEndToEnd(t *testing.T) {
 	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		requests = append(requests, request.URL.Host+request.URL.Path)
 		header := http.Header{"Content-Type": {"application/json"}}
-		switch request.URL.String() {
-		case "https://www.reddit.com/api/v1/access_token":
-			clientID, secret, ok := request.BasicAuth()
-			if !ok || clientID != "client-id" || secret != "client-secret" {
-				t.Error("OAuth request did not carry the configured confidential-client credentials")
-			}
-			return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(`{"access_token":"offline-token","token_type":"bearer","expires_in":3600}`))}, nil
-		default:
-			if request.URL.Host != "oauth.reddit.com" || request.URL.Path != "/comments/duck123" ||
-				request.Header.Get("Authorization") != "Bearer offline-token" || request.URL.Query().Get("raw_json") != "1" {
-				t.Fatalf("unexpected Reddit request %s", request.URL.Redacted())
-			}
-			return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(initial))}, nil
+		if request.Method != http.MethodGet || request.URL.Scheme != "https" || request.URL.Host != RedditOrigin ||
+			request.URL.Path != "/comments/duck123/.json" ||
+			request.URL.Query().Encode() != "limit=500&raw_json=1&showmore=true&sort=confidence" ||
+			request.Header.Get("Accept") != "application/json" ||
+			request.Header.Get("Authorization") != "" || request.Header.Get("Cookie") != "" ||
+			request.Body != nil || request.UserAgent() != validProductionEnvironment()[envRedditUserAgent] {
+			t.Fatalf("unexpected public Reddit request %s", request.URL.Redacted())
 		}
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(initial))}, nil
 	})
 	client := &http.Client{Transport: transport, Timeout: time.Second}
+	access, accessErr := ResolveAccessIdentity(mapLookup(validProductionEnvironment()))
+	if accessErr != nil {
+		t.Fatalf("ResolveAccessIdentity() error = %v", accessErr)
+	}
+	lookupCalls := 0
 	dependencies := Dependencies{
-		lookupEnv: mapLookup(validProductionEnvironment()),
-		newHTTP:   func(time.Duration, int) (*http.Client, error) { return client, nil },
-		now:       time.Now,
+		lookupEnv: func(string) (string, bool) {
+			lookupCalls++
+			return "", false
+		},
+		newHTTP: func(time.Duration, int) (*http.Client, error) { return client, nil },
+		now:     time.Now,
 	}
 	cfg := productionTestConfig()
 	cfg.Posts = config.InputSource{Kind: config.SourceFile, Location: postsFile}
@@ -154,7 +159,8 @@ func TestExecuteProductionComposesOfflineEndToEnd(t *testing.T) {
 	cfg.RateLimit = config.MaxRateLimit
 	var logs strings.Builder
 	sink := mustTestLogSink(t, &logs)
-	result, err := executeProduction(context.Background(), cfg, sink.Logger(), dependencies)
+	ctx := ContextWithAccessIdentity(context.Background(), access)
+	result, err := executeProduction(ctx, cfg, sink.Logger(), dependencies)
 	if err != nil {
 		t.Fatalf("executeProduction() error = %v; logs:\n%s", err, logs.String())
 	}
@@ -165,16 +171,135 @@ func TestExecuteProductionComposesOfflineEndToEnd(t *testing.T) {
 	if result.Summary.Total != 1 || result.Summary.Completed != 1 || result.Summary.Comments != 1 || result.Summary.Partial {
 		t.Fatalf("Summary = %#v, want one complete post", result.Summary)
 	}
-	if len(requests) != 2 || requests[0] != "www.reddit.com/api/v1/access_token" || requests[1] != "oauth.reddit.com/comments/duck123" {
-		t.Fatalf("requests = %v, want fixed OAuth then comments endpoints", requests)
+	if len(requests) != 1 || requests[0] != "old.reddit.com/comments/duck123/.json" {
+		t.Fatalf("requests = %v, want one fixed public JSON endpoint", requests)
 	}
-	for _, want := range []string{"event=source_parsed", "event=post_outcome", "status=completed", "event=run_summary", "source_retries=0", "reddit_http_attempts=2", "reddit_retries=0"} {
+	if lookupCalls != 0 {
+		t.Fatalf("environment lookup calls = %d, want identity resolved exactly once before composition", lookupCalls)
+	}
+	for _, want := range []string{
+		"event=source_parsed", "event=http_attempt", "operation=comments", "result=success",
+		"http_status=200", "event=post_outcome", "status=completed", "event=run_summary",
+		"source_retries=0", "reddit_http_attempts=1", "reddit_retries=0",
+		"access_profile=old-reddit-public-json-v1", "reddit_origin=old.reddit.com",
+		"reddit_method=GET", "reddit_auth=none", "ua_source=override", "ua_sha256=",
+	} {
 		if !strings.Contains(logs.String(), want) {
 			t.Fatalf("logs do not contain %q:\n%s", want, logs.String())
 		}
 	}
-	if strings.Contains(logs.String(), "client-secret") || strings.Contains(logs.String(), "offline-token") {
-		t.Fatalf("logs leaked credentials: %s", logs.String())
+	if strings.Contains(logs.String(), validProductionEnvironment()[envRedditUserAgent]) {
+		t.Fatalf("logs leaked raw User-Agent: %s", logs.String())
+	}
+}
+
+func TestExecuteProductionBrowserSessionIsPinnedToRedditAndLoggedWithoutSecrets(t *testing.T) {
+	const (
+		cookie         = "reddit_session=browser-private-canary; loid=abc123"
+		browserUA      = "Mozilla/5.0 DuckWords session integration test"
+		acceptLanguage = "en-US,en;q=0.9"
+		secCHUA        = `"Chromium";v="126"`
+		secPlatform    = `"macOS"`
+	)
+	values := validProductionEnvironment()
+	values[envRedditUserAgent] = browserUA
+	values[envRedditBrowserCookie] = cookie
+	values[envRedditBrowserAcceptLanguage] = acceptLanguage
+	values[envRedditBrowserSecCHUA] = secCHUA
+	values[envRedditBrowserSecCHUAMobile] = "?0"
+	values[envRedditBrowserSecCHUAPlatform] = secPlatform
+	access, err := ResolveAccessIdentity(mapLookup(values))
+	if err != nil {
+		t.Fatalf("ResolveAccessIdentity() error = %v", err)
+	}
+
+	const initial = `[{"kind":"Listing","data":{"children":[{"kind":"t3","data":{"id":"duck123","name":"t3_duck123"}}]}},{"kind":"Listing","data":{"children":[{"kind":"t1","data":{"id":"c1","name":"t1_c1","link_id":"t3_duck123","parent_id":"t3_duck123","body":"Duck.","replies":""}}]}}]`
+	var sourceRequests, redditRequests int
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var body, contentType string
+		switch request.URL.Host {
+		case "gist.githubusercontent.com":
+			sourceRequests++
+			body = "https://redd.it/duck123\n"
+			contentType = "text/plain; charset=utf-8"
+		case "raw.githubusercontent.com":
+			sourceRequests++
+			body = "duck\n"
+			contentType = "text/plain; charset=utf-8"
+		case RedditOrigin:
+			redditRequests++
+			body = initial
+			contentType = "application/json"
+			if request.Header.Get("Cookie") != cookie || request.UserAgent() != browserUA ||
+				request.Header.Get("Accept-Language") != acceptLanguage ||
+				request.Header.Get("Sec-CH-UA") != secCHUA ||
+				request.Header.Get("Sec-CH-UA-Mobile") != "?0" ||
+				request.Header.Get("Sec-CH-UA-Platform") != secPlatform ||
+				request.Header.Get("Sec-Fetch-Dest") != "empty" ||
+				request.Header.Get("Sec-Fetch-Mode") != "cors" ||
+				request.Header.Get("Sec-Fetch-Site") != "same-origin" {
+				t.Fatal("Reddit request did not carry the exact browser-session allowlist")
+			}
+		default:
+			t.Fatalf("unexpected destination %s", request.URL.Redacted())
+		}
+		if request.URL.Host != RedditOrigin {
+			for _, header := range []string{"Cookie", "Accept-Language", "Sec-CH-UA", "Sec-CH-UA-Mobile", "Sec-CH-UA-Platform", "Sec-Fetch-Dest", "Sec-Fetch-Mode", "Sec-Fetch-Site"} {
+				if request.Header.Get(header) != "" {
+					t.Fatalf("source request received browser header %s", header)
+				}
+			}
+			if request.UserAgent() == browserUA {
+				t.Fatal("source request received the browser User-Agent")
+			}
+		}
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        http.Header{"Content-Type": {contentType}},
+			Body:          io.NopCloser(strings.NewReader(body)),
+			ContentLength: int64(len(body)),
+			Request:       request,
+		}, nil
+	})
+
+	cfg := productionTestConfig()
+	cfg.RateLimit = config.MaxRateLimit
+	client := &http.Client{Transport: transport, Timeout: time.Second}
+	var logs strings.Builder
+	sink := mustTestLogSink(t, &logs)
+	result, err := executeProduction(
+		ContextWithAccessIdentity(context.Background(), access),
+		cfg,
+		sink.Logger(),
+		Dependencies{
+			lookupEnv: func(string) (string, bool) {
+				t.Fatal("environment was read again after identity resolution")
+				return "", false
+			},
+			newHTTP: func(time.Duration, int) (*http.Client, error) { return client, nil },
+			now:     time.Now,
+		},
+	)
+	if err != nil || len(result.Words) != 1 || result.Words[0].Word != "duck" || result.Words[0].Count != 1 {
+		t.Fatalf("result = %+v, error = %v; logs:\n%s", result, err, logs.String())
+	}
+	if sourceRequests != 2 || redditRequests != 1 {
+		t.Fatalf("source requests = %d, Reddit requests = %d", sourceRequests, redditRequests)
+	}
+	for _, want := range []string{
+		"access_profile=old-reddit-browser-session-json-v1",
+		"reddit_auth=browser-session",
+		"reddit_origin=old.reddit.com",
+		"ua_source=override",
+	} {
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("logs do not contain %q:\n%s", want, logs.String())
+		}
+	}
+	for _, secret := range []string{cookie, browserUA, acceptLanguage, secCHUA, secPlatform} {
+		if strings.Contains(logs.String(), secret) {
+			t.Fatalf("logs leaked browser-session value %q: %s", secret, logs.String())
+		}
 	}
 }
 
@@ -297,6 +422,7 @@ func TestSourceRetryLoggingIsSanitizedAndCountedInSummary(t *testing.T) {
 	log.Summary(
 		context.Background(),
 		productionTestConfig(),
+		runlogTestAccessIdentity(),
 		app.Result{},
 		reddit.RequestPolicySnapshot{HTTPAttempts: 7, Retries: 2},
 		"posts-digest",
@@ -350,11 +476,16 @@ func productionTestConfig() config.Config {
 
 func validProductionEnvironment() map[string]string {
 	return map[string]string{
-		envRedditAPIApproved:  "true",
-		envRedditClientID:     "client-id",
-		envRedditClientSecret: "client-secret",
-		envRedditUserAgent:    "darwin:duckwords:test (by /u/example)",
+		envRedditUserAgent: "duckwords-test/1.0 (+https://github.com/pointerm/duckwords)",
 	}
+}
+
+func runlogTestAccessIdentity() runlog.AccessIdentity {
+	access, err := ResolveAccessIdentity(mapLookup(validProductionEnvironment()))
+	if err != nil {
+		panic(err)
+	}
+	return runlogAccessIdentity(access)
 }
 
 func fixedProductionClock() func() time.Time {

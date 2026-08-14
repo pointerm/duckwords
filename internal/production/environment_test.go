@@ -1,126 +1,235 @@
 package production
 
 import (
+	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
 
-func TestCredentialsFromEnvironmentRequiresExplicitApprovalBeforeCredentials(t *testing.T) {
+func TestResolveAccessIdentityUsesBuiltinWithoutCredentials(t *testing.T) {
 	t.Parallel()
 
-	lookedUp := make([]string, 0, 1)
-	credentials, err := credentialsFromEnvironment(func(name string) (string, bool) {
-		lookedUp = append(lookedUp, name)
+	var lookups []string
+	identity, err := ResolveAccessIdentity(func(name string) (string, bool) {
+		lookups = append(lookups, name)
 		return "", false
 	})
-	if credentials != (redditCredentials{}) || !errors.Is(err, errApprovalRequired) {
-		t.Fatalf("credentials = %+v, error = %v", credentials, err)
-	}
-	if len(lookedUp) != 1 || lookedUp[0] != envRedditAPIApproved {
-		t.Fatalf("lookups = %v, want approval only", lookedUp)
-	}
-}
-
-// TestCredentialsFromEnvironmentRejectsCredentialsWithoutApproval proves that holding
-// an application's credentials is never treated as Reddit having approved this use.
-func TestCredentialsFromEnvironmentRejectsCredentialsWithoutApproval(t *testing.T) {
-	t.Parallel()
-
-	for _, approval := range []string{"", "false", "TRUE", "true ", "1", "yes"} {
-		approval := approval
-		t.Run("approval="+approval, func(t *testing.T) {
-			t.Parallel()
-
-			values := map[string]string{
-				envRedditAPIApproved:  approval,
-				envRedditClientID:     "client-id",
-				envRedditClientSecret: "client-secret",
-				envRedditUserAgent:    "darwin:duckwords:1.0 (by /u/example)",
-			}
-			credentials, err := credentialsFromEnvironment(mapLookup(values))
-			if credentials != (redditCredentials{}) || !errors.Is(err, errApprovalRequired) {
-				t.Fatalf("credentials = %+v, error = %v; complete credentials must not imply approval", credentials, err)
-			}
-		})
-	}
-}
-
-func TestCredentialsFromEnvironmentNamesTheMissingCredential(t *testing.T) {
-	t.Parallel()
-
-	values := map[string]string{envRedditAPIApproved: "true"}
-	credentials, err := credentialsFromEnvironment(mapLookup(values))
-	if credentials != (redditCredentials{}) || !errors.Is(err, errEnvironmentConfig) {
-		t.Fatalf("credentials = %+v, error = %v", credentials, err)
-	}
-	if !strings.Contains(err.Error(), envRedditClientID) {
-		t.Fatalf("error does not name the missing variable: %q", err)
-	}
-}
-
-func TestCredentialsFromEnvironmentAcceptsCompleteExactConfiguration(t *testing.T) {
-	t.Parallel()
-
-	values := map[string]string{
-		envRedditAPIApproved:  "true",
-		envRedditClientID:     "client-id",
-		envRedditClientSecret: "client-secret",
-		envRedditUserAgent:    "darwin:duckwords:1.0 (by /u/example)",
-	}
-	credentials, err := credentialsFromEnvironment(mapLookup(values))
 	if err != nil {
-		t.Fatalf("credentialsFromEnvironment() error = %v", err)
+		t.Fatalf("ResolveAccessIdentity() error = %v", err)
 	}
-	if !credentials.approved || credentials.clientID != values[envRedditClientID] ||
-		credentials.clientSecret != values[envRedditClientSecret] ||
-		credentials.userAgent != values[envRedditUserAgent] {
-		t.Fatalf("credentials = %+v, want complete environment values", credentials)
+	wantLookups := []string{
+		envRedditUserAgent,
+		envRedditBrowserCookie,
+		envRedditBrowserAcceptLanguage,
+		envRedditBrowserSecCHUA,
+		envRedditBrowserSecCHUAMobile,
+		envRedditBrowserSecCHUAPlatform,
+	}
+	if fmt.Sprint(lookups) != fmt.Sprint(wantLookups) {
+		t.Fatalf("lookups = %v, want %v", lookups, wantLookups)
+	}
+	wantUserAgent := redditUserAgent()
+	wantDigest := fmt.Sprintf("%x", sha256.Sum256([]byte(wantUserAgent)))
+	if identity.Profile != RedditAccessProfile || identity.Origin != RedditOrigin ||
+		identity.Method != RedditMethod || identity.Auth != RedditAuth ||
+		identity.UserAgentSource != userAgentSourceBuiltin ||
+		identity.UserAgentSHA256 != wantDigest || identity.UserAgent() != wantUserAgent {
+		t.Fatalf("identity = %+v, user agent = %q", identity, identity.UserAgent())
 	}
 }
 
-func TestCredentialsFromEnvironmentRejectsMissingValuesWithoutLeakingSecrets(t *testing.T) {
+func TestResolveAccessIdentityAcceptsMinimalAndFullBrowserSessions(t *testing.T) {
 	t.Parallel()
 
-	const canary = "planted-secret"
+	const (
+		cookie    = "reddit_session=private-canary; loid=abc123"
+		userAgent = "Mozilla/5.0 DuckWords browser-session test"
+	)
 	tests := []struct {
 		name   string
-		change func(map[string]string)
-		want   string
+		values map[string]string
 	}{
-		{name: "missing client id", change: func(values map[string]string) { delete(values, envRedditClientID) }, want: envRedditClientID},
-		{name: "blank secret", change: func(values map[string]string) { values[envRedditClientSecret] = "" }, want: envRedditClientSecret},
-		{name: "padded user agent", change: func(values map[string]string) { values[envRedditUserAgent] = " " + canary + " " }, want: envRedditUserAgent},
+		{
+			name: "minimal",
+			values: map[string]string{
+				envRedditBrowserCookie: cookie,
+			},
+		},
+		{
+			name: "full allowlist",
+			values: map[string]string{
+				envRedditUserAgent:              userAgent,
+				envRedditBrowserCookie:          cookie,
+				envRedditBrowserAcceptLanguage:  "en-US,en;q=0.9",
+				envRedditBrowserSecCHUA:         `"Chromium";v="126", "Not.A/Brand";v="24"`,
+				envRedditBrowserSecCHUAMobile:   "?0",
+				envRedditBrowserSecCHUAPlatform: `"macOS"`,
+			},
+		},
 	}
 	for _, test := range tests {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			values := map[string]string{
-				envRedditAPIApproved:  "true",
-				envRedditClientID:     canary,
-				envRedditClientSecret: canary,
-				envRedditUserAgent:    canary,
+			identity, err := ResolveAccessIdentity(mapLookup(test.values))
+			if err != nil {
+				t.Fatalf("ResolveAccessIdentity() error = %v", err)
 			}
-			test.change(values)
-			credentials, err := credentialsFromEnvironment(mapLookup(values))
-			if credentials != (redditCredentials{}) || !errors.Is(err, errEnvironmentConfig) {
-				t.Fatalf("credentials = %+v, error = %v", credentials, err)
+			if identity.Profile != RedditBrowserSessionAccessProfile ||
+				identity.Auth != RedditBrowserSessionAuth || identity.browserHeaders() == nil ||
+				!identity.browserHeaders().Valid() || !validAccessIdentity(identity) {
+				t.Fatalf("identity = %+v, want valid browser-session identity", identity)
 			}
-			if !strings.Contains(err.Error(), test.want) || strings.Contains(err.Error(), canary) {
+			formatted := fmt.Sprintf("%v %#v", identity, identity)
+			for _, secret := range []string{cookie, userAgent, "Chromium", "macOS"} {
+				if strings.Contains(formatted, secret) {
+					t.Fatalf("formatted identity leaked %q: %q", secret, formatted)
+				}
+			}
+		})
+	}
+}
+
+func TestResolveAccessIdentityRejectsInvalidBrowserEnvironmentWithoutEchoingValues(t *testing.T) {
+	t.Parallel()
+
+	const canary = "browser-private-canary"
+	tests := []struct {
+		name   string
+		values map[string]string
+	}{
+		{name: "empty cookie", values: map[string]string{envRedditBrowserCookie: ""}},
+		{name: "cookie prefix", values: map[string]string{envRedditBrowserCookie: "Cookie: session=" + canary}},
+		{name: "cookie injection", values: map[string]string{envRedditBrowserCookie: "session=" + canary + "\r\nAuthorization: secret"}},
+		{name: "cookie unicode", values: map[string]string{envRedditBrowserCookie: "session=" + canary + "-качка"}},
+		{name: "cookie too large", values: map[string]string{envRedditBrowserCookie: "session=" + strings.Repeat("a", (16<<10)+1)}},
+		{name: "header without cookie", values: map[string]string{envRedditBrowserAcceptLanguage: canary}},
+		{name: "empty optional header", values: map[string]string{envRedditBrowserCookie: "session=ok", envRedditBrowserSecCHUA: ""}},
+		{name: "header injection", values: map[string]string{envRedditBrowserCookie: "session=ok", envRedditBrowserAcceptLanguage: "en\r\nX-Secret: " + canary}},
+		{name: "invalid mobile", values: map[string]string{envRedditBrowserCookie: "session=ok", envRedditBrowserSecCHUAMobile: canary}},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			identity, err := ResolveAccessIdentity(mapLookup(test.values))
+			if identity != (AccessIdentity{}) || !errors.Is(err, errEnvironmentConfig) {
+				t.Fatalf("identity = %+v, error = %v", identity, err)
+			}
+			if strings.Contains(err.Error(), canary) {
+				t.Fatalf("error leaked browser session value: %q", err)
+			}
+		})
+	}
+}
+
+func TestResolveAccessIdentityAcceptsValidatedOverride(t *testing.T) {
+	t.Parallel()
+
+	const override = "duckwords-test/1.0 (+https://github.com/pointerm/duckwords)"
+	identity, err := ResolveAccessIdentity(mapLookup(map[string]string{envRedditUserAgent: override}))
+	if err != nil {
+		t.Fatalf("ResolveAccessIdentity() error = %v", err)
+	}
+	wantDigest := fmt.Sprintf("%x", sha256.Sum256([]byte(override)))
+	if identity.UserAgent() != override || identity.UserAgentSource != userAgentSourceOverride ||
+		identity.UserAgentSHA256 != wantDigest {
+		t.Fatalf("identity = %+v, user agent = %q", identity, identity.UserAgent())
+	}
+}
+
+func TestResolveAccessIdentityRejectsUnsafeOverrideWithoutEchoingIt(t *testing.T) {
+	t.Parallel()
+
+	const canary = "planted-secret"
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "empty"},
+		{name: "too short", value: "short"},
+		{name: "leading whitespace", value: " " + canary},
+		{name: "trailing whitespace", value: canary + " "},
+		{name: "header injection", value: canary + "\r\nAuthorization: secret"},
+		{name: "unicode", value: canary + "-качка"},
+		{name: "oversized", value: strings.Repeat("a", maxUserAgentBytes+1)},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			identity, err := ResolveAccessIdentity(mapLookup(map[string]string{envRedditUserAgent: test.value}))
+			if identity != (AccessIdentity{}) || !errors.Is(err, errEnvironmentConfig) {
+				t.Fatalf("identity = %+v, error = %v", identity, err)
+			}
+			if !strings.Contains(err.Error(), envRedditUserAgent) || strings.Contains(err.Error(), canary) {
 				t.Fatalf("unsafe or unactionable error = %q", err)
 			}
 		})
 	}
 }
 
-func TestCredentialsFromEnvironmentRejectsNilLookup(t *testing.T) {
+func TestResolveAccessIdentityRejectsNilLookup(t *testing.T) {
 	t.Parallel()
 
-	_, err := credentialsFromEnvironment(nil)
-	if !errors.Is(err, errEnvironmentConfig) {
-		t.Fatalf("error = %v, want errEnvironmentConfig", err)
+	identity, err := ResolveAccessIdentity(nil)
+	if identity != (AccessIdentity{}) || !errors.Is(err, errEnvironmentConfig) {
+		t.Fatalf("identity = %+v, error = %v", identity, err)
+	}
+}
+
+func TestContextWithAccessIdentityPreservesValidatedIdentity(t *testing.T) {
+	t.Parallel()
+
+	identity, err := ResolveAccessIdentity(mapLookup(nil))
+	if err != nil {
+		t.Fatalf("ResolveAccessIdentity() error = %v", err)
+	}
+	ctx := ContextWithAccessIdentity(context.Background(), identity)
+	got, ok := accessIdentityFromContext(ctx)
+	if !ok || got != identity || !validAccessIdentity(got) {
+		t.Fatalf("context identity = %+v, present=%t", got, ok)
+	}
+	var nilContext context.Context
+	if ContextWithAccessIdentity(nilContext, identity) != nil {
+		t.Fatal("nil context was not preserved")
+	}
+
+	tampered := identity
+	tampered.UserAgentSHA256 = strings.Repeat("0", 64)
+	if validAccessIdentity(tampered) {
+		t.Fatal("tampered identity was accepted")
+	}
+	tampered = identity
+	tampered.Profile = RedditBrowserSessionAccessProfile
+	tampered.Auth = RedditBrowserSessionAuth
+	if validAccessIdentity(tampered) {
+		t.Fatal("browser-session metadata without a browser session was accepted")
+	}
+}
+
+func TestLegacyRedditEnvironmentVariablesAreNeverRead(t *testing.T) {
+	t.Parallel()
+
+	legacy := map[string]bool{
+		"REDDIT_API_ACCESS_APPROVED": true,
+		"REDDIT_CLIENT_ID":           true,
+		"REDDIT_CLIENT_SECRET":       true,
+	}
+	_, err := ResolveAccessIdentity(func(name string) (string, bool) {
+		if legacy[name] {
+			t.Fatalf("legacy environment variable %s was read", name)
+		}
+		return "", false
+	})
+	if err != nil {
+		t.Fatalf("ResolveAccessIdentity() error = %v", err)
 	}
 }
 

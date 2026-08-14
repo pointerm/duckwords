@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	// Two default-sized API responses may be read and decoded concurrently. Additional
+	// Two default-sized JSON responses may be read and decoded concurrently. Additional
 	// walks wait before body allocation instead of multiplying transient response and
 	// decoder state by the worker count.
 	defaultMaxInFlightResponseBytes int64 = 32 << 20

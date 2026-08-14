@@ -19,6 +19,7 @@ import (
 const (
 	logMessageRunStarted  = "run started"
 	logMessageSource      = "source loaded"
+	logMessageHTTPAttempt = "HTTP attempt completed"
 	logMessageRetry       = "request retry scheduled"
 	logMessagePostOutcome = "post processing completed"
 	logMessageRunSummary  = "processing summary"
@@ -28,17 +29,25 @@ const (
 )
 
 const (
-	unknownBuildLogValue   = "unknown"
-	maxCommitLogBytes      = 64
-	minCommitLogBytes      = 7
-	maxVersionLogBytes     = 64
-	maxGoVersionLogBytes   = 96
-	maxPlatformLogBytes    = 16
-	buildDateLogLayout     = "2006-01-02T15:04:05Z"
-	terminalStatusComplete = "complete"
-	terminalStatusPartial  = "partial"
-	inputProfileAssignment = "assignment-default-v1"
-	inputProfileCustom     = "custom"
+	unknownBuildLogValue            = "unknown"
+	maxCommitLogBytes               = 64
+	minCommitLogBytes               = 7
+	maxVersionLogBytes              = 64
+	maxGoVersionLogBytes            = 96
+	maxPlatformLogBytes             = 16
+	buildDateLogLayout              = "2006-01-02T15:04:05Z"
+	terminalStatusComplete          = "complete"
+	terminalStatusPartial           = "partial"
+	inputProfileAssignment          = "assignment-default-v1"
+	inputProfileCustom              = "custom"
+	accessProfilePublicJSON         = "old-reddit-public-json-v1"
+	accessProfileBrowserSessionJSON = "old-reddit-browser-session-json-v1"
+	accessOriginOldReddit           = "old.reddit.com"
+	accessMethodGET                 = "GET"
+	accessAuthNone                  = "none"
+	accessAuthBrowserSession        = "browser-session"
+	userAgentSourceBuiltin          = "builtin"
+	userAgentSourceOverride         = "override"
 )
 
 type logBuildIdentity struct {
@@ -50,8 +59,19 @@ type logBuildIdentity struct {
 	goarch    string
 }
 
-// Recorder writes the stable, sanitized lifecycle schema consumed by the evidence
-// finalizer. It owns only observation state; application decisions remain elsewhere.
+// AccessIdentity is the sanitized Reddit transport identity recorded at both
+// lifecycle boundaries. It intentionally contains no raw User-Agent or session value.
+type AccessIdentity struct {
+	Profile         string
+	Origin          string
+	Method          string
+	Auth            string
+	UserAgentSource string
+	UserAgentSHA256 string
+}
+
+// Recorder writes the stable, sanitized lifecycle schema used in the application
+// log. It owns only observation state; application decisions remain elsewhere.
 type Recorder struct {
 	logger        *slog.Logger
 	sourceRetries *atomic.Uint64
@@ -63,7 +83,7 @@ func New(logger *slog.Logger) Recorder {
 }
 
 // RunStarted records the validated execution configuration and bounded resource policy.
-func (log Recorder) RunStarted(ctx context.Context, cfg config.Config) {
+func (log Recorder) RunStarted(ctx context.Context, cfg config.Config, access AccessIdentity) {
 	if log.logger == nil {
 		return
 	}
@@ -86,8 +106,38 @@ func (log Recorder) RunStarted(ctx context.Context, cfg config.Config) {
 		slog.Int64("max_in_flight_response_bytes", traversalBudget.MaxInFlightResponseBytes),
 		slog.Int("max_retained_things", traversalBudget.MaxRetainedThings),
 	}
+	attributes = appendAccessIdentityAttrs(attributes, access)
 	attributes = appendBuildIdentityAttrs(attributes, currentLogBuildIdentity())
 	log.logger.LogAttrs(ctx, slog.LevelInfo, logMessageRunStarted, attributes...)
+}
+
+// AttemptObserver returns the sanitized observer for completed Reddit HTTP
+// attempts. The request policy calls it synchronously, so each record reaches the
+// configured log writer while the run is still in progress.
+func (log Recorder) AttemptObserver(ctx context.Context) reddit.AttemptObserver {
+	return func(event reddit.AttemptEvent) {
+		if log.logger == nil {
+			return
+		}
+		result := "failure"
+		if event.Succeeded {
+			result = "success"
+		}
+		attributes := []slog.Attr{
+			logging.EventAttr(logging.EventHTTPAttempt),
+			slog.String("scope", "reddit"),
+			slog.String(logging.KeyOperation, string(event.Endpoint)),
+			slog.String(logging.KeyPostID, event.PostID),
+			slog.Int("attempt", event.Attempt),
+			slog.String("result", result),
+			slog.Int("http_status", event.StatusCode),
+			slog.Duration("duration", event.Duration),
+		}
+		if !event.Succeeded {
+			attributes = append(attributes, logging.ErrorClassAttr(string(event.Class)))
+		}
+		log.logger.LogAttrs(ctx, slog.LevelInfo, logMessageHTTPAttempt, attributes...)
+	}
 }
 
 // RetryObserver returns the sanitized observer for Reddit HTTP retries.
@@ -203,7 +253,7 @@ func (log Recorder) Outcomes(ctx context.Context, result app.Result) {
 			slog.String("status", string(outcome.Status)),
 			slog.Int("comments", outcome.Comments),
 			slog.Int("bodies_visited", outcome.BodiesVisited),
-			slog.Int("more_requests", outcome.MoreRequests),
+			slog.Int("expansion_requests", outcome.ExpansionRequests),
 			slog.Int("continuation_requests", outcome.ContinuationRequests),
 			slog.Uint64("counted_tokens", outcome.CountedTokens),
 		}
@@ -224,6 +274,7 @@ func (log Recorder) Outcomes(ctx context.Context, result app.Result) {
 func (log Recorder) Summary(
 	ctx context.Context,
 	cfg config.Config,
+	access AccessIdentity,
 	result app.Result,
 	requestStats reddit.RequestPolicySnapshot,
 	postsHash string,
@@ -257,7 +308,7 @@ func (log Recorder) Summary(
 		slog.Int("posts_incomplete", summary.Incomplete),
 		slog.Uint64("comments", summary.Comments),
 		slog.Uint64("bodies_visited", summary.BodiesVisited),
-		slog.Uint64("more_requests", summary.MoreRequests),
+		slog.Uint64("expansion_requests", summary.ExpansionRequests),
 		slog.Uint64("continuation_requests", summary.ContinuationRequests),
 		slog.Uint64("counted_tokens", summary.CountedTokens),
 		slog.Int("distinct_words", summary.DistinctWords),
@@ -271,14 +322,68 @@ func (log Recorder) Summary(
 		slog.String("post_ids_sha256", postIDsHash),
 		slog.String("dictionary_sha256", dictionaryHash),
 	}
+	attributes = appendAccessIdentityAttrs(attributes, access)
 	attributes = appendBuildIdentityAttrs(attributes, currentLogBuildIdentity())
 	log.logger.LogAttrs(ctx, slog.LevelInfo, logMessageRunSummary, attributes...)
 }
 
-// executionInputProfile binds evidence to the two exact assignment locators
-// without putting full URLs or local paths in operational logs. Any override is
-// deliberately collapsed to "custom" and therefore cannot satisfy the final
-// assignment-evidence contract.
+func appendAccessIdentityAttrs(attributes []slog.Attr, access AccessIdentity) []slog.Attr {
+	access = safeAccessIdentity(access)
+	return append(
+		attributes,
+		slog.String("access_profile", access.Profile),
+		slog.String("reddit_origin", access.Origin),
+		slog.String("reddit_method", access.Method),
+		slog.String("reddit_auth", access.Auth),
+		slog.String("ua_source", access.UserAgentSource),
+		slog.String("ua_sha256", access.UserAgentSHA256),
+	)
+}
+
+func safeAccessIdentity(access AccessIdentity) AccessIdentity {
+	publicAccess := access.Profile == accessProfilePublicJSON && access.Auth == accessAuthNone
+	browserAccess := access.Profile == accessProfileBrowserSessionJSON && access.Auth == accessAuthBrowserSession
+	if !publicAccess && !browserAccess {
+		access.Profile = unknownBuildLogValue
+		access.Auth = unknownBuildLogValue
+	}
+	if access.Origin != accessOriginOldReddit {
+		access.Origin = unknownBuildLogValue
+	}
+	if access.Method != accessMethodGET {
+		access.Method = unknownBuildLogValue
+	}
+	if access.Auth != accessAuthNone && access.Auth != accessAuthBrowserSession {
+		access.Auth = unknownBuildLogValue
+	}
+	if access.UserAgentSource != userAgentSourceBuiltin && access.UserAgentSource != userAgentSourceOverride {
+		access.UserAgentSource = unknownBuildLogValue
+	}
+	if !validLowerHex(access.UserAgentSHA256, sha256DigestBytes*2) {
+		access.UserAgentSHA256 = unknownBuildLogValue
+	}
+	return access
+}
+
+const sha256DigestBytes = 32
+
+func validLowerHex(value string, length int) bool {
+	if len(value) != length {
+		return false
+	}
+	for _, character := range []byte(value) {
+		if character < '0' || character > '9' {
+			if character < 'a' || character > 'f' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// executionInputProfile identifies the two exact assignment locators without
+// putting full URLs or local paths in operational logs. Any override is deliberately
+// collapsed to "custom" so it cannot be mistaken for the assignment input pair.
 func executionInputProfile(cfg config.Config) string {
 	if cfg.Posts == (config.InputSource{Kind: config.SourceURL, Location: config.DefaultPostsURL}) &&
 		cfg.Dictionary == (config.InputSource{Kind: config.SourceURL, Location: config.DefaultDictionaryURL}) {

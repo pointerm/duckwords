@@ -10,44 +10,44 @@ func TestParsePostURLAcceptsSupportedPermalinks(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]struct {
-		raw  string
-		want string
+		raw      string
+		wantID   string
+		wantPath string
 	}{
 		"assignment old Reddit": {
-			raw:  "https://old.reddit.com/r/duck/comments/AbC123/a_title/",
-			want: "abc123",
+			raw:      "https://old.reddit.com/r/duck/comments/AbC123/a_title/",
+			wantID:   "abc123",
+			wantPath: "/r/duck/comments/abc123/a_title/.json",
 		},
 		"root domain": {
-			raw:  "https://reddit.com/r/duck/comments/abc123",
-			want: "abc123",
-		},
-		"www comment permalink": {
-			raw:  "https://www.reddit.com/r/duck/comments/abc123/title/def456/",
-			want: "abc123",
+			raw:      "https://reddit.com/r/duck/comments/abc123",
+			wantID:   "abc123",
+			wantPath: "/r/duck/comments/abc123/.json",
 		},
 		"new Reddit": {
-			raw:  "https://new.reddit.com/r/Duck_Pictures/comments/ABC123/title",
-			want: "abc123",
+			raw:      "https://new.reddit.com/r/Duck_Pictures/comments/ABC123/title",
+			wantID:   "abc123",
+			wantPath: "/r/duck_pictures/comments/abc123/title/.json",
 		},
 		"no subreddit": {
-			raw:  "https://www.reddit.com/comments/abc123/title",
-			want: "abc123",
+			raw:      "https://www.reddit.com/comments/abc123/title",
+			wantID:   "abc123",
+			wantPath: "/comments/abc123/title/.json",
 		},
 		"short link": {
-			raw:  "https://redd.it/ABC123/",
-			want: "abc123",
+			raw:      "https://redd.it/ABC123/",
+			wantID:   "abc123",
+			wantPath: "/comments/abc123/.json",
 		},
-		"JSON suffix": {
-			raw:  "https://m.reddit.com/comments/ABC123.json",
-			want: "abc123",
-		},
-		"tracking is identity neutral": {
-			raw:  "https://np.reddit.com/r/duck/comments/abc123/title/?utm_source=share#context",
-			want: "abc123",
+		"JSON path already present": {
+			raw:      "https://m.reddit.com/comments/ABC123/.json",
+			wantID:   "abc123",
+			wantPath: "/comments/abc123/.json",
 		},
 		"host and scheme case": {
-			raw:  "HTTPS://OLD.REDDIT.COM/r/duck/comments/ABC123/title",
-			want: "abc123",
+			raw:      "HTTPS://OLD.REDDIT.COM/r/duck/comments/ABC123/title",
+			wantID:   "abc123",
+			wantPath: "/r/duck/comments/abc123/title/.json",
 		},
 	}
 
@@ -60,8 +60,8 @@ func TestParsePostURLAcceptsSupportedPermalinks(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ParsePostURL() error = %v", err)
 			}
-			if got != test.want {
-				t.Fatalf("ParsePostURL() = %q, want %q", got, test.want)
+			if got.ID != test.wantID || got.JSONPath != test.wantPath {
+				t.Fatalf("ParsePostURL() = %#v, want ID=%q path=%q", got, test.wantID, test.wantPath)
 			}
 		})
 	}
@@ -89,17 +89,22 @@ func TestParsePostURLRejectsUnsupportedOrUnsafeValues(t *testing.T) {
 		"empty port":               {raw: "https://reddit.com:/r/duck/comments/abc123", reason: PostURLUnsafe},
 		"escaped slash":            {raw: "https://reddit.com/r/duck/comments%2Fabc123", reason: PostURLUnsafe},
 		"escaped traversal":        {raw: "https://reddit.com/r/duck/comments/abc123/%2e%2e", reason: PostURLUnsafe},
+		"query":                    {raw: "https://reddit.com/r/duck/comments/abc123/title?utm_source=share", reason: PostURLUnsafe},
+		"empty query":              {raw: "https://reddit.com/r/duck/comments/abc123/title?", reason: PostURLUnsafe},
+		"fragment":                 {raw: "https://reddit.com/r/duck/comments/abc123/title#context", reason: PostURLUnsafe},
 		"missing path":             {raw: "https://reddit.com", reason: PostURLUnsupportedPath},
 		"subreddit root":           {raw: "https://reddit.com/r/duck", reason: PostURLUnsupportedPath},
 		"wrong route case":         {raw: "https://reddit.com/r/duck/COMMENTS/abc123", reason: PostURLUnsupportedPath},
 		"missing subreddit":        {raw: "https://reddit.com/r//comments/abc123", reason: PostURLUnsupportedPath},
 		"invalid subreddit":        {raw: "https://reddit.com/r/duck-pics/comments/abc123", reason: PostURLUnsupportedPath},
 		"short link extra segment": {raw: "https://redd.it/abc123/title", reason: PostURLUnsupportedPath},
+		"focal comment permalink":  {raw: "https://www.reddit.com/r/duck/comments/abc123/title/def456/", reason: PostURLUnsupportedPath},
 		"empty ID":                 {raw: "https://reddit.com/r/duck/comments/", reason: PostURLUnsupportedPath},
 		"non-base36 ID":            {raw: "https://reddit.com/r/duck/comments/abc-123", reason: PostURLInvalidID},
 		"fullname not ID":          {raw: "https://reddit.com/r/duck/comments/t3_abc123", reason: PostURLInvalidID},
 		"ID too long":              {raw: "https://redd.it/1234567890abcdefg", reason: PostURLInvalidID},
 		"JSON without ID":          {raw: "https://redd.it/.json", reason: PostURLInvalidID},
+		"ID dot JSON form":         {raw: "https://reddit.com/comments/abc123.json", reason: PostURLInvalidID},
 		"ambiguous empty segment":  {raw: "https://reddit.com/r/duck/comments/abc123//title", reason: PostURLUnsupportedPath},
 		"double leading slash":     {raw: "https://reddit.com//r/duck/comments/abc123", reason: PostURLUnsupportedPath},
 		"double trailing slash":    {raw: "https://reddit.com/r/duck/comments/abc123//", reason: PostURLUnsupportedPath},
@@ -153,15 +158,19 @@ func FuzzParsePostURL(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, raw string) {
-		id, err := ParsePostURL(raw)
+		parsed, err := ParsePostURL(raw)
 		if err != nil {
 			if !errors.Is(err, ErrInvalidPostURL) {
 				t.Fatalf("unclassified error: %v", err)
 			}
 			return
 		}
-		if !validPostID(id) || id != strings.ToLower(id) {
-			t.Fatalf("accepted invalid normalized ID %q", id)
+		if !validPostID(parsed.ID) || parsed.ID != strings.ToLower(parsed.ID) {
+			t.Fatalf("accepted invalid normalized ID %q", parsed.ID)
+		}
+		if !strings.HasPrefix(parsed.JSONPath, "/") || !strings.HasSuffix(parsed.JSONPath, "/.json") ||
+			strings.ContainsAny(parsed.JSONPath, "%?#\\") {
+			t.Fatalf("accepted unsafe JSON path %q", parsed.JSONPath)
 		}
 	})
 }

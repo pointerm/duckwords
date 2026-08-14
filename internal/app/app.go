@@ -82,7 +82,7 @@ func DefaultConfig() Config {
 // must never be invoked concurrently or after WalkComments returns; this lets each
 // worker retain exclusive ownership of its post-local count map.
 type CommentWalker interface {
-	WalkComments(context.Context, string, func(reddit.Comment) error) (reddit.WalkStats, error)
+	WalkComments(context.Context, reddit.PostRef, func(reddit.Comment) error) (reddit.WalkStats, error)
 }
 
 // OutcomeStatus is the terminal processing state of one unique input post.
@@ -91,13 +91,14 @@ type OutcomeStatus string
 const (
 	// OutcomeCompleted means the complete post-local count was merged.
 	OutcomeCompleted OutcomeStatus = "completed"
-	// OutcomeSkipped means the post provably does not exist: Reddit answered with
-	// HTTP 404 or a well-formed listing containing no post. A post that cannot exist
-	// can never be counted, so it is an expected absence rather than a failure. It
-	// contributes no counts, does not make the result partial, and does not trigger
-	// strict cancellation. HTTP 403 stays a failure because access may be restored.
+	// OutcomeSkipped means the post provably does not exist: its initial public
+	// comments request answered HTTP 404 or 410. An absent post can never be counted,
+	// so it is an expected absence rather than a failure. It contributes no counts,
+	// does not make the result partial, and does not trigger strict cancellation.
+	// HTTP 403 and empty/malformed HTTP-200 listings remain failures because neither
+	// proves absence.
 	OutcomeSkipped OutcomeStatus = "skipped"
-	// OutcomeFailed means the post ended in an API, transport, protocol, or fatal
+	// OutcomeFailed means the post ended in an access, transport, protocol, or fatal
 	// processing failure.
 	OutcomeFailed OutcomeStatus = "failed"
 	// OutcomeIncomplete means post-local progress was discarded because either the
@@ -116,7 +117,7 @@ type PostOutcome struct {
 	HTTPStatus           int               `json:"http_status,omitempty"`
 	Comments             int               `json:"comments"`
 	BodiesVisited        int               `json:"bodies_visited"`
-	MoreRequests         int               `json:"more_requests"`
+	ExpansionRequests    int               `json:"expansion_requests"`
 	ContinuationRequests int               `json:"continuation_requests"`
 	CountedTokens        uint64            `json:"counted_tokens"`
 }
@@ -133,7 +134,7 @@ type Summary struct {
 	Incomplete           int    `json:"incomplete"`
 	Comments             uint64 `json:"comments"`
 	BodiesVisited        uint64 `json:"bodies_visited"`
-	MoreRequests         uint64 `json:"more_requests"`
+	ExpansionRequests    uint64 `json:"expansion_requests"`
 	ContinuationRequests uint64 `json:"continuation_requests"`
 	CountedTokens        uint64 `json:"counted_tokens"`
 	DistinctWords        int    `json:"distinct_words"`
