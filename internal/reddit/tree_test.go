@@ -86,7 +86,19 @@ func TestWalkDecodedRequiresCommentReferences(t *testing.T) {
 	assertErrorClass(t, err, ErrorProtocol)
 }
 
-func TestWalkDecodedBatchesAndResolvesMoreChildren(t *testing.T) {
+func TestWalkDecodedTreatsEmptyHTTP200PostListingAsIncomplete(t *testing.T) {
+	t.Parallel()
+
+	payload := mustJSON(t, []any{testListing(), testListing()})
+	_, err := walkDecoded(context.Background(), "post1", payload, unexpectedFetch(t), func(Comment) error { return nil })
+	assertErrorClass(t, err, ErrorIncomplete)
+	var adapterErr *Error
+	if !errors.As(err, &adapterErr) || adapterErr.Endpoint != EndpointComments || adapterErr.StatusCode != 0 {
+		t.Fatalf("error = %#v, want statusless initial-comments incomplete", adapterErr)
+	}
+}
+
+func TestWalkDecodedExpandsMoreIDsIndividuallyInFirstSeenOrder(t *testing.T) {
 	t.Parallel()
 
 	postID := "post1"
@@ -101,11 +113,10 @@ func TestWalkDecodedBatchesAndResolvesMoreChildren(t *testing.T) {
 	var bodies []string
 	stats, err := walkDecoded(context.Background(), postID, testInitial(t, postID, continuation), func(_ context.Context, batch []string) ([]byte, error) {
 		batches = append(batches, append([]string(nil), batch...))
-		things := make([]any, len(batch))
-		for index, id := range batch {
-			things[index] = testComment(id, "body "+id, "t3_"+postID, "")
+		if len(batch) != 1 {
+			t.Fatalf("focal expansion batch = %q, want exactly one ID", batch)
 		}
-		return testMoreResponse(t, nil, things...), nil
+		return testFocalResponse(t, postID, testComment(batch[0], "body "+batch[0], "t3_"+postID, "")), nil
 	}, func(comment Comment) error {
 		bodies = append(bodies, comment.Body)
 		return nil
@@ -114,17 +125,19 @@ func TestWalkDecodedBatchesAndResolvesMoreChildren(t *testing.T) {
 		t.Fatalf("walkDecoded() error = %v", err)
 	}
 
-	if got := []int{len(batches[0]), len(batches[1])}; !slices.Equal(got, []int{100, 5}) {
-		t.Fatalf("batch sizes = %v", got)
+	if len(batches) != len(ids) {
+		t.Fatalf("expansion calls = %d, want %d", len(batches), len(ids))
 	}
-	if !slices.Equal(batches[0], ids[:100]) || !slices.Equal(batches[1], ids[100:]) {
-		t.Fatalf("batches did not retain first-seen ID order")
+	for index, batch := range batches {
+		if !slices.Equal(batch, []string{ids[index]}) {
+			t.Fatalf("expansion %d = %q, want %q", index, batch, ids[index])
+		}
 	}
 	if len(bodies) != 105 || bodies[0] != "body m0" || bodies[104] != "body m104" {
 		t.Fatalf("visited %d bodies, first/last = %q/%q", len(bodies), bodies[0], bodies[len(bodies)-1])
 	}
-	if stats.Things != 107 || stats.Comments != 105 || stats.BodiesVisited != 105 || stats.MoreIDs != 106 ||
-		stats.UniqueMoreIDs != 105 || stats.DuplicateMoreIDs != 1 || stats.MoreRequests != 2 ||
+	if stats.Things != 212 || stats.Comments != 105 || stats.BodiesVisited != 105 || stats.MoreIDs != 106 ||
+		stats.UniqueMoreIDs != 105 || stats.DuplicateMoreIDs != 1 || stats.ExpansionRequests != 105 ||
 		stats.BodyBytes != 835 || stats.ResponseBytes <= 0 {
 		t.Fatalf("stats = %#v", stats)
 	}
@@ -134,11 +147,12 @@ func TestWalkDecodedAcceptsUnrequestedMoreDescendants(t *testing.T) {
 	t.Parallel()
 
 	postID := "post1"
-	requested := testComment("wanted", "wanted body", "t3_"+postID, "")
-	descendant := testComment("extra", "extra body", "t1_wanted", "")
+	requested := testComment("wanted", "wanted body", "t3_"+postID, testListing(
+		testComment("extra", "extra body", "t1_wanted", ""),
+	))
 	var ids []string
 	stats, err := walkDecoded(context.Background(), postID, testInitial(t, postID, testMore([]string{"wanted"}, 1, "t3_"+postID)), func(context.Context, []string) ([]byte, error) {
-		return testMoreResponse(t, nil, requested, descendant), nil
+		return testFocalResponse(t, postID, requested), nil
 	}, func(comment Comment) error {
 		ids = append(ids, comment.ID)
 		return nil
@@ -149,12 +163,12 @@ func TestWalkDecodedAcceptsUnrequestedMoreDescendants(t *testing.T) {
 	if !slices.Equal(ids, []string{"wanted", "extra"}) {
 		t.Fatalf("visited IDs = %q", ids)
 	}
-	if stats.Comments != 2 || stats.MoreIDs != 1 || stats.UniqueMoreIDs != 1 || stats.MoreRequests != 1 {
+	if stats.Comments != 2 || stats.MoreIDs != 1 || stats.UniqueMoreIDs != 1 || stats.ExpansionRequests != 1 {
 		t.Fatalf("stats = %#v", stats)
 	}
 }
 
-func TestWalkDecodedExpandsMoreReturnedByMoreChildren(t *testing.T) {
+func TestWalkDecodedExpandsMoreReturnedByFocalListing(t *testing.T) {
 	t.Parallel()
 
 	postID := "post1"
@@ -164,12 +178,13 @@ func TestWalkDecodedExpandsMoreReturnedByMoreChildren(t *testing.T) {
 		batches = append(batches, append([]string(nil), batch...))
 		switch len(batches) {
 		case 1:
-			return testMoreResponse(t, nil,
-				testComment("first", "first body", "t3_"+postID, ""),
-				testMore([]string{"second"}, 1, "t3_"+postID),
+			return testFocalResponse(t, postID,
+				testComment("first", "first body", "t3_"+postID, testListing(
+					testMore([]string{"second"}, 1, "t1_first"),
+				)),
 			), nil
 		case 2:
-			return testMoreResponse(t, nil, testComment("second", "second body", "t3_"+postID, "")), nil
+			return testFocalResponse(t, postID, testComment("second", "second body", "t1_first", "")), nil
 		default:
 			t.Fatalf("unexpected batch %q", batch)
 			return nil, errors.New("unexpected batch")
@@ -186,8 +201,8 @@ func TestWalkDecodedExpandsMoreReturnedByMoreChildren(t *testing.T) {
 		!slices.Equal(ids, []string{"first", "second"}) {
 		t.Fatalf("batches = %q, visited IDs = %q", batches, ids)
 	}
-	if stats.Things != 5 || stats.Comments != 2 || stats.BodiesVisited != 2 || stats.MoreIDs != 2 ||
-		stats.UniqueMoreIDs != 2 || stats.MoreRequests != 2 || stats.BodyBytes != 21 || stats.ResponseBytes <= 0 {
+	if stats.Things != 7 || stats.Comments != 2 || stats.BodiesVisited != 2 || stats.MoreIDs != 2 ||
+		stats.UniqueMoreIDs != 2 || stats.ExpansionRequests != 2 || stats.BodyBytes != 21 || stats.ResponseBytes <= 0 {
 		t.Fatalf("stats = %#v", stats)
 	}
 }
@@ -206,20 +221,20 @@ func TestWalkDecodedMoreCompletenessFailures(t *testing.T) {
 		{
 			name:     "missing requested child",
 			more:     testMore([]string{"wanted"}, 1, "t3_"+postID),
-			response: testMoreResponse(t, nil, testComment("other", "body", "t3_"+postID, "")),
+			response: testFocalResponse(t, postID, testComment("other", "body", "t3_"+postID, "")),
 			want:     ErrorIncomplete,
 		},
 		{
 			name:     "empty returned things",
 			more:     testMore([]string{"wanted"}, 1, "t3_"+postID),
-			response: testMoreResponse(t, nil),
-			want:     ErrorProtocol,
+			response: testInitial(t, postID),
+			want:     ErrorIncomplete,
 		},
 		{
-			name:     "API errors",
+			name:     "legacy API envelope",
 			more:     testMore([]string{"wanted"}, 1, "t3_"+postID),
 			response: testMoreResponse(t, []any{[]any{"BAD_REQUEST", "bad", "children"}}),
-			want:     ErrorIncomplete,
+			want:     ErrorProtocol,
 		},
 		{
 			name:     "continuation count without children",
@@ -273,7 +288,7 @@ func TestWalkDecodedMakesDepthTruncationExplicit(t *testing.T) {
 		t.Fatalf("walkDecoded() error = %v, want explicit incomplete-tree cause", err)
 	}
 	if called {
-		t.Fatal("depth-truncation placeholder was incorrectly sent to morechildren")
+		t.Fatal("depth-truncation placeholder was incorrectly sent as a child expansion")
 	}
 }
 
@@ -472,7 +487,7 @@ func TestWalkDecodedKeepsMoreStubBatchesSeparate(t *testing.T) {
 			if ids[0] == "nested" {
 				parent = "t1_root"
 			}
-			return testMoreResponse(t, nil, testComment(ids[0], "body", parent, "")), nil
+			return testFocalResponse(t, postID, testComment(ids[0], "body", parent, "")), nil
 		},
 		func(Comment) error { return nil },
 	)
@@ -492,7 +507,7 @@ func TestWalkDecodedRejectsRelationshipContradictions(t *testing.T) {
 	tests := []struct {
 		name    string
 		initial func(*testing.T) []byte
-		fetch   moreFetcher
+		fetch   expansionFetcher
 	}{
 		{
 			name: "duplicate comment under different parent",
@@ -509,10 +524,11 @@ func TestWalkDecodedRejectsRelationshipContradictions(t *testing.T) {
 				return testInitial(t, postID, testMore([]string{"wanted"}, 1, "t3_"+postID))
 			},
 			fetch: func(context.Context, []string) ([]byte, error) {
-				return testMoreResponse(t, nil,
-					testComment("wanted", "wanted", "t3_"+postID, ""),
-					testComment("one", "one", "t1_two", ""),
-					testComment("two", "two", "t1_one", ""),
+				return testFocalResponse(t, postID,
+					testComment("wanted", "wanted", "t3_"+postID, testListing(
+						testComment("one", "one", "t1_two", ""),
+						testComment("two", "two", "t1_one", ""),
+					)),
 				), nil
 			},
 		},
@@ -522,9 +538,10 @@ func TestWalkDecodedRejectsRelationshipContradictions(t *testing.T) {
 				return testInitial(t, postID, testMore([]string{"wanted"}, 1, "t3_"+postID))
 			},
 			fetch: func(context.Context, []string) ([]byte, error) {
-				return testMoreResponse(t, nil,
-					testComment("wanted", "wanted", "t3_"+postID, ""),
-					testComment("child", "body", "t1_missing", ""),
+				return testFocalResponse(t, postID,
+					testComment("wanted", "wanted", "t3_"+postID, testListing(
+						testComment("child", "body", "t1_missing", ""),
+					)),
 				), nil
 			},
 		},
@@ -542,7 +559,7 @@ func TestWalkDecodedRejectsRelationshipContradictions(t *testing.T) {
 				return testInitial(t, postID, testMore([]string{"wanted"}, 1, "t3_"+postID))
 			},
 			fetch: func(context.Context, []string) ([]byte, error) {
-				return testMoreResponse(t, nil, testComment("wanted", "body", "t1_other", "")), nil
+				return testFocalResponse(t, postID, testComment("wanted", "body", "t1_other", "")), nil
 			},
 		},
 	}
@@ -553,8 +570,8 @@ func TestWalkDecodedRejectsRelationshipContradictions(t *testing.T) {
 			assertErrorClass(t, err, ErrorProtocol)
 			if test.name == "cycle" || test.name == "orphan parent" {
 				var adapterErr *Error
-				if !errors.As(err, &adapterErr) || adapterErr.Endpoint != EndpointMoreChildren {
-					t.Fatalf("error = %v, want morechildren origin", err)
+				if !errors.As(err, &adapterErr) || adapterErr.Endpoint != EndpointCommentExpansion {
+					t.Fatalf("error = %v, want comment-expansion origin", err)
 				}
 			}
 		})
@@ -569,7 +586,7 @@ func TestValidateCommentGraphUsesStableInsertionOrder(t *testing.T) {
 	}
 	origins := map[string]Endpoint{
 		"first":  EndpointComments,
-		"second": EndpointMoreChildren,
+		"second": EndpointCommentExpansion,
 	}
 
 	for range 100 {
@@ -578,7 +595,7 @@ func TestValidateCommentGraphUsesStableInsertionOrder(t *testing.T) {
 			t.Fatalf("first insertion order = endpoint %q, error %v", endpoint, err)
 		}
 		endpoint, err = validateCommentGraph(context.Background(), parents, origins, []string{"second", "first"}, postID)
-		if !errors.Is(err, errMalformedResponse) || endpoint != EndpointMoreChildren {
+		if !errors.Is(err, errMalformedResponse) || endpoint != EndpointCommentExpansion {
 			t.Fatalf("second insertion order = endpoint %q, error %v", endpoint, err)
 		}
 	}
@@ -802,7 +819,7 @@ func TestWalkDecodedEnforcesLimits(t *testing.T) {
 		name    string
 		limits  ThingLimits
 		initial func(*testing.T) []byte
-		fetch   moreFetcher
+		fetch   expansionFetcher
 		class   ErrorClass
 	}{
 		{
@@ -847,21 +864,17 @@ func TestWalkDecodedEnforcesLimits(t *testing.T) {
 			class: ErrorResourceLimit,
 		},
 		{
-			name:   "more requests",
-			limits: withThingLimits(defaults, func(limits *ThingLimits) { limits.MaxMoreRequests = 1 }),
+			name:   "expansion requests",
+			limits: withThingLimits(defaults, func(limits *ThingLimits) { limits.MaxExpansionRequests = 1 }),
 			initial: func(t *testing.T) []byte {
-				ids := make([]string, 101)
+				ids := make([]string, 2)
 				for index := range ids {
 					ids[index] = fmt.Sprintf("c%d", index)
 				}
 				return testInitial(t, postID, testMore(ids, len(ids), "t3_"+postID))
 			},
 			fetch: func(_ context.Context, ids []string) ([]byte, error) {
-				things := make([]any, len(ids))
-				for index, id := range ids {
-					things[index] = testComment(id, "body", "t3_"+postID, "")
-				}
-				return testMoreResponse(t, nil, things...), nil
+				return testFocalResponse(t, postID, testComment(ids[0], "body", "t3_"+postID, "")), nil
 			},
 			class: ErrorResourceLimit,
 		},
@@ -901,7 +914,7 @@ func TestThingLimitsValidationBoundaries(t *testing.T) {
 		MaxThings:               absoluteMaxThings,
 		MaxComments:             absoluteMaxComments,
 		MaxMoreIDs:              absoluteMaxMoreIDs,
-		MaxMoreRequests:         absoluteMaxMoreRequests,
+		MaxExpansionRequests:    absoluteMaxExpansionRequests,
 		MaxContinuationRequests: absoluteMaxContinuationRequests,
 		MaxBodyBytes:            absoluteMaxBodyBytes,
 		MaxTotalBodyBytes:       absoluteMaxTotalBodyBytes,
@@ -919,11 +932,11 @@ func TestThingLimitsValidationBoundaries(t *testing.T) {
 		{name: "things too high", limits: withThingLimits(validMaximum, func(limits *ThingLimits) { limits.MaxThings = absoluteMaxThings + 1 })},
 		{name: "comments zero", limits: withThingLimits(validMaximum, func(limits *ThingLimits) { limits.MaxComments = 0 })},
 		{name: "comments too high", limits: withThingLimits(validMaximum, func(limits *ThingLimits) { limits.MaxComments = absoluteMaxComments + 1 })},
-		{name: "comments exceed things", limits: ThingLimits{MaxThings: 1, MaxComments: 2, MaxMoreIDs: 1, MaxMoreRequests: 1, MaxContinuationRequests: 1, MaxBodyBytes: 1, MaxTotalBodyBytes: 1, MaxTotalResponseBytes: 1}},
+		{name: "comments exceed things", limits: ThingLimits{MaxThings: 1, MaxComments: 2, MaxMoreIDs: 1, MaxExpansionRequests: 1, MaxContinuationRequests: 1, MaxBodyBytes: 1, MaxTotalBodyBytes: 1, MaxTotalResponseBytes: 1}},
 		{name: "more IDs zero", limits: withThingLimits(validMaximum, func(limits *ThingLimits) { limits.MaxMoreIDs = 0 })},
 		{name: "more IDs too high", limits: withThingLimits(validMaximum, func(limits *ThingLimits) { limits.MaxMoreIDs = absoluteMaxMoreIDs + 1 })},
-		{name: "more requests zero", limits: withThingLimits(validMaximum, func(limits *ThingLimits) { limits.MaxMoreRequests = 0 })},
-		{name: "more requests too high", limits: withThingLimits(validMaximum, func(limits *ThingLimits) { limits.MaxMoreRequests = absoluteMaxMoreRequests + 1 })},
+		{name: "expansion requests zero", limits: withThingLimits(validMaximum, func(limits *ThingLimits) { limits.MaxExpansionRequests = 0 })},
+		{name: "expansion requests too high", limits: withThingLimits(validMaximum, func(limits *ThingLimits) { limits.MaxExpansionRequests = absoluteMaxExpansionRequests + 1 })},
 		{name: "continuation requests zero", limits: withThingLimits(validMaximum, func(limits *ThingLimits) { limits.MaxContinuationRequests = 0 })},
 		{name: "continuation requests too high", limits: withThingLimits(validMaximum, func(limits *ThingLimits) { limits.MaxContinuationRequests = absoluteMaxContinuationRequests + 1 })},
 		{name: "body zero", limits: withThingLimits(validMaximum, func(limits *ThingLimits) { limits.MaxBodyBytes = 0 })},
@@ -1094,7 +1107,7 @@ func TestWalkDecodedPreservesCallbackErrorsAndCancellation(t *testing.T) {
 		t.Fatalf("deadline fetch error does not unwrap cause: %v", err)
 	}
 
-	typedTransport := newError(ErrorTransport, EndpointMoreChildren, postID, 0, context.DeadlineExceeded)
+	typedTransport := newError(ErrorTransport, EndpointCommentExpansion, postID, 0, context.DeadlineExceeded)
 	_, err = walkDecoded(context.Background(), postID, testInitial(t, postID, testMore([]string{"c1"}, 1, "t3_"+postID)), func(context.Context, []string) ([]byte, error) {
 		return nil, typedTransport
 	}, func(Comment) error { return nil })
@@ -1107,7 +1120,7 @@ func TestWalkDecodedPreservesCallbackErrorsAndCancellation(t *testing.T) {
 	}
 
 	fetchContext, cancelFetch := context.WithCancel(context.Background())
-	typedAfterCancellation := newError(ErrorTransport, EndpointMoreChildren, postID, 0, context.DeadlineExceeded)
+	typedAfterCancellation := newError(ErrorTransport, EndpointCommentExpansion, postID, 0, context.DeadlineExceeded)
 	_, err = walkDecoded(fetchContext, postID, testInitial(t, postID, testMore([]string{"c1"}, 1, "t3_"+postID)), func(context.Context, []string) ([]byte, error) {
 		cancelFetch()
 		return nil, typedAfterCancellation
@@ -1213,7 +1226,7 @@ func TestWalkDecodedPreflightsAllocationCardinality(t *testing.T) {
 		}
 	})
 
-	t.Run("morechildren things", func(t *testing.T) {
+	t.Run("legacy expansion envelope things", func(t *testing.T) {
 		things := make([]any, elements)
 		for index := range things {
 			id := fmt.Sprintf("c%d", index)
@@ -1232,7 +1245,7 @@ func TestWalkDecodedPreflightsAllocationCardinality(t *testing.T) {
 		)
 		assertErrorClass(t, err, ErrorResourceLimit)
 		var adapterErr *Error
-		if !errors.Is(err, errThingLimit) || stats.Things != 2 || !errors.As(err, &adapterErr) || adapterErr.Endpoint != EndpointMoreChildren {
+		if !errors.Is(err, errThingLimit) || stats.Things != 2 || !errors.As(err, &adapterErr) || adapterErr.Endpoint != EndpointCommentExpansion {
 			t.Fatalf("stats = %#v, error = %v", stats, err)
 		}
 	})
@@ -1446,14 +1459,14 @@ func TestContextAwareResponseDecodersPreserveCancellation(t *testing.T) {
 	if _, err := decodeInitialContext(ctx, payload); !errors.Is(err, context.Canceled) {
 		t.Fatalf("decodeInitialContext() error = %v, want context.Canceled", err)
 	}
-	if _, err := decodeMoreResponseContext(ctx, []byte(`{"json":{"errors":[],"data":{"things":[]}}}`)); !errors.Is(err, context.Canceled) {
-		t.Fatalf("decodeMoreResponseContext() error = %v, want context.Canceled", err)
+	if _, err := decodeExpansionResponseContext(ctx, payload, "post1", "c1"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("decodeExpansionResponseContext() error = %v, want context.Canceled", err)
 	}
 	if _, err := decodeContinuationResponseContext(ctx, payload, "post1", "c1"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("decodeContinuationResponseContext() error = %v, want context.Canceled", err)
 	}
 
-	for _, endpoint := range []Endpoint{EndpointComments, EndpointMoreChildren, EndpointContinuation} {
+	for _, endpoint := range []Endpoint{EndpointComments, EndpointCommentExpansion, EndpointContinuation} {
 		err := classifyTreeError(endpoint, "post1", context.Canceled)
 		assertErrorClass(t, err, ErrorCanceled)
 		var adapterErr *Error
@@ -1494,7 +1507,7 @@ func TestWalkDecodedValidatesArguments(t *testing.T) {
 		name  string
 		ctx   context.Context
 		post  string
-		fetch moreFetcher
+		fetch expansionFetcher
 		visit commentVisitor
 	}{
 		{name: "nil context", post: "post1", fetch: unexpectedFetch(t), visit: func(Comment) error { return nil }},
@@ -1530,7 +1543,7 @@ func FuzzWalkDecoded(f *testing.F) {
 	f.Add([]byte("null"), []byte(`{"json":{"errors":[],"data":{"things":[]}}}`), []byte("null"))
 	f.Add([]byte("["), []byte("{"), []byte("]"))
 
-	limits := ThingLimits{MaxThings: 64, MaxComments: 32, MaxMoreIDs: 32, MaxMoreRequests: 4, MaxContinuationRequests: 4, MaxBodyBytes: 256, MaxTotalBodyBytes: 4 << 10, MaxTotalResponseBytes: 8 << 10}
+	limits := ThingLimits{MaxThings: 64, MaxComments: 32, MaxMoreIDs: 32, MaxExpansionRequests: 4, MaxContinuationRequests: 4, MaxBodyBytes: 256, MaxTotalBodyBytes: 4 << 10, MaxTotalResponseBytes: 8 << 10}
 	f.Fuzz(func(t *testing.T, initial, more, continuation []byte) {
 		stats, _ := walkDecodedCompleteWithLimits(context.Background(), "post1", initial, limits, func(context.Context, []string) ([]byte, error) {
 			return more, nil
@@ -1543,7 +1556,7 @@ func FuzzWalkDecoded(f *testing.F) {
 			return nil
 		})
 		if stats.Things > limits.MaxThings || stats.Comments > limits.MaxComments || stats.MoreIDs > limits.MaxMoreIDs ||
-			stats.MoreRequests > limits.MaxMoreRequests || stats.ContinuationRequests > limits.MaxContinuationRequests ||
+			stats.ExpansionRequests > limits.MaxExpansionRequests || stats.ContinuationRequests > limits.MaxContinuationRequests ||
 			stats.BodyBytes > limits.MaxTotalBodyBytes || stats.ResponseBytes > limits.MaxTotalResponseBytes {
 			t.Fatalf("stats exceed limits: %#v", stats)
 		}
@@ -1594,6 +1607,11 @@ func testMoreResponse(tb testing.TB, apiErrors []any, things ...any) []byte {
 	return mustJSON(tb, map[string]any{"json": map[string]any{"errors": apiErrors, "data": map[string]any{"things": things}}})
 }
 
+func testFocalResponse(tb testing.TB, postID string, comment any) []byte {
+	tb.Helper()
+	return testInitial(tb, postID, comment)
+}
+
 func mustJSON(tb testing.TB, value any) []byte {
 	tb.Helper()
 	payload, err := json.Marshal(value)
@@ -1612,10 +1630,10 @@ func cloneThing(tb testing.TB, thing map[string]any) map[string]any {
 	return cloned
 }
 
-func unexpectedFetch(tb testing.TB) moreFetcher {
+func unexpectedFetch(tb testing.TB) expansionFetcher {
 	tb.Helper()
 	return func(context.Context, []string) ([]byte, error) {
-		tb.Errorf("unexpected morechildren fetch")
+		tb.Errorf("unexpected focal expansion fetch")
 		return nil, errors.New("unexpected fetch")
 	}
 }

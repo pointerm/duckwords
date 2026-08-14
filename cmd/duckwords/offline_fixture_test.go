@@ -42,8 +42,11 @@ var syntheticDictionaryDocument string
 //go:embed testdata/synthetic/post-synth001.json
 var syntheticPostOneResponse string
 
-//go:embed testdata/synthetic/more-synth001.json
-var syntheticMoreResponse string
+//go:embed testdata/synthetic/expansion-synth001-a4.json
+var syntheticExpansionA4Response string
+
+//go:embed testdata/synthetic/expansion-synth001-a5.json
+var syntheticExpansionA5Response string
 
 //go:embed testdata/synthetic/post-synth002.json
 var syntheticPostTwoResponse string
@@ -60,8 +63,7 @@ type offlineFixtureProfile string
 
 // TestMain exposes one deterministic process fixture only from the compiled test
 // binary. The production duckwords binary contains neither this environment switch
-// nor injectable endpoints, so release verification cannot weaken the live approval
-// gate or redirect credentials.
+// nor injectable endpoints, so release verification cannot redirect public requests.
 func TestMain(m *testing.M) {
 	if os.Getenv(offlineFixtureProcessEnvironment) == "1" {
 		os.Exit(runOfflineFixtureProcess(os.Stdout, os.Stderr))
@@ -82,20 +84,18 @@ func runOfflineFixtureProcessWithProfile(profile offlineFixtureProfile, stdout, 
 		_, _ = fmt.Fprintln(stderr, "offline fixture profile is invalid")
 		return cli.ExitFailure
 	}
-	fixtureEnvironment := map[string]string{
-		"REDDIT_API_ACCESS_APPROVED": "true",
-		"REDDIT_CLIENT_ID":           "fixture-client-id",
-		"REDDIT_CLIENT_SECRET":       "fixture-client-secret",
-		"REDDIT_USER_AGENT":          "cli:duckwords:offline-fixture (by /u/example)",
+	access, err := production.ResolveAccessIdentity(os.LookupEnv)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, "offline fixture User-Agent is invalid")
+		return cli.ExitFailure
 	}
 	dependencies := production.NewDependencies(
-		func(name string) (string, bool) {
-			value, found := fixtureEnvironment[name]
-			return value, found
+		func(string) (string, bool) {
+			panic("production re-resolved the CLI-owned access identity")
 		},
 		func(requestTimeout time.Duration, _ int) (*http.Client, error) {
 			return &http.Client{
-				Transport: offlineFixtureTransport{profile: profile},
+				Transport: offlineFixtureTransport{profile: profile, redditUserAgent: access.UserAgent()},
 				Timeout:   requestTimeout,
 			}, nil
 		},
@@ -134,15 +134,13 @@ func runOfflineFixtureProcessWithProfile(profile offlineFixtureProfile, stdout, 
 }
 
 type offlineFixtureTransport struct {
-	profile offlineFixtureProfile
+	profile         offlineFixtureProfile
+	redditUserAgent string
 }
 
 func (transport offlineFixtureTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	if request == nil || request.URL == nil {
 		return nil, errUnexpectedOfflineFixtureRequest
-	}
-	if request.Body != nil {
-		defer request.Body.Close()
 	}
 	postsURL := config.DefaultPostsURL
 	dictionaryURL := config.DefaultDictionaryURL
@@ -170,36 +168,22 @@ func (transport offlineFixtureTransport) RoundTrip(request *http.Request) (*http
 			return nil, errUnexpectedOfflineFixtureRequest
 		}
 		return offlineFixtureResponse(request, "text/plain; charset=utf-8", dictionaryDocument)
-	case "https://www.reddit.com/api/v1/access_token":
-		clientID, secret, ok := request.BasicAuth()
-		if request.Method != http.MethodPost ||
-			request.Header.Get("Content-Type") != "application/x-www-form-urlencoded" ||
-			request.Header.Get("Accept") != "application/json" ||
-			!ok || clientID != "fixture-client-id" || secret != "fixture-client-secret" ||
-			request.UserAgent() != "cli:duckwords:offline-fixture (by /u/example)" {
-			return nil, errUnexpectedOfflineFixtureRequest
-		}
-		if err := request.ParseForm(); err != nil || request.PostForm.Encode() != "grant_type=client_credentials" {
-			return nil, errUnexpectedOfflineFixtureRequest
-		}
-		return offlineFixtureResponse(
-			request,
-			"application/json",
-			`{"access_token":"offline-token","token_type":"bearer","expires_in":3600}`,
-		)
 	}
 
-	if request.URL.Scheme != "https" || request.URL.Host != "oauth.reddit.com" ||
-		request.Header.Get("Authorization") != "Bearer offline-token" ||
+	if request.Method != http.MethodGet || request.Body != nil || request.Response != nil ||
+		request.URL.Scheme != "https" || request.URL.Host != production.RedditOrigin ||
+		request.URL.User != nil || request.URL.Fragment != "" ||
+		request.Header.Get("Authorization") != "" || request.Header.Get("Cookie") != "" ||
+		request.Header.Get("Content-Type") != "" ||
 		request.Header.Get("Accept") != "application/json" ||
-		request.UserAgent() != "cli:duckwords:offline-fixture (by /u/example)" {
+		request.UserAgent() != transport.redditUserAgent {
 		return nil, errUnexpectedOfflineFixtureRequest
 	}
 	if transport.profile == offlineFixtureProfileSynthetic {
 		return syntheticOfflineFixtureResponse(request)
 	}
-	if request.Method != http.MethodGet || request.URL.Path != "/comments/duck123" ||
-		request.URL.Query().Encode() != "raw_json=1&showmore=true&sort=confidence" {
+	if request.URL.Path != "/comments/duck123/.json" ||
+		request.URL.Query().Encode() != "limit=500&raw_json=1&showmore=true&sort=confidence" {
 		return nil, errUnexpectedOfflineFixtureRequest
 	}
 	return offlineFixtureResponse(
@@ -210,37 +194,28 @@ func (transport offlineFixtureTransport) RoundTrip(request *http.Request) (*http
 }
 
 func syntheticOfflineFixtureResponse(request *http.Request) (*http.Response, error) {
-	if request.URL.Path == "/api/morechildren" {
-		if request.Method != http.MethodPost || request.URL.RawQuery != "raw_json=1" ||
-			request.Header.Get("Content-Type") != "application/x-www-form-urlencoded" {
-			return nil, errUnexpectedOfflineFixtureRequest
-		}
-		if err := request.ParseForm(); err != nil ||
-			request.PostForm.Encode() != "api_type=json&children=a4%2Ca5&limit_children=false&link_id=t3_synth001&sort=confidence" {
-			return nil, errUnexpectedOfflineFixtureRequest
-		}
-		return offlineFixtureResponse(request, "application/json", syntheticMoreResponse)
-	}
-	if request.Method != http.MethodGet {
-		return nil, errUnexpectedOfflineFixtureRequest
-	}
-
 	switch request.URL.Path {
-	case "/comments/synth001":
-		if request.URL.Query().Encode() != "raw_json=1&showmore=true&sort=confidence" {
+	case "/comments/synth001/.json":
+		switch request.URL.Query().Encode() {
+		case "limit=500&raw_json=1&showmore=true&sort=confidence":
+			return offlineFixtureResponse(request, "application/json", syntheticPostOneResponse)
+		case "comment=a4&context=0&limit=500&raw_json=1&showmore=true&sort=confidence":
+			return offlineFixtureResponse(request, "application/json", syntheticExpansionA4Response)
+		case "comment=a5&context=0&limit=500&raw_json=1&showmore=true&sort=confidence":
+			return offlineFixtureResponse(request, "application/json", syntheticExpansionA5Response)
+		default:
 			return nil, errUnexpectedOfflineFixtureRequest
 		}
-		return offlineFixtureResponse(request, "application/json", syntheticPostOneResponse)
-	case "/comments/synth002":
-		if request.URL.Query().Encode() != "raw_json=1&showmore=true&sort=confidence" {
+	case "/r/duck/comments/synth002/synthetic_fixture/.json":
+		if request.URL.Query().Encode() != "limit=500&raw_json=1&showmore=true&sort=confidence" {
 			return nil, errUnexpectedOfflineFixtureRequest
 		}
 		return offlineFixtureResponse(request, "application/json", syntheticPostTwoResponse)
-	case "/comments/synth003":
+	case "/comments/synth003/synthetic_fixture/.json":
 		switch request.URL.Query().Encode() {
-		case "raw_json=1&showmore=true&sort=confidence":
+		case "limit=500&raw_json=1&showmore=true&sort=confidence":
 			return offlineFixtureResponse(request, "application/json", syntheticPostThreeResponse)
-		case "comment=d1&context=0&raw_json=1&showmore=true&sort=confidence":
+		case "comment=d1&context=0&limit=500&raw_json=1&showmore=true&sort=confidence":
 			return offlineFixtureResponse(request, "application/json", syntheticContinuationResponse)
 		default:
 			return nil, errUnexpectedOfflineFixtureRequest
@@ -271,15 +246,75 @@ func TestOfflineFixtureProcessProducesGoldenJSON(t *testing.T) {
 	if stdout.String() != want {
 		t.Fatalf("offline fixture stdout mismatch:\ngot:\n%s\nwant:\n%s", stdout.String(), want)
 	}
-	for _, event := range []string{"event=run_started", "event=run_summary", "event=output_written"} {
+	for _, event := range []string{
+		"event=run_started", "event=run_summary", "event=output_written",
+		"access_profile=old-reddit-public-json-v1", "reddit_origin=old.reddit.com",
+		"reddit_method=GET", "reddit_auth=none", "ua_source=", "ua_sha256=",
+	} {
 		if !strings.Contains(stderr.String(), event) {
 			t.Fatalf("offline fixture stderr does not contain %q:\n%s", event, stderr.String())
 		}
 	}
-	for _, secret := range []string{"fixture-client-secret", "offline-token"} {
-		if strings.Contains(stderr.String(), secret) {
-			t.Fatalf("offline fixture stderr contains planted secret %q", secret)
+	access, err := production.ResolveAccessIdentity(os.LookupEnv)
+	if err != nil {
+		t.Fatalf("ResolveAccessIdentity() error = %v", err)
+	}
+	if got := strings.Count(stderr.String(), "ua_sha256="+access.UserAgentSHA256); got != 2 {
+		t.Fatalf("safe User-Agent digest occurrence count = %d, want matching start and summary records", got)
+	}
+	if got := strings.Count(stderr.String(), "ua_source="+access.UserAgentSource); got != 2 {
+		t.Fatalf("User-Agent source occurrence count = %d, want matching start and summary records", got)
+	}
+	if strings.Contains(stderr.String(), access.UserAgent()) {
+		t.Fatal("offline fixture stderr contains the raw Reddit User-Agent")
+	}
+}
+
+func TestOfflineFixtureTransportRejectsNonPublicRequestShapes(t *testing.T) {
+	t.Parallel()
+
+	access, err := production.ResolveAccessIdentity(os.LookupEnv)
+	if err != nil {
+		t.Fatalf("ResolveAccessIdentity() error = %v", err)
+	}
+	transport := offlineFixtureTransport{redditUserAgent: access.UserAgent()}
+	newRequest := func(t *testing.T) *http.Request {
+		t.Helper()
+		request, requestErr := http.NewRequest(
+			http.MethodGet,
+			"https://old.reddit.com/comments/duck123/.json?limit=500&raw_json=1&showmore=true&sort=confidence",
+			nil,
+		)
+		if requestErr != nil {
+			t.Fatalf("http.NewRequest() error = %v", requestErr)
 		}
+		request.Header.Set("Accept", "application/json")
+		request.Header.Set("User-Agent", access.UserAgent())
+		return request
+	}
+	tests := []struct {
+		name   string
+		change func(*http.Request)
+	}{
+		{name: "wrong host", change: func(request *http.Request) { request.URL.Host = "oauth.reddit.com" }},
+		{name: "post", change: func(request *http.Request) { request.Method = http.MethodPost }},
+		{name: "body", change: func(request *http.Request) { request.Body = io.NopCloser(strings.NewReader("token=secret")) }},
+		{name: "authorization", change: func(request *http.Request) { request.Header.Set("Authorization", "Bearer secret") }},
+		{name: "cookie", change: func(request *http.Request) { request.Header.Set("Cookie", "session=secret") }},
+		{name: "content type", change: func(request *http.Request) { request.Header.Set("Content-Type", "application/x-www-form-urlencoded") }},
+		{name: "redirect follow", change: func(request *http.Request) { request.Response = &http.Response{StatusCode: http.StatusFound} }},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			request := newRequest(t)
+			test.change(request)
+			response, requestErr := transport.RoundTrip(request)
+			if response != nil || !errors.Is(requestErr, errUnexpectedOfflineFixtureRequest) {
+				t.Fatalf("RoundTrip() response = %#v, error = %v", response, requestErr)
+			}
+		})
 	}
 }
 

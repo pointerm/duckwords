@@ -156,11 +156,8 @@ Information:
   --version                     print build and toolchain information
   -h, --help                    show this help
 
-Environment (all required for processing; values are never accepted as flags):
-  REDDIT_API_ACCESS_APPROVED    exact value "true"; set only after Reddit approval
-  REDDIT_CLIENT_ID              approved confidential OAuth client ID
-  REDDIT_CLIENT_SECRET          approved confidential OAuth client secret
-  REDDIT_USER_AGENT             platform:app:version (by /u/name)
+Environment (optional; values are never accepted as flags):
+  REDDIT_USER_AGENT             override the built-in public-request identity
 
 Examples:
   duckwords
@@ -195,9 +192,9 @@ type InputSource struct {
 	Location string
 }
 
-// Config contains validated process configuration. OAuth credentials and the API
-// approval acknowledgement intentionally remain outside this value so they cannot
-// be exposed through process arguments or generic configuration formatting.
+// Config contains validated process configuration. The optional Reddit User-Agent
+// override remains outside this value so it cannot be exposed through process
+// arguments or generic configuration formatting.
 type Config struct {
 	Posts          InputSource
 	Dictionary     InputSource

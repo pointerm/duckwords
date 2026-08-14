@@ -45,10 +45,12 @@ func TestClassForStatus(t *testing.T) {
 	t.Parallel()
 
 	tests := map[int]ErrorClass{
+		302: ErrorAccess,
 		400: ErrorInvalidInput,
-		401: ErrorAuthentication,
-		403: ErrorForbidden,
+		401: ErrorAccess,
+		403: ErrorAccess,
 		404: ErrorNotFound,
+		410: ErrorNotFound,
 		408: ErrorTransport,
 		429: ErrorRateLimited,
 		500: ErrorServer,

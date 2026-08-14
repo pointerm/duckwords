@@ -22,8 +22,7 @@ func TestRunReportsSanitizedFinalizationFailure(t *testing.T) {
 	t.Parallel()
 	var stderr strings.Builder
 	args := []string{"--result", "missing-secret-result", "--log", "missing-log", "--output-dir", "out",
-		"--exit-code", "0", "--binary", "missing-bin", "--policy-verified-at", "2026-08-14",
-		"--approval-reference", "reddit-approval-confirmed-2026-08-14"}
+		"--exit-code", "0", "--binary", "missing-bin"}
 	if code := run(context.Background(), args, &stderr); code != 1 {
 		t.Fatalf("run() = %d, want 1", code)
 	}
@@ -35,12 +34,10 @@ func TestRunReportsSanitizedFinalizationFailure(t *testing.T) {
 func TestValidArgumentsRequiresEachExactFlagOnce(t *testing.T) {
 	t.Parallel()
 	valid := []string{
-		"--approval-reference", "review-2026-08-14",
 		"--binary", "bin/duckwords",
 		"--exit-code", "0",
 		"--log", "application.log",
 		"--output-dir", "artifacts/submission",
-		"--policy-verified-at", "2026-08-14",
 		"--result", "result.json",
 	}
 	if !validArguments(valid) {
@@ -51,9 +48,9 @@ func TestValidArgumentsRequiresEachExactFlagOnce(t *testing.T) {
 		nil,
 		valid[:len(valid)-1],
 		append(append([]string{}, valid...), "positional"),
-		{"--result", "result.json", "--result", "other.json", "--log", "application.log", "--output-dir", "out", "--exit-code", "0", "--binary", "bin", "--policy-verified-at", "2026-08-14"},
-		{"-result", "result.json", "--log", "application.log", "--output-dir", "out", "--exit-code", "0", "--binary", "bin", "--policy-verified-at", "2026-08-14", "--approval-reference", "review"},
-		{"--result", "", "--log", "application.log", "--output-dir", "out", "--exit-code", "0", "--binary", "bin", "--policy-verified-at", "2026-08-14", "--approval-reference", "review"},
+		{"--result", "result.json", "--result", "other.json", "--log", "application.log", "--output-dir", "out", "--exit-code", "0", "--binary", "bin"},
+		{"-result", "result.json", "--log", "application.log", "--output-dir", "out", "--exit-code", "0", "--binary", "bin"},
+		{"--result", "", "--log", "application.log", "--output-dir", "out", "--exit-code", "0", "--binary", "bin"},
 	}
 	for _, args := range tests {
 		if validArguments(args) {
@@ -72,7 +69,6 @@ func TestRunRejectsDuplicateFlagWithoutLeakingValue(t *testing.T) {
 		"--output-dir", "out",
 		"--exit-code", "0",
 		"--binary", "bin",
-		"--policy-verified-at", "2026-08-14",
 	}
 	var stderr strings.Builder
 	if code := run(context.Background(), args, &stderr); code != 2 {

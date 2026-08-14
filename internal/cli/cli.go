@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/pointerm/duckwords/internal/aggregate"
@@ -155,7 +156,27 @@ func runWithTimeoutContext(
 		}
 		return code
 	}
-	runlog.New(logSink.Logger()).RunStarted(executionCtx, cfg)
+	access, err := production.ResolveAccessIdentity(os.LookupEnv)
+	if err != nil {
+		runlog.New(logSink.Logger()).Failed(executionCtx, "user_agent", 0)
+		if logErr := logSink.Err(); logErr != nil {
+			return exitFailure
+		}
+		if writeErr := writeRuntimeDiagnostic(stderr, cfg.LogFormat, executionFailureDiagnostic(production.ErrRedditSetup)); writeErr != nil {
+			return exitFailure
+		}
+		return exitFailure
+	}
+	accessLog := runlog.AccessIdentity{
+		Profile:         access.Profile,
+		Origin:          access.Origin,
+		Method:          access.Method,
+		Auth:            access.Auth,
+		UserAgentSource: access.UserAgentSource,
+		UserAgentSHA256: access.UserAgentSHA256,
+	}
+	executionCtx = production.ContextWithAccessIdentity(executionCtx, access)
+	runlog.New(logSink.Logger()).RunStarted(executionCtx, cfg, accessLog)
 	if logErr := logSink.Err(); logErr != nil {
 		return exitFailure
 	}
@@ -286,17 +307,10 @@ func writeRuntimeDiagnostic(stderr io.Writer, format logging.Format, message str
 	return writeDiagnostic(stderr, message)
 }
 
-// executionFailureDiagnostic keeps the human-facing cause specific. A single
-// catch-all message previously pointed every setup failure at Reddit credentials,
-// which sent users looking in the wrong place for an unrelated misconfiguration.
+// executionFailureDiagnostic keeps the human-facing cause specific so an unrelated
+// source or HTTP-policy failure is not mistaken for a Reddit access problem.
 func executionFailureDiagnostic(err error) string {
 	switch {
-	case errors.Is(err, production.ErrApproval):
-		return "Reddit Data API access is not confirmed; obtain Reddit's approval, then set " +
-			"REDDIT_API_ACCESS_APPROVED=true (see README)"
-	case errors.Is(err, production.ErrCredentials):
-		return "Reddit credentials are missing or malformed; set REDDIT_CLIENT_ID, " +
-			"REDDIT_CLIENT_SECRET, and REDDIT_USER_AGENT (see README)"
 	case errors.Is(err, production.ErrSourceConfig):
 		return "input source rejected before any download; check --posts-url/--posts-file " +
 			"and --dictionary-url/--dictionary-file"
@@ -305,7 +319,7 @@ func executionFailureDiagnostic(err error) string {
 	case errors.Is(err, production.ErrSourceParsing):
 		return "an input source was downloaded but could not be parsed"
 	case errors.Is(err, production.ErrRedditSetup):
-		return "Reddit client setup failed; check REDDIT_USER_AGENT format (see README)"
+		return "Reddit client setup failed; if REDDIT_USER_AGENT is set, use 8..256 printable ASCII bytes without surrounding whitespace"
 	case errors.Is(err, production.ErrConfig):
 		return "production setup failed; check the configuration reported in the log"
 	}

@@ -75,70 +75,130 @@ func (reason PostURLReason) String() string {
 	}
 }
 
+// ParsedPostURL is the normalized, non-secret identity and public JSON path of a
+// supported Reddit post permalink. JSONPath is always a relative, ASCII-only path
+// ending in "/.json" and is safe to resolve against the pinned old.reddit.com
+// origin.
+type ParsedPostURL struct {
+	ID       string
+	JSONPath string
+}
+
 // ParsePostURL validates a supported Reddit permalink and returns its normalized
-// lowercase base-36 post ID. Query parameters and fragments are deliberately ignored:
-// they cannot change the stable resource identity and are never forwarded by this
-// package.
-func ParsePostURL(raw string) (string, error) {
+// lowercase base-36 post ID and safe public JSON path. Query parameters and
+// fragments are rejected rather than silently discarded, so an operator can prove
+// that the requested resource is exactly the one present in the source file.
+func ParsePostURL(raw string) (ParsedPostURL, error) {
 	if raw == "" || !utf8.ValidString(raw) || containsUnsafeURLRune(raw) {
-		return "", &PostURLError{Reason: PostURLMalformed}
+		return ParsedPostURL{}, &PostURLError{Reason: PostURLMalformed}
 	}
 
 	parsed, err := url.Parse(raw)
 	if err != nil || !parsed.IsAbs() || parsed.Opaque != "" {
-		return "", &PostURLError{Reason: PostURLMalformed}
+		return ParsedPostURL{}, &PostURLError{Reason: PostURLMalformed}
 	}
 	if !strings.EqualFold(parsed.Scheme, "https") {
-		return "", &PostURLError{Reason: PostURLUnsupportedScheme}
+		return ParsedPostURL{}, &PostURLError{Reason: PostURLUnsupportedScheme}
 	}
 	// Comparing Host with Hostname also rejects an explicitly empty port, which
 	// URL.Port cannot distinguish from no port at all.
-	if parsed.User != nil || parsed.Host != parsed.Hostname() || parsed.RawPath != "" || strings.Contains(parsed.EscapedPath(), "%") {
-		return "", &PostURLError{Reason: PostURLUnsafe}
+	if parsed.User != nil || parsed.Host != parsed.Hostname() || parsed.RawPath != "" ||
+		strings.Contains(parsed.EscapedPath(), "%") || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return ParsedPostURL{}, &PostURLError{Reason: PostURLUnsafe}
 	}
 
 	host := strings.ToLower(parsed.Hostname())
 	if host == "" || strings.HasSuffix(host, ".") {
-		return "", &PostURLError{Reason: PostURLUnsupportedHost}
+		return ParsedPostURL{}, &PostURLError{Reason: PostURLUnsupportedHost}
 	}
 
 	segments, validPath := splitPath(parsed.Path)
 	if !validPath {
-		return "", &PostURLError{Reason: PostURLUnsupportedPath}
+		return ParsedPostURL{}, &PostURLError{Reason: PostURLUnsupportedPath}
 	}
 
 	var candidate string
+	var jsonSegments []string
 	switch host {
 	case "redd.it":
 		if len(segments) != 1 {
-			return "", &PostURLError{Reason: PostURLUnsupportedPath}
+			return ParsedPostURL{}, &PostURLError{Reason: PostURLUnsupportedPath}
 		}
 		candidate = segments[0]
+		jsonSegments = []string{"comments", candidate}
 	default:
 		if !isLongRedditHost(host) {
-			return "", &PostURLError{Reason: PostURLUnsupportedHost}
+			return ParsedPostURL{}, &PostURLError{Reason: PostURLUnsupportedHost}
 		}
 
 		switch {
 		case len(segments) >= 4 && segments[0] == "r" && segments[2] == "comments":
 			if !validSubreddit(segments[1]) {
-				return "", &PostURLError{Reason: PostURLUnsupportedPath}
+				return ParsedPostURL{}, &PostURLError{Reason: PostURLUnsupportedPath}
 			}
 			candidate = segments[3]
+			jsonSegments = append([]string(nil), segments...)
 		case len(segments) >= 2 && segments[0] == "comments":
 			candidate = segments[1]
+			jsonSegments = append([]string(nil), segments...)
 		default:
-			return "", &PostURLError{Reason: PostURLUnsupportedPath}
+			return ParsedPostURL{}, &PostURLError{Reason: PostURLUnsupportedPath}
 		}
 	}
 
-	// Reddit's JSON listing form may suffix the post-ID segment with .json. The
-	// suffix is syntax, not part of the stable base-36 identity.
-	candidate = strings.TrimSuffix(candidate, ".json")
 	if !validPostID(candidate) {
-		return "", &PostURLError{Reason: PostURLInvalidID}
+		return ParsedPostURL{}, &PostURLError{Reason: PostURLInvalidID}
 	}
-	return strings.ToLower(candidate), nil
+	if !normalizeJSONSegments(&jsonSegments) {
+		return ParsedPostURL{}, &PostURLError{Reason: PostURLUnsupportedPath}
+	}
+	id := strings.ToLower(candidate)
+	// Normalize the identity-bearing segment as well as subreddit spelling. Slugs
+	// are already restricted to Reddit's stable ASCII permalink alphabet.
+	if len(jsonSegments) >= 4 && jsonSegments[0] == "r" {
+		jsonSegments[1] = strings.ToLower(jsonSegments[1])
+		jsonSegments[3] = id
+	} else {
+		jsonSegments[1] = id
+	}
+	return ParsedPostURL{ID: id, JSONPath: "/" + strings.Join(jsonSegments, "/") + "/.json"}, nil
+}
+
+// normalizeJSONSegments accepts only a post permalink, never a focal-comment URL.
+// A trailing .json segment is normalized away so callers cannot produce .json.json.
+func normalizeJSONSegments(segments *[]string) bool {
+	values := *segments
+	if len(values) > 0 && values[len(values)-1] == ".json" {
+		values = values[:len(values)-1]
+	}
+	prefix := 2
+	if len(values) >= 4 && values[0] == "r" {
+		prefix = 4
+	}
+	// The slug is optional, but a second suffix segment would identify a comment,
+	// not the post itself.
+	if len(values) < prefix || len(values) > prefix+1 {
+		return false
+	}
+	for index, segment := range values {
+		if segment == "" || !validPathSegment(segment) {
+			return false
+		}
+		if index == prefix && segment == ".json" {
+			return false
+		}
+	}
+	*segments = values
+	return true
+}
+
+func validPathSegment(value string) bool {
+	for _, c := range []byte(value) {
+		if !isASCIIAlphaNumeric(c) && c != '_' && c != '-' {
+			return false
+		}
+	}
+	return value != ""
 }
 
 func isLongRedditHost(host string) bool {

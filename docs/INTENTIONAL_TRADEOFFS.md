@@ -6,12 +6,11 @@ their absence is a scope decision rather than an overlooked implementation task.
 
 ## 1. Persistent caching
 
-DuckWords does not cache source documents, Reddit responses, comment trees, OAuth
-tokens, or final counts across runs. The assignment expects a fresh aggregation, and
+DuckWords does not cache source documents, Reddit responses, comment trees, or final
+counts across runs. The assignment expects a fresh aggregation, and
 a persistent cache would require expiry rules, invalidation, storage permissions,
 schema migration, and careful handling of deleted Reddit content. Within one process,
-OAuth tokens and HTTP connections are reused where safe, but nothing is written as a
-reusable data cache.
+HTTP connections are reused where safe, but nothing is written as a reusable data cache.
 
 ## 2. Prometheus metrics
 
@@ -34,19 +33,18 @@ diagnostics remain explicit and testable.
 
 HTTP is implemented with Go's standard `net/http` stack instead of Resty or another
 wrapper. This is intentional: the project needs precise control over transports,
-timeouts, redirects, body limits, retries, rate limiting, connection reuse, OAuth
+timeouts, redirects, body limits, retries, rate limiting, connection reuse, fixed
 destinations, and response closing. The native client provides those primitives
 without hiding request ownership or adding another runtime dependency.
 
-## 5. Cross-process rate-limit and profile coordination
+## 5. Cross-process rate-limit coordination
 
-The OAuth token source, adaptive limiter, retry counters, and Reddit rate-limit state
-are shared by all workers **inside one process only**. Two DuckWords processes using
-the same Reddit application/profile do not coordinate, so together they may consume
-the quota faster than either process observes locally. The supported operational
-model is one active DuckWords process per Reddit application/profile. Supporting
+The adaptive limiter, retry counters, and Reddit rate-limit state are shared by all
+workers **inside one process only**. Two DuckWords processes do not coordinate, so
+together they may send requests faster than either process observes locally. The
+supported operational model is one active DuckWords process. Supporting
 horizontal execution would require an external lease and distributed rate limiter
-(for example Redis or a database), plus shared token and retry-state semantics.
+(for example Redis or a database), plus shared retry-state semantics.
 
 ## 6. Checkpointing and resume
 
@@ -57,9 +55,9 @@ could add a versioned checkpoint store, but that is unnecessary for 200 bounded 
 
 ## 7. General-purpose Reddit client behavior
 
-The implementation is intentionally narrow: fixed official OAuth/API origins,
-application-only OAuth, the assignment's comment endpoints, and allowlisted input
-hosts. It does not support browser cookies, user-login flows, arbitrary Reddit
+The implementation is intentionally narrow: one fixed public `old.reddit.com` JSON
+origin, the assignment's comment pages, and allowlisted input hosts. It does not
+support OAuth, browser cookies, user-login flows, arbitrary Reddit
 endpoints, arbitrary remote input origins, posting, moderation actions, or streaming.
 Local input files remain available for deterministic and offline use.
 

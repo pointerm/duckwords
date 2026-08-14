@@ -7,8 +7,8 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Pull requests, including forks, need source read access only. Reddit approval and
-# credentials are deliberately absent from every ordinary CI job.
+# Pull requests, including forks, need source read access only. Live Reddit access
+# is deliberately absent from every ordinary CI job.
 permissions:
   contents: read
 
@@ -19,7 +19,6 @@ concurrency:
 env:
   GOTOOLCHAIN: local
   GOFIPS140: "off"
-  REDDIT_API_ACCESS_APPROVED: "false"
 
 jobs:
   verify:

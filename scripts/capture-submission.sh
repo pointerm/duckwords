@@ -1,9 +1,9 @@
 #!/bin/bash -p
 
-# Capture one policy-approved assignment run and ask the evidence finalizer to
-# publish an atomic, reviewable bundle. Credentials remain in process memory only:
-# this wrapper never prints or persists them and exposes them solely to the verified
-# live DuckWords child.
+# Capture one complete public-JSON assignment run and ask the evidence finalizer to
+# publish an atomic, reviewable bundle. Reddit authentication is neither required
+# nor allowed; only an optional non-secret User-Agent override crosses into the
+# verified live DuckWords child.
 if [[ "$-" != *p* ]]; then
   printf 'capture-submission: invoke through make submission-capture or execute the script directly; Bash privileged mode is required\n' >&2
   exit 2
@@ -17,17 +17,13 @@ umask 077
 # functions before this script executes; ordinary in-script cleanup cannot safely
 # run first when functions are allowed to shadow even `set`, `unset`, or `command`.
 #
-# The caller must provide Reddit credentials through the environment, but no
-# preflight subprocess needs them. Retain their bytes only as unexported shell
-# variables, remove them from the wrapper environment before invoking any helper,
-# and restore them solely for the byte-verified live DuckWords child.
-live_reddit_api_approved="${REDDIT_API_ACCESS_APPROVED-}"
-live_reddit_client_id="${REDDIT_CLIENT_ID-}"
-live_reddit_client_secret="${REDDIT_CLIENT_SECRET-}"
+# Retain the optional User-Agent override only as an unexported shell variable.
+# Legacy OAuth/policy names are removed without reading their values and can never
+# cross an executable boundary.
 live_reddit_user_agent="${REDDIT_USER_AGENT-}"
 unset REDDIT_API_ACCESS_APPROVED REDDIT_CLIENT_ID REDDIT_CLIENT_SECRET REDDIT_USER_AGENT
-readonly live_reddit_api_approved live_reddit_client_id live_reddit_client_secret \
-  live_reddit_user_agent
+unset REDDIT_POLICY_VERIFIED_AT REDDIT_APPROVAL_REFERENCE
+readonly live_reddit_user_agent
 
 # Bash imports exported functions before it starts this script. Remove every such
 # function before resolving the repository or invoking a helper so an ambient
@@ -126,11 +122,6 @@ fail() {
 if [[ "$#" -ne 0 ]]; then
   fail "this wrapper accepts no arguments; the reviewed assignment invocation is fixed"
 fi
-if [[ "${live_reddit_api_approved}" != "true" || -z "${live_reddit_client_id}" ||
-  -z "${live_reddit_client_secret}" || -z "${live_reddit_user_agent}" ]]; then
-  fail "REDDIT_API_ACCESS_APPROVED=true and all credential environment variables are required"
-fi
-
 cd "${repository_root}"
 
 if ! repository_from_git="$(git rev-parse --show-toplevel 2>/dev/null)"; then
@@ -244,45 +235,6 @@ if [[ -e "${verification_source}" || -L "${verification_source}" ]]; then
   fail "the private candidate source snapshot could not be removed safely"
 fi
 verification_source=""
-
-: "${REDDIT_POLICY_VERIFIED_AT:?REDDIT_POLICY_VERIFIED_AT is required (YYYY-MM-DD)}"
-: "${REDDIT_APPROVAL_REFERENCE:?REDDIT_APPROVAL_REFERENCE is required (safe opaque identifier)}"
-readonly policy_verified_at="${REDDIT_POLICY_VERIFIED_AT}"
-readonly approval_reference="${REDDIT_APPROVAL_REFERENCE}"
-
-if [[ ! "${policy_verified_at}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-  fail "REDDIT_POLICY_VERIFIED_AT must use YYYY-MM-DD"
-fi
-normalized_policy_date=""
-if normalized_policy_date="$(date -u -d "${policy_verified_at}" '+%Y-%m-%d' 2>/dev/null)"; then
-  :
-elif normalized_policy_date="$(date -j -u -f '%Y-%m-%d' "${policy_verified_at}" '+%Y-%m-%d' 2>/dev/null)"; then
-  :
-else
-  fail "REDDIT_POLICY_VERIFIED_AT must be a real calendar date"
-fi
-if ! utc_today="$(date -u '+%Y-%m-%d')"; then
-  fail "the current UTC date could not be determined"
-fi
-if [[ "${normalized_policy_date}" != "${policy_verified_at}" ||
-  "${policy_verified_at}" > "${utc_today}" ]]; then
-  fail "REDDIT_POLICY_VERIFIED_AT must be a real, non-future UTC date"
-fi
-if [[ "${policy_verified_at}" != "${utc_today}" ]]; then
-  fail "REDDIT_POLICY_VERIFIED_AT must match the final run UTC date"
-fi
-if [[ ${#approval_reference} -gt 128 ||
-  ! "${approval_reference}" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]*$ ]]; then
-  fail "REDDIT_APPROVAL_REFERENCE must be a 1..128 character safe opaque identifier"
-fi
-if ! approval_reference_lower="$(printf '%s' "${approval_reference}" | tr '[:upper:]' '[:lower:]')"; then
-  fail "REDDIT_APPROVAL_REFERENCE could not be validated"
-fi
-case "${approval_reference_lower}" in
-  *secret* | *token* | *password* | *authorization* | *bearer* | *client_id* | *client-id*)
-    fail "REDDIT_APPROVAL_REFERENCE contains a prohibited sensitive term"
-    ;;
-esac
 
 if [[ -z "${submission_dir}" || "${submission_dir}" == /* ||
   "${submission_dir}" == */ || "${submission_dir}" == *//* ]]; then
@@ -406,26 +358,24 @@ trap 'forward_signal TERM' TERM
 
 set +e
 (
-  # The credential values are unexported parent-shell variables. Remove the export
-  # attribute from every ambient name with Bash builtins, export only the reviewed
-  # live inputs, and replace this subshell directly with the verified binary. No
-  # transient process receives a credential through argv.
+  # Remove the export attribute from every ambient name with Bash builtins, export
+  # only the reviewed live inputs, and replace this subshell directly with the
+  # verified binary.
   while IFS= read -r environment_name; do
     command builtin export -n "${environment_name}"
   done < <(command builtin compgen -e)
   command builtin export TZ=UTC
-  command builtin export REDDIT_API_ACCESS_APPROVED="${live_reddit_api_approved}"
-  command builtin export REDDIT_CLIENT_ID="${live_reddit_client_id}"
-  command builtin export REDDIT_CLIENT_SECRET="${live_reddit_client_secret}"
-  command builtin export REDDIT_USER_AGENT="${live_reddit_user_agent}"
+  if [[ -n "${live_reddit_user_agent}" ]]; then
+    command builtin export REDDIT_USER_AGENT="${live_reddit_user_agent}"
+  fi
   exec "${verification_binary}" \
     --workers=4 \
     --rate-limit=0.8 \
     --request-timeout=20s \
-    --timeout=30m \
+    --timeout=2h \
     --max-retries=3 \
     --retry-budget=45s \
-    --failure-mode=best-effort \
+    --failure-mode=strict \
     --log-level=info \
     --log-format=json
 ) \
@@ -447,7 +397,7 @@ if ((signal_count > 0)); then
   set -e
 fi
 
-if [[ "${run_status}" -ne 0 && "${run_status}" -ne 3 ]]; then
+if [[ "${run_status}" -ne 0 ]]; then
   printf 'capture-submission: assignment run failed with exit status %s; no submission artifacts were published\n' "${run_status}" >&2
   exit "${run_status}"
 fi
@@ -460,9 +410,7 @@ env -i \
   --log "${stage_dir}/application.log" \
   --output-dir "${submission_output_abs}" \
   --exit-code "${run_status}" \
-  --binary "${verification_binary}" \
-  --policy-verified-at "${policy_verified_at}" \
-  --approval-reference "${approval_reference}" &
+  --binary "${verification_binary}" &
 child_pid=$!
 if ((signal_count > 0)); then
   signal_child "${received_signal}"

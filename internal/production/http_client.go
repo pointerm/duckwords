@@ -21,8 +21,8 @@ const (
 
 var errHTTPClientConfig = errors.New("invalid production HTTP client configuration")
 
-// newProductionHTTPClient centralizes transport ownership for source downloads,
-// OAuth, and Reddit API traffic. The specialized clients copy this value to apply
+// newProductionHTTPClient centralizes transport ownership for source downloads and
+// public Reddit JSON traffic. The specialized clients copy this value to apply
 // stricter redirect and cookie policy while retaining this shared connection pool.
 func newProductionHTTPClient(requestTimeout time.Duration, workers int) (*http.Client, error) {
 	if requestTimeout <= 0 {
@@ -37,7 +37,7 @@ func newProductionHTTPClient(requestTimeout time.Duration, workers int) (*http.C
 		)
 	}
 
-	connectionBudget := workers + 4 // workers, one OAuth flight, and two source loads.
+	connectionBudget := workers + 2 // concurrent post workers and two source loads.
 	dialTimeout := min(requestTimeout, productionDialTimeout)
 	tlsTimeout := min(requestTimeout, productionTLSHandshake)
 	dialer := &net.Dialer{

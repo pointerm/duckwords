@@ -63,6 +63,7 @@ func DefaultPostListLimits() PostListLimits {
 // appeared. It contains no untrusted query, fragment, or source URL text.
 type Post struct {
 	ID         string
+	JSONPath   string
 	SourceLine int
 }
 
@@ -183,18 +184,18 @@ func LoadPostList(r io.Reader, limits PostListLimits) (PostList, PostListStats, 
 		}
 		stats.URLLines++
 
-		id, err := ParsePostURL(line)
+		parsed, err := ParsePostURL(line)
 		if err != nil {
 			stats = finalizePostListStats(limited, limits, hasher, stats, len(posts))
 			return PostList{}, stats, &LineError{Line: stats.Lines, Err: err}
 		}
-		if _, duplicate := seen[id]; duplicate {
+		if _, duplicate := seen[parsed.ID]; duplicate {
 			stats.Duplicates++
 			continue
 		}
 
-		seen[id] = struct{}{}
-		posts = append(posts, Post{ID: id, SourceLine: stats.Lines})
+		seen[parsed.ID] = struct{}{}
+		posts = append(posts, Post{ID: parsed.ID, JSONPath: parsed.JSONPath, SourceLine: stats.Lines})
 	}
 
 	stats = finalizePostListStats(limited, limits, hasher, stats, len(posts))

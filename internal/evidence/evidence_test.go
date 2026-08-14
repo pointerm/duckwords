@@ -23,6 +23,7 @@ const (
 	testPostIDs = "aa1b5251da9480bdfc7abf23702fc1123756bfb0de76341fea70fe725e3e4806"
 	testWords   = "2222222222222222222222222222222222222222222222222222222222222222"
 	testResult  = "88eefd45a31855d57634868edcd846e93126c6db2ffd3c1790cca38fecaaba18"
+	testUAHash  = "3333333333333333333333333333333333333333333333333333333333333333"
 )
 
 func TestFinalizePublishesReconciledBundle(t *testing.T) {
@@ -40,9 +41,11 @@ func TestFinalizePublishesReconciledBundle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Finalize() error = %v", err)
 	}
-	if manifest.Schema != 1 || manifest.ExitCode != 0 || manifest.Partial || manifest.ResultWords != 2 ||
+	if manifest.Schema != 2 || manifest.ExitCode != 0 || manifest.Partial || manifest.ResultWords != 2 ||
 		manifest.StartedAt != "2026-08-14T10:00:00Z" || manifest.FinishedAt != "2026-08-14T10:00:03Z" ||
-		manifest.Summary.PostsCompleted != assignmentPostCount || manifest.Build.Commit != testCommit || manifest.Build.BinarySHA256 == "" {
+		manifest.Summary.PostsCompleted != assignmentPostCount || manifest.Build.Commit != testCommit || manifest.Build.BinarySHA256 == "" ||
+		manifest.Access.AccessProfile != fixedAccessProfile || manifest.Access.RedditAuth != fixedRedditAuth ||
+		manifest.Access.UserAgentSource != "builtin" || manifest.Access.UserAgentSHA256 == "" {
 		t.Fatalf("manifest = %#v", manifest)
 	}
 	for _, name := range []string{"result.json", "application.log", "full-application.log", "run-manifest.json", "RUN.md"} {
@@ -82,19 +85,15 @@ func TestFinalizePublishesReconciledBundle(t *testing.T) {
 	}
 }
 
-func TestFinalizeAcceptsExplicitPartialEvidence(t *testing.T) {
+func TestFinalizeRejectsPartialEvidence(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()
 	resultPath := writeTestFile(t, directory, "result.json", canonicalTestResult())
 	logPath := writeTestFile(t, directory, "log.ndjson", canonicalTestLog("failed"))
 	binaryPath := writeVersionBinary(t, directory)
-	manifest, err := Finalize(context.Background(), testConfig(resultPath, logPath, binaryPath, filepath.Join(directory, "out"), 3))
-	if err != nil {
-		t.Fatalf("Finalize() error = %v", err)
-	}
-	if !manifest.Partial || manifest.TerminalStatus != "partial" || manifest.Summary.PostsCompleted != assignmentPostCount-1 ||
-		manifest.Summary.PostsFailed != 1 || len(manifest.Outcomes) != assignmentPostCount {
-		t.Fatalf("partial manifest = %#v", manifest)
+	_, err := Finalize(context.Background(), testConfig(resultPath, logPath, binaryPath, filepath.Join(directory, "out"), 0))
+	if !errors.Is(err, ErrInvalidLog) {
+		t.Fatalf("Finalize() error = %v, want ErrInvalidLog", err)
 	}
 }
 
@@ -108,6 +107,7 @@ func TestFinalizeReconcilesSourceAndRedditRetryEvents(t *testing.T) {
 	log = strings.Replace(log, "\n"+`{"time":"2026-08-14T10:00:01Z"`, "\n"+redditRetry+"\n"+`{"time":"2026-08-14T10:00:01Z"`, 1)
 	log = strings.Replace(log, `"source_retries":0`, `"source_retries":1`, 1)
 	log = strings.Replace(log, `"reddit_retries":0`, `"reddit_retries":1`, 1)
+	log = strings.Replace(log, `"reddit_http_attempts":200`, `"reddit_http_attempts":201`, 1)
 	manifest, err := Finalize(context.Background(), testConfig(
 		writeTestFile(t, directory, "result.json", canonicalTestResult()),
 		writeTestFile(t, directory, "log.ndjson", log),
@@ -121,23 +121,20 @@ func TestFinalizeReconcilesSourceAndRedditRetryEvents(t *testing.T) {
 	}
 }
 
-func TestFinalizeAcceptsOAuthRetryWithEmptyPostID(t *testing.T) {
+func TestFinalizeRejectsOAuthRetry(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()
 	log := canonicalTestLog("completed")
 	retry := `{"time":"2026-08-14T10:00:00.5Z","level":"WARN","msg":"request retry scheduled","event":"request_retry","operation":"oauth_token","post_id":"","error_class":"server","http_status":503,"attempt":2,"delay":"500ms"}`
 	log = strings.Replace(log, "\n"+`{"time":"2026-08-14T10:00:01Z"`, "\n"+retry+"\n"+`{"time":"2026-08-14T10:00:01Z"`, 1)
 	log = strings.Replace(log, `"reddit_retries":0`, `"reddit_retries":1`, 1)
-	manifest, err := Finalize(context.Background(), testConfig(
+	_, err := Finalize(context.Background(), testConfig(
 		writeTestFile(t, directory, "result.json", canonicalTestResult()),
 		writeTestFile(t, directory, "log.ndjson", log),
 		writeVersionBinary(t, directory), filepath.Join(directory, "out"), 0,
 	))
-	if err != nil {
-		t.Fatalf("Finalize() error = %v", err)
-	}
-	if manifest.Requests.RedditRetries != 1 {
-		t.Fatalf("request manifest = %#v", manifest.Requests)
+	if !errors.Is(err, ErrInvalidLog) {
+		t.Fatalf("Finalize() error = %v, want ErrInvalidLog", err)
 	}
 }
 
@@ -151,8 +148,7 @@ func TestValidateRetryMatchesProducerContract(t *testing.T) {
 		{name: "source status", valid: true, json: `{"time":"2026-08-14T10:00:00Z","operation":"source_download","source_kind":"posts","error_class":"http_status","http_status":503,"attempt":2,"delay":"1ns"}`},
 		{name: "source read", valid: true, json: `{"time":"2026-08-14T10:00:00Z","operation":"source_download","source_kind":"posts","error_class":"read","http_status":200,"attempt":3,"delay":"1ns"}`},
 		{name: "source transport", valid: true, json: `{"time":"2026-08-14T10:00:00Z","operation":"source_download","source_kind":"dictionary","error_class":"transport","attempt":2,"delay":"1ns"}`},
-		{name: "oauth server", valid: true, json: `{"time":"2026-08-14T10:00:00Z","operation":"oauth_token","post_id":"","error_class":"server","http_status":503,"attempt":4,"delay":"1ns"}`},
-		{name: "authentication replay", valid: true, json: `{"time":"2026-08-14T10:00:00Z","operation":"comments","post_id":"duck123","error_class":"authentication","http_status":401,"attempt":5,"delay":"0s"}`},
+		{name: "comment expansion", valid: true, json: `{"time":"2026-08-14T10:00:00Z","operation":"comment_expansion","post_id":"duck123","error_class":"server","http_status":503,"attempt":4,"delay":"1ns"}`},
 		{name: "source first attempt", json: `{"time":"2026-08-14T10:00:00Z","operation":"source_download","source_kind":"posts","error_class":"http_status","http_status":503,"attempt":1,"delay":"1ns"}`},
 		{name: "source fourth attempt", json: `{"time":"2026-08-14T10:00:00Z","operation":"source_download","source_kind":"posts","error_class":"http_status","http_status":503,"attempt":4,"delay":"1ns"}`},
 		{name: "source zero delay", json: `{"time":"2026-08-14T10:00:00Z","operation":"source_download","source_kind":"posts","error_class":"http_status","http_status":503,"attempt":2,"delay":"0s"}`},
@@ -162,12 +158,12 @@ func TestValidateRetryMatchesProducerContract(t *testing.T) {
 		{name: "source read status omitted", json: `{"time":"2026-08-14T10:00:00Z","operation":"source_download","source_kind":"posts","error_class":"read","attempt":2,"delay":"1ns"}`},
 		{name: "source close emitted status", json: `{"time":"2026-08-14T10:00:00Z","operation":"source_download","source_kind":"posts","error_class":"close","http_status":200,"attempt":2,"delay":"1ns"}`},
 		{name: "reddit status omitted", json: `{"time":"2026-08-14T10:00:00Z","operation":"comments","post_id":"duck123","error_class":"server","attempt":2,"delay":"1ns"}`},
-		{name: "authentication backoff", json: `{"time":"2026-08-14T10:00:00Z","operation":"comments","post_id":"duck123","error_class":"authentication","http_status":401,"attempt":2,"delay":"1ns"}`},
+		{name: "access is permanent", json: `{"time":"2026-08-14T10:00:00Z","operation":"comments","post_id":"duck123","error_class":"access","http_status":403,"attempt":2,"delay":"1ns"}`},
 		{name: "server zero delay", json: `{"time":"2026-08-14T10:00:00Z","operation":"comments","post_id":"duck123","error_class":"server","http_status":503,"attempt":2,"delay":"0s"}`},
 		{name: "server permanent status", json: `{"time":"2026-08-14T10:00:00Z","operation":"comments","post_id":"duck123","error_class":"server","http_status":501,"attempt":2,"delay":"1ns"}`},
-		{name: "oauth fifth attempt", json: `{"time":"2026-08-14T10:00:00Z","operation":"oauth_token","post_id":"","error_class":"server","http_status":503,"attempt":5,"delay":"1ns"}`},
-		{name: "API sixth attempt", json: `{"time":"2026-08-14T10:00:00Z","operation":"comments","post_id":"duck123","error_class":"server","http_status":503,"attempt":6,"delay":"1ns"}`},
-		{name: "oauth authentication", json: `{"time":"2026-08-14T10:00:00Z","operation":"oauth_token","post_id":"","error_class":"authentication","http_status":401,"attempt":2,"delay":"0s"}`},
+		{name: "legacy OAuth operation", json: `{"time":"2026-08-14T10:00:00Z","operation":"oauth_token","post_id":"","error_class":"server","http_status":503,"attempt":2,"delay":"1ns"}`},
+		{name: "API fifth attempt", json: `{"time":"2026-08-14T10:00:00Z","operation":"comments","post_id":"duck123","error_class":"server","http_status":503,"attempt":5,"delay":"1ns"}`},
+		{name: "zero-delay Reddit retry", json: `{"time":"2026-08-14T10:00:00Z","operation":"comments","post_id":"duck123","error_class":"transport","http_status":0,"attempt":2,"delay":"0s"}`},
 		{name: "API post ID omitted", json: `{"time":"2026-08-14T10:00:00Z","operation":"comments","error_class":"server","http_status":503,"attempt":2,"delay":"1ns"}`},
 	}
 	for _, test := range tests {
@@ -235,9 +231,9 @@ func TestReconcileRejectsImpossibleRedditRetryAttemptSequence(t *testing.T) {
 			},
 		},
 		{
-			name: "morechildren session absent from outcome",
+			name: "comment expansion session absent from outcome",
 			retries: []string{
-				`{"time":"2026-08-14T10:00:00.5Z","level":"WARN","msg":"request retry scheduled","event":"request_retry","operation":"morechildren","post_id":"duck123","error_class":"server","http_status":503,"attempt":2,"delay":"1ns"}`,
+				`{"time":"2026-08-14T10:00:00.5Z","level":"WARN","msg":"request retry scheduled","event":"request_retry","operation":"comment_expansion","post_id":"duck123","error_class":"server","http_status":503,"attempt":2,"delay":"1ns"}`,
 			},
 		},
 	}
@@ -258,15 +254,13 @@ func TestReconcileRejectsImpossibleRedditRetryAttemptSequence(t *testing.T) {
 func TestReconcileAcceptsBoundedRedditRetrySessions(t *testing.T) {
 	t.Parallel()
 	outcomes := map[string]OutcomeManifest{
-		"duck123": {PostID: "duck123", MoreRequests: 2, ContinuationRequests: 1},
+		"duck123": {PostID: "duck123", ExpansionRequests: 2, ContinuationRequests: 1},
 	}
 	retries := []retryRecord{
-		{operation: "oauth_token", attempt: 2},
-		{operation: "oauth_token", attempt: 3},
 		{operation: "comments", postID: "duck123", attempt: 2},
 		{operation: "comments", postID: "duck123", attempt: 3},
-		{operation: "morechildren", postID: "duck123", attempt: 2},
-		{operation: "morechildren", postID: "duck123", attempt: 2},
+		{operation: "comment_expansion", postID: "duck123", attempt: 2},
+		{operation: "comment_expansion", postID: "duck123", attempt: 2},
 		{operation: "continuation", postID: "duck123", attempt: 2},
 	}
 	if err := reconcileRedditRetries(retries, outcomes); err != nil {
@@ -387,6 +381,12 @@ func TestFinalizeRejectsLogTamperingWithoutPublishing(t *testing.T) {
 		{name: "wrong assignment origin", edit: func(value string) string {
 			return strings.Replace(value, `"source_origin":"gist.githubusercontent.com"`, `"source_origin":"example.com"`, 1)
 		}},
+		{name: "wrong access profile", edit: func(value string) string {
+			return strings.Replace(value, `"access_profile":"old-reddit-public-json-v1"`, `"access_profile":"oauth"`, 1)
+		}},
+		{name: "access identity changes", edit: func(value string) string {
+			return strings.Replace(value, `"ua_source":"builtin"`, `"ua_source":"override"`, 1)
+		}},
 		{name: "source lifecycle order", edit: func(value string) string {
 			lines := strings.Split(value, "\n")
 			lines[1], lines[2] = lines[2], lines[1]
@@ -440,13 +440,13 @@ func TestReconcileRejectsImpossibleLifecycleEvidence(t *testing.T) {
 			return strings.Replace(value, `"duration":"2s"`, `"duration":"20s"`, 1)
 		}},
 		{name: "summary duration exceeds global ceiling", edit: func(value string) string {
-			return strings.Replace(value, `"duration":"2s"`, `"duration":"30m0.000000001s"`, 1)
+			return strings.Replace(value, `"duration":"2s"`, `"duration":"2h0m0.000000001s"`, 1)
 		}},
 		{name: "observed lifecycle exceeds global ceiling", edit: func(value string) string {
 			value = strings.Replace(value, `"time":"2026-08-14T10:00:02Z","level":"INFO","msg":"processing summary"`,
-				`"time":"2026-08-14T10:31:00Z","level":"INFO","msg":"processing summary"`, 1)
+				`"time":"2026-08-14T12:01:00Z","level":"INFO","msg":"processing summary"`, 1)
 			return strings.Replace(value, `"time":"2026-08-14T10:00:03Z","level":"INFO","msg":"result written"`,
-				`"time":"2026-08-14T10:31:01Z","level":"INFO","msg":"result written"`, 1)
+				`"time":"2026-08-14T12:01:01Z","level":"INFO","msg":"result written"`, 1)
 		}},
 		{name: "output precedes summary timestamp", edit: func(value string) string {
 			return strings.Replace(value, `"time":"2026-08-14T10:00:03Z","level":"INFO","msg":"result written"`,
@@ -700,17 +700,14 @@ func TestInspectBinaryBoundsDescendantHeldPipes(t *testing.T) {
 	descendant = process
 }
 
-func TestValidateConfigRejectsUnsafeAttestation(t *testing.T) {
+func TestValidateConfigRejectsUnsafeConfiguration(t *testing.T) {
 	t.Parallel()
 	base := Config{ResultPath: "result", LogPath: "log", OutputDir: "out", BinaryPath: "bin", ExitCode: 0,
-		PolicyVerifiedAt: "2026-08-14", ApprovalReference: "reddit-approval-confirmed-2026-08-14",
 		Now: func() time.Time { return time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC) }}
 	tests := []Config{
 		func() Config { cfg := base; cfg.ExitCode = 2; return cfg }(),
-		func() Config { cfg := base; cfg.PolicyVerifiedAt = "2026-02-30"; return cfg }(),
-		func() Config { cfg := base; cfg.PolicyVerifiedAt = "2026-08-12"; return cfg }(),
-		func() Config { cfg := base; cfg.PolicyVerifiedAt = "2026-08-15"; return cfg }(),
-		func() Config { cfg := base; cfg.ApprovalReference = "bearer-token"; return cfg }(),
+		func() Config { cfg := base; cfg.ExitCode = 3; return cfg }(),
+		func() Config { cfg := base; cfg.ResultPath = ""; return cfg }(),
 		func() Config { cfg := base; cfg.OutputDir = " bad"; return cfg }(),
 	}
 	for _, cfg := range tests {
@@ -735,7 +732,7 @@ func TestFinalizeAllowsUTCDateRolloverAfterRunStarts(t *testing.T) {
 	}
 }
 
-func TestFinalizeRequiresPolicyReviewOnRunUTCDate(t *testing.T) {
+func TestFinalizeRejectsFutureLifecycleAfterUTCDateRollover(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()
 	log := strings.ReplaceAll(canonicalTestLog("completed"), "2026-08-14T10:", "2026-08-15T10:")
@@ -745,8 +742,8 @@ func TestFinalizeRequiresPolicyReviewOnRunUTCDate(t *testing.T) {
 		writeTestFile(t, directory, "log.ndjson", log),
 		writeVersionBinary(t, directory), outputDir, 0,
 	))
-	if !errors.Is(err, ErrInvalidConfig) {
-		t.Fatalf("Finalize() error = %v, want ErrInvalidConfig", err)
+	if !errors.Is(err, ErrInvalidLog) {
+		t.Fatalf("Finalize() error = %v, want ErrInvalidLog", err)
 	}
 	assertNoPublishedOrStagedBundle(t, directory, outputDir)
 }
@@ -815,8 +812,8 @@ func canonicalTestResult() string {
 }
 
 // canonicalTestLog builds a full 200-post capture. lastOutcome selects the terminal
-// state of the final post: "completed", "failed" (a genuine server failure, which
-// makes the run partial), or "skipped" (a provably absent post, which does not).
+// state of the final post: "completed", "failed" (non-canonical partial evidence),
+// or "skipped" (a 404-proven absent post, which keeps the strict run complete).
 func canonicalTestLog(lastOutcome string) string {
 	status, terminal := "complete", "false"
 	completed, skipped, failed := assignmentPostCount, 0, 0
@@ -828,7 +825,7 @@ func canonicalTestLog(lastOutcome string) string {
 		completed, skipped = assignmentPostCount-1, 1
 	}
 	lines := []string{
-		`{"time":"2026-08-14T10:00:00Z","level":"INFO","msg":"run started","event":"run_started","workers":4,"failure_mode":"best-effort","input_profile":"assignment-default-v1","filter_count":0,"rate_limit_rps":0.8,"request_timeout":"20s","global_timeout":"30m0s","max_retries":3,"retry_budget":"45s","source_max_retries":2,"source_retry_budget":"15s","max_distinct_words_per_post":50000,"max_in_flight_response_bytes":33554432,"max_retained_things":500000,"app_version":"1.2.3","app_commit":"` + testCommit + `","app_build_date":"2026-08-14T09:00:00Z","go_version":"go1.26.6","goos":"` + runtime.GOOS + `","goarch":"` + runtime.GOARCH + `"}`,
+		`{"time":"2026-08-14T10:00:00Z","level":"INFO","msg":"run started","event":"run_started","workers":4,"failure_mode":"strict","input_profile":"assignment-default-v1","filter_count":0,"rate_limit_rps":0.8,"request_timeout":"20s","global_timeout":"2h0m0s","max_retries":3,"retry_budget":"45s","source_max_retries":2,"source_retry_budget":"15s","max_distinct_words_per_post":50000,"max_in_flight_response_bytes":33554432,"max_retained_things":500000,"access_profile":"old-reddit-public-json-v1","reddit_origin":"old.reddit.com","reddit_method":"GET","reddit_auth":"none","ua_source":"builtin","ua_sha256":"` + testUAHash + `","app_version":"1.2.3","app_commit":"` + testCommit + `","app_build_date":"2026-08-14T09:00:00Z","go_version":"go1.26.6","goos":"` + runtime.GOOS + `","goarch":"` + runtime.GOARCH + `"}`,
 		`{"time":"2026-08-14T10:00:00.1Z","level":"INFO","msg":"source loaded","event":"source_loaded","source_kind":"posts","source_mode":"https","source_origin":"gist.githubusercontent.com","source_bytes":100,"source_sha256":"` + testPosts + `"}`,
 		`{"time":"2026-08-14T10:00:00.2Z","level":"INFO","msg":"source parsed","event":"source_parsed","source_kind":"posts","stage":"parsed","entries":200,"source_sha256":"` + testPosts + `","posts_sha256":"` + testPostIDs + `"}`,
 		`{"time":"2026-08-14T10:00:00.3Z","level":"INFO","msg":"source loaded","event":"source_loaded","source_kind":"dictionary","source_mode":"https","source_origin":"raw.githubusercontent.com","source_bytes":200,"source_sha256":"` + testWords + `"}`,
@@ -840,19 +837,18 @@ func canonicalTestLog(lastOutcome string) string {
 			postID, comments, bodies, tokens = "duck123", 1, 1, 3
 		}
 		if index == assignmentPostCount && lastOutcome == "failed" {
-			lines = append(lines, fmt.Sprintf(`{"time":"2026-08-14T10:00:01Z","level":"INFO","msg":"post processing completed","event":"post_outcome","post_id":"%s","source_line":%d,"status":"failed","comments":0,"bodies_visited":0,"more_requests":0,"continuation_requests":0,"counted_tokens":0,"error_class":"server","operation":"comments","http_status":503}`, postID, index))
+			lines = append(lines, fmt.Sprintf(`{"time":"2026-08-14T10:00:01Z","level":"INFO","msg":"post processing completed","event":"post_outcome","post_id":"%s","source_line":%d,"status":"failed","comments":0,"bodies_visited":0,"expansion_requests":0,"continuation_requests":0,"counted_tokens":0,"error_class":"server","operation":"comments","http_status":503}`, postID, index))
 			continue
 		}
-		// A validated empty post listing is a 200 response, so an absent post carries
-		// no HTTP status of its own.
+		// Canonical absence requires a 404 or 410 from the initial comments request.
 		if index == assignmentPostCount && lastOutcome == "skipped" {
-			lines = append(lines, fmt.Sprintf(`{"time":"2026-08-14T10:00:01Z","level":"INFO","msg":"post processing completed","event":"post_outcome","post_id":"%s","source_line":%d,"status":"skipped","comments":0,"bodies_visited":0,"more_requests":0,"continuation_requests":0,"counted_tokens":0,"error_class":"not_found","operation":"comments"}`, postID, index))
+			lines = append(lines, fmt.Sprintf(`{"time":"2026-08-14T10:00:01Z","level":"INFO","msg":"post processing completed","event":"post_outcome","post_id":"%s","source_line":%d,"status":"skipped","comments":0,"bodies_visited":0,"expansion_requests":0,"continuation_requests":0,"counted_tokens":0,"error_class":"not_found","operation":"comments","http_status":404}`, postID, index))
 			continue
 		}
-		lines = append(lines, fmt.Sprintf(`{"time":"2026-08-14T10:00:01Z","level":"INFO","msg":"post processing completed","event":"post_outcome","post_id":"%s","source_line":%d,"status":"completed","comments":%d,"bodies_visited":%d,"more_requests":0,"continuation_requests":0,"counted_tokens":%d}`, postID, index, comments, bodies, tokens))
+		lines = append(lines, fmt.Sprintf(`{"time":"2026-08-14T10:00:01Z","level":"INFO","msg":"post processing completed","event":"post_outcome","post_id":"%s","source_line":%d,"status":"completed","comments":%d,"bodies_visited":%d,"expansion_requests":0,"continuation_requests":0,"counted_tokens":%d}`, postID, index, comments, bodies, tokens))
 	}
 	lines = append(lines,
-		fmt.Sprintf(`{"time":"2026-08-14T10:00:02Z","level":"INFO","msg":"processing summary","event":"run_summary","terminal_status":"%s","partial":%s,"failure_mode":"best-effort","workers":4,"input_profile":"assignment-default-v1","filter_count":0,"duration":"2s","posts_total":200,"posts_completed":%d,"posts_skipped":%d,"posts_failed":%d,"posts_incomplete":0,"comments":1,"bodies_visited":1,"more_requests":0,"continuation_requests":0,"counted_tokens":3,"distinct_words":2,"dictionary_words":3,"source_retries":0,"reddit_http_attempts":201,"reddit_retries":0,"throttle_waits":200,"throttle_wait":"1s","posts_sha256":"%s","post_ids_sha256":"%s","dictionary_sha256":"%s","app_version":"1.2.3","app_commit":"%s","app_build_date":"2026-08-14T09:00:00Z","go_version":"go1.26.6","goos":"%s","goarch":"%s"}`, status, terminal, completed, skipped, failed, testPosts, testPostIDs, testWords, testCommit, runtime.GOOS, runtime.GOARCH),
+		fmt.Sprintf(`{"time":"2026-08-14T10:00:02Z","level":"INFO","msg":"processing summary","event":"run_summary","terminal_status":"%s","partial":%s,"failure_mode":"strict","workers":4,"input_profile":"assignment-default-v1","filter_count":0,"duration":"2s","posts_total":200,"posts_completed":%d,"posts_skipped":%d,"posts_failed":%d,"posts_incomplete":0,"comments":1,"bodies_visited":1,"expansion_requests":0,"continuation_requests":0,"counted_tokens":3,"distinct_words":2,"dictionary_words":3,"source_retries":0,"reddit_http_attempts":200,"reddit_retries":0,"throttle_waits":200,"throttle_wait":"1s","posts_sha256":"%s","post_ids_sha256":"%s","dictionary_sha256":"%s","access_profile":"old-reddit-public-json-v1","reddit_origin":"old.reddit.com","reddit_method":"GET","reddit_auth":"none","ua_source":"builtin","ua_sha256":"%s","app_version":"1.2.3","app_commit":"%s","app_build_date":"2026-08-14T09:00:00Z","go_version":"go1.26.6","goos":"%s","goarch":"%s"}`, status, terminal, completed, skipped, failed, testPosts, testPostIDs, testWords, testUAHash, testCommit, runtime.GOOS, runtime.GOARCH),
 		fmt.Sprintf(`{"time":"2026-08-14T10:00:03Z","level":"INFO","msg":"result written","event":"output_written","partial":%s,"result_words":2,"result_sha256":"%s"}`, terminal, testResult),
 	)
 	log := strings.Join(lines, "\n") + "\n"
@@ -914,8 +910,8 @@ func assertNoEvidenceStages(t *testing.T, parent string) {
 
 func testConfig(resultPath, logPath, binaryPath, outputDir string, exitCode int) Config {
 	return Config{ResultPath: resultPath, LogPath: logPath, BinaryPath: binaryPath, OutputDir: outputDir,
-		ExitCode: exitCode, PolicyVerifiedAt: "2026-08-14", ApprovalReference: "reddit-approval-confirmed-2026-08-14",
-		Now: func() time.Time { return time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC) }}
+		ExitCode: exitCode,
+		Now:      func() time.Time { return time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC) }}
 }
 
 func writeTestFile(t *testing.T, directory, name, contents string) string {
@@ -971,19 +967,21 @@ func TestFinalizeAcceptsSkippedAbsentPosts(t *testing.T) {
 func TestParseOutcomeSkippedContract(t *testing.T) {
 	t.Parallel()
 
-	const base = `{"time":"2026-08-14T10:00:01Z","level":"INFO","msg":"post processing completed","event":"post_outcome","post_id":"duck123","source_line":1,"comments":0,"bodies_visited":0,"more_requests":0,"continuation_requests":0,"counted_tokens":0`
+	const base = `{"time":"2026-08-14T10:00:01Z","level":"INFO","msg":"post processing completed","event":"post_outcome","post_id":"duck123","source_line":1,"comments":0,"bodies_visited":0,"expansion_requests":0,"continuation_requests":0,"counted_tokens":0`
 	tests := []struct {
 		name  string
 		extra string
 		valid bool
 	}{
-		{name: "empty listing has no HTTP status", extra: `,"status":"skipped","error_class":"not_found","operation":"comments"`, valid: true},
+		{name: "empty listing is not absence", extra: `,"status":"skipped","error_class":"not_found","operation":"comments"`},
 		{name: "explicit 404", extra: `,"status":"skipped","error_class":"not_found","operation":"comments","http_status":404`, valid: true},
-		{name: "forbidden is not absence", extra: `,"status":"skipped","error_class":"forbidden","operation":"comments","http_status":403`},
-		{name: "expansion 404 is not absence", extra: `,"status":"skipped","error_class":"not_found","operation":"morechildren","http_status":404`},
+		{name: "explicit 410", extra: `,"status":"skipped","error_class":"not_found","operation":"comments","http_status":410`, valid: true},
+		{name: "access denial is not absence", extra: `,"status":"skipped","error_class":"access","operation":"comments","http_status":403`},
+		{name: "expansion 404 is not absence", extra: `,"status":"skipped","error_class":"not_found","operation":"comment_expansion","http_status":404`},
 		{name: "wrong status pairing", extra: `,"status":"skipped","error_class":"not_found","operation":"comments","http_status":500`},
 		{name: "absent post recorded as failure", extra: `,"status":"failed","error_class":"not_found","operation":"comments","http_status":404`},
-		{name: "expansion 404 stays a failure", extra: `,"status":"failed","error_class":"not_found","operation":"morechildren","http_status":404`, valid: true},
+		{name: "expansion 404 stays a failure", extra: `,"status":"failed","error_class":"not_found","operation":"comment_expansion","http_status":404`, valid: true},
+		{name: "expansion 410 stays a failure", extra: `,"status":"failed","error_class":"not_found","operation":"comment_expansion","http_status":410`, valid: true},
 	}
 	for _, test := range tests {
 		test := test

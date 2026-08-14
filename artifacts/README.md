@@ -7,8 +7,8 @@ assignment evidence:
   and other non-submission diagnostics. Raw stdout/stderr from a failed or
   interrupted live capture is never copied here; the capture helper securely
   discards its private staging directory.
-- `submission/` is created exactly once by the Phase 6 capture helper after a
-  complete (`0`) or explicitly partial (`3`) approved live run. It contains
+- `submission/` is created exactly once by the capture helper after a complete
+  (`0`) public-JSON live run. It contains
   `result.json`, `application.log`, `full-application.log`,
   `run-manifest.json`, and `RUN.md` from that one invocation.
 
@@ -19,8 +19,7 @@ ignored intentionally and must never be committed to the candidate branch: addin
 the evidence would create a different commit from the SHA that the evidence proves.
 Preserve the directory byte for byte and identify it by the full candidate SHA in its
 manifest and in the submission portal or cover note. No live bundle is present until
-Reddit Data API approval, final candidate metadata, and the documented capture
-prerequisites all exist.
+the final candidate metadata and documented capture prerequisites exist.
 
 A hard termination may leave `submission.capture-lock/` with a safe PID and candidate
 SHA. The wrapper deliberately refuses to guess that it is stale; inspect running

@@ -18,6 +18,7 @@ DOCKER_IMAGE ?= duckwords:review
 DOCKER_FIXTURE_IMAGE ?= duckwords:fixture-review
 REVIEW_DIR ?= artifacts/review
 SYNTHETIC_REVIEW_DIR ?= $(REVIEW_DIR)/synthetic-demo
+REDDIT_SMOKE_DIR ?= $(REVIEW_DIR)/reddit-smoke
 SYNTHETIC_DEMO_DIR ?= examples/synthetic-demo
 SUBMISSION_DIR ?= artifacts/submission
 GOVULNCHECK_VERSION ?= v1.6.0
@@ -41,7 +42,7 @@ LDFLAGS = -X '$(BUILDINFO_PACKAGE).version=$(VERSION)' \
 
 .PHONY: help toolchain-check fmt fmt-check mod-tidy-check mod-verify vet lint vuln secret-scan test test-shuffle race fuzz-smoke bench bench-text \
 	build fixture-build fixture-native synthetic-demo synthetic-demo-verify synthetic-demo-docker-verify docker-build docker-fixture-build docker-smoke \
-	evidence-build submission-build submission-capture submission-capture-test fixture-verify docker-verify run version verify
+	evidence-build submission-build submission-capture submission-capture-test fixture-verify docker-verify reddit-smoke run version verify
 
 help: ## Show available targets.
 	@awk 'BEGIN {FS = ":.*## "; printf "DuckWords development targets:\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-14s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -141,7 +142,7 @@ submission-build: ## Build candidate CLI and evidence finalizer without changing
 	$(MAKE) build evidence-build \
 		VERSION="$(VERSION)" COMMIT="$(CANDIDATE_SHA)" BUILD_DATE="$(BUILD_DATE)"
 
-submission-capture: ## Run one approved live invocation from an already built clean-SHA candidate.
+submission-capture: ## Run one canonical public-JSON invocation from an already built clean-SHA candidate.
 	DUCKWORDS_RELEASE_VERSION="$(VERSION)" DUCKWORDS_BUILD_DATE="$(BUILD_DATE)" \
 		SUBMISSION_DIR="$(SUBMISSION_DIR)" /bin/bash -p scripts/capture-submission.sh
 
@@ -155,13 +156,15 @@ fixture-build: ## Compile the test-only deterministic offline process fixture.
 
 fixture-native: fixture-build ## Run the native offline fixture into ignored review artifacts.
 	mkdir -p $(REVIEW_DIR)
-	DUCKWORDS_OFFLINE_FIXTURE_PROCESS=1 DUCKWORDS_OFFLINE_FIXTURE_PROFILE= $(FIXTURE_BINARY) \
+	env -u REDDIT_USER_AGENT \
+		DUCKWORDS_OFFLINE_FIXTURE_PROCESS=1 DUCKWORDS_OFFLINE_FIXTURE_PROFILE= $(FIXTURE_BINARY) \
 		> $(REVIEW_DIR)/native-result.json \
 		2> $(REVIEW_DIR)/native-stderr.log
 
 synthetic-demo: fixture-build ## Run the richer non-live synthetic E2E demo into ignored review artifacts.
 	mkdir -p $(SYNTHETIC_REVIEW_DIR)
-	DUCKWORDS_OFFLINE_FIXTURE_PROCESS=1 \
+	env -u REDDIT_USER_AGENT \
+		DUCKWORDS_OFFLINE_FIXTURE_PROCESS=1 \
 		DUCKWORDS_OFFLINE_FIXTURE_PROFILE=synthetic-demo \
 		$(FIXTURE_BINARY) \
 		> $(SYNTHETIC_REVIEW_DIR)/raw-stdout.json \
@@ -231,6 +234,27 @@ fixture-verify: fixture-native docker-fixture-build ## Compare native and isolat
 	cmp $(REVIEW_DIR)/native-result.json $(REVIEW_DIR)/docker-result.json
 
 docker-verify: docker-smoke fixture-verify synthetic-demo-docker-verify ## Run all Docker and native/container parity gates.
+
+reddit-smoke: build ## Opt-in one-post public-JSON smoke (never run in CI).
+	@test "$(LIVE_REDDIT_SMOKE)" = "true" || { \
+		printf '%s\n' 'set LIVE_REDDIT_SMOKE=true to acknowledge one live one-post public-JSON smoke' >&2; \
+		exit 2; \
+	}
+	@test -n "$(LIVE_POSTS_FILE)" && test -f "$(LIVE_POSTS_FILE)" && test -r "$(LIVE_POSTS_FILE)" || { \
+		printf '%s\n' 'set LIVE_POSTS_FILE to a readable one-post list' >&2; \
+		exit 2; \
+	}
+	@test "$$(awk 'NF { count++ } END { print count + 0 }' "$(LIVE_POSTS_FILE)")" = "1" || { \
+		printf '%s\n' 'LIVE_POSTS_FILE must contain exactly one non-blank permalink' >&2; \
+		exit 2; \
+	}
+	mkdir -p $(REDDIT_SMOKE_DIR)
+	env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY \
+		-u http_proxy -u https_proxy -u all_proxy -u no_proxy \
+		$(BINARY) --posts-file="$(LIVE_POSTS_FILE)" --workers=1 \
+		--rate-limit=0.5 --failure-mode=strict --timeout=10m --log-format=json \
+		> $(REDDIT_SMOKE_DIR)/result.json \
+		2> $(REDDIT_SMOKE_DIR)/application.ndjson
 
 run: ## Run the CLI; pass options with ARGS='...'.
 	$(GO_RUN) run ./cmd/duckwords $(ARGS)

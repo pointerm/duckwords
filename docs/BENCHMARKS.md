@@ -5,14 +5,15 @@ No Reddit request, credential, or assignment dataset is involved.
 
 ## Does this path matter?
 
-**No — and that is the useful conclusion.** A DuckWords run is bound by Reddit request
-pacing, not by counting words. At the default 0.8 requests/second the 200-post list
-needs at least 250 seconds of network time before a single `more` expansion, while the
-same run counts a few megabytes of comment text in tens of milliseconds.
+**For the measured sizes, no — and that is the useful conclusion.** A DuckWords run is
+normally bound by Reddit request pacing rather than word counting. At the default 0.8
+requests/second the 200-post list needs at least 250 seconds of network time before a
+single expansion, while the table below puts even a hypothetical 500 MB corpus at
+only a few seconds of text-processing time.
 
 Extrapolating the measurement below, **the comment corpus would have to reach roughly
-37 GB before the text path merely equalled that 250-second network floor.** The
-assignment corpus is smaller by four orders of magnitude.
+37 GB before the text path merely equalled that 250-second network floor.** No claim
+about the assignment corpus size is made until the live run records it.
 
 This file exists to make that ratio explicit and to record what the counting path
 actually costs, so a future change to it can be compared against a known number. It is
@@ -86,9 +87,9 @@ lowercased runes into a `[]byte` scratch with `utf8.AppendRune`, then look up
 `entries[string(scratch)]`, which the compiler performs without allocating. The
 semantics would be unchanged.
 
-It has not been done because the assignment corpus is English: bodies containing only
-ASCII take the fast path, and the change would optimize a path that this workload
-barely uses. It is an accepted, unoptimized branch, not a constraint.
+It has not been done because bodies containing only ASCII already take the fast path,
+while the live corpus's non-ASCII share is still unknown. It is an accepted,
+unoptimized branch whose impact is bracketed below, not a correctness constraint.
 
 ## Scaling to real volumes
 
@@ -109,10 +110,10 @@ Blending the two measured throughputs by the share of bytes in non-ASCII bodies:
 | 25% | 148.6 MB/s | 0.034 s | 0.34 s | 3.4 s |
 | 50% | 114.4 MB/s | 0.044 s | 0.44 s | 4.4 s |
 
-Against the 250-second network floor for 200 posts, a 50 MB corpus at a 25% non-ASCII
-mix spends **0.135% of the run counting words**. The corpus for this assignment is far
-smaller; the real figure is a rounding error, and this holds even if the estimate is
-wrong by an order of magnitude in either direction.
+Against the 250-second network floor for 200 posts, a hypothetical 50 MB corpus at a
+25% non-ASCII mix spends **0.135% of the run counting words**. The final ratio cannot
+be stated until a live run measures the real corpus, but the 5/50/500 MB table makes
+the cost transparent without assuming its size.
 
 Memory does not scale with corpus size. Each worker's post-local map is bounded by
 `MaxDistinctWordsPerPost` (50,000) and by the dictionary size, whichever is smaller, so
@@ -125,11 +126,11 @@ short-lived allocations, which is GC pressure rather than retained memory.
 - Synthetic fixtures on one machine. Compare changes on the same machine and toolchain;
   these are not cross-machine numbers.
 - The benchmark reuses a preallocated post-local count map and excludes fixture I/O,
-  dictionary construction, HTTP, OAuth, Reddit latency, retries, and aggregation.
+  dictionary construction, HTTP, Reddit latency, retries, and aggregation.
   Aggregation is bounded by distinct words rather than corpus size and is negligible at
   any of the volumes above.
 - The 250-second network floor assumes one request per post at the default rate. A real
-  run issues more: every `more` placeholder batch and every depth-truncated branch adds
-  a request, which widens the gap rather than narrowing it.
+  run issues more: every unresolved `more` child and every depth-truncated branch adds
+  a focal request, which widens the gap rather than narrowing it.
 - The non-ASCII share of a real r/duck corpus has not been measured, because no live run
   has been made. The table brackets the plausible range instead of asserting a value.

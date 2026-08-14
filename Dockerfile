@@ -54,7 +54,7 @@ RUN CGO_ENABLED=0 GOFIPS140=off GOFLAGS= GOWORK=off GOENV=off GOEXPERIMENT= \
 
 FROM scratch AS runtime-base
 
-# HTTPS is required for approved live runs and remote assignment inputs. Copying
+# HTTPS is required for public Reddit JSON and remote assignment inputs. Copying
 # only the trusted root bundle and required redistribution notice keeps both final
 # images minimal, compliant, and shell-free.
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt

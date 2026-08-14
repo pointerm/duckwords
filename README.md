@@ -26,14 +26,15 @@ clean JSON document.
 
 ## Quick start
 
-### 1. Verify it works — no credentials, no network
+### 1. Verify the runtime path — no credentials, no fixture network traffic
 
 ```bash
 make fixture-native && cat artifacts/review/native-result.json
 ```
 
 This runs the real CLI and the real production wiring against an in-memory
-transport, and prints:
+transport, and prints (a cold Go toolchain/module cache may still download build
+dependencies before the fixture starts):
 
 ```json
 [
@@ -48,7 +49,7 @@ transport, and prints:
 ]
 ```
 
-For the richer three-post synthetic scenario with nested replies, `morechildren`,
+For the richer three-post synthetic scenario with nested replies, focal comment expansion,
 continuation, deduplication, and a top-10 tie boundary:
 
 ```bash
@@ -57,38 +58,37 @@ cat examples/synthetic-demo/synthetic-output.json
 ```
 
 The checked-in [synthetic demo](examples/synthetic-demo) is explicitly non-live and
-is not a substitute for the assignment's approved 200-post application log.
+is not a substitute for the assignment's 200-post application log.
 
 ### 2. Run it for real
 
-Reddit's [Responsible Builder Policy](https://support.reddithelp.com/hc/en-us/articles/42728983564564-Responsible-Builder-Policy)
-requires Reddit's approval before you access the Data API. Registering an OAuth
-application gives you credentials; it is **not** that approval, and DuckWords never
-treats one as the other. Until approval exists, the tool fails closed before it
-opens a socket.
-
-Once you have approval and a registered application:
+The assignment owner confirmed that these supplied public `old.reddit.com` pages
+should be fetched without the official OAuth Data API. DuckWords therefore issues
+only unauthenticated `GET` requests to fixed `https://old.reddit.com` JSON URLs; it
+does not need an app registration, client ID, secret, token, cookie, or approval flag.
 
 ```bash
-export REDDIT_API_ACCESS_APPROVED=true   # only after Reddit has approved your access
-export REDDIT_CLIENT_ID='<client-id>'
-export REDDIT_CLIENT_SECRET='<secret>'
-export REDDIT_USER_AGENT='cli:duckwords:<version> (by /u/<your-reddit-name>)'
-
 go run ./cmd/duckwords > result.json 2> application.log
 ```
 
-`REDDIT_API_ACCESS_APPROVED` must be exactly `true`; it is your acknowledgement, not
-a bypass. Without it you get a diagnostic and exit `1`, and no request is made:
+The binary supplies a descriptive User-Agent automatically. A reviewer may override
+it with a printable 8–256 byte value, but this is optional and non-secret:
 
-```text
-duckwords: Reddit Data API access is not confirmed; obtain Reddit's approval,
-then set REDDIT_API_ACCESS_APPROVED=true (see README)
+```bash
+export REDDIT_USER_AGENT='duckwords/0.2.0 (+https://github.com/pointerm/duckwords)'
 ```
 
+This `.json` renderer is the assignment's public-page access contract, not a claim
+that anonymous access is part of Reddit's current supported OAuth Data API. Reddit
+may redirect hosted/cloud IP ranges to a login page. DuckWords rejects every redirect
+and non-JSON response rather than following it or silently returning incomplete data;
+run the opt-in smoke from the same local network intended for the final capture.
+
 With no options it processes the assignment inputs using the documented defaults.
-Expect roughly 5–20 minutes for the 200-post list: requests are paced at 0.8/s to
-stay well inside Reddit's limits.
+At 0.8 requests/second the 200 initial listings alone take about 4 minutes 10 seconds.
+Every unresolved `more` child, continuation, and retry adds another paced request, so
+the actual duration depends on the live trees and is bounded by the 30-minute default
+(the guarded canonical capture deliberately allows up to 2 hours).
 
 ```bash
 # Only words starting with "duck".
@@ -98,18 +98,47 @@ go run ./cmd/duckwords --filter 'duck*'
 go run ./cmd/duckwords --workers=8 --log-format=json
 ```
 
+Before the final 200-post run, validate the public endpoint from your own network
+with one supplied permalink in a local file:
+
+```bash
+printf '%s\n' 'https://old.reddit.com/r/duck/comments/<id>/<slug>/' > /tmp/duckwords-one-post.txt
+make reddit-smoke LIVE_REDDIT_SMOKE=true LIVE_POSTS_FILE=/tmp/duckwords-one-post.txt
+```
+
+The smoke is deliberately opt-in and never runs in CI. It uses one worker, 0.5
+requests/second, strict completeness, and writes only ignored output under
+`artifacts/review/reddit-smoke/`. A `302` login redirect or `403` is reported as an
+access failure; do not work around it with a proxy or hidden endpoint override.
+
+For the final candidate, build from a clean commit and run the guarded one-shot
+capture with the same metadata values in both commands:
+
+```bash
+version=0.2.0
+build_date="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+make submission-build VERSION="$version" BUILD_DATE="$build_date"
+make submission-capture VERSION="$version" BUILD_DATE="$build_date"
+```
+
+The capture runs the fixed assignment profile in strict mode and publishes the
+five-file `artifacts/submission/` bundle only after a complete exit `0`. It refuses
+a dirty tree, a changed binary, a second writer, a partial result, or replacement of
+an existing bundle. Attach that directory separately; do not commit it to the SHA it
+attests.
+
 ### 3. Or via Docker
 
 ```bash
 make docker-build
 docker run --rm \
-  -e REDDIT_API_ACCESS_APPROVED -e REDDIT_CLIENT_ID \
-  -e REDDIT_CLIENT_SECRET -e REDDIT_USER_AGENT \
   duckwords:review
 ```
 
-**Requirements:** Go 1.26.6 (`make toolchain-check` verifies it). Docker and `jq`
-only for the container targets.
+Pass `-e REDDIT_USER_AGENT` only when using the optional override.
+
+**Requirements:** Go 1.26.6 (`make toolchain-check` verifies it); `jq` for synthetic
+log normalization; Docker for container parity and the secret-scan target.
 
 ---
 
@@ -133,8 +162,9 @@ only for the container targets.
 | `--log-format FORMAT` | text | text or json (NDJSON). |
 | `--version`, `--help` | | |
 
-Credentials are environment-only and are never accepted as flags, logged, or
-included in error messages.
+DuckWords has no Reddit credential input. The only Reddit environment setting is the
+optional non-secret `REDDIT_USER_AGENT`; logs record only whether it was overridden
+and its SHA-256 digest, never the raw value.
 
 | Exit code | Meaning | JSON on stdout |
 |---:|---|---|
@@ -157,10 +187,10 @@ word bank URL ─┘          └──► words.LoadDictionary ─► normalize
                         ▼
               app.Runner: N workers, one post each
                         │
-                        ├─► reddit.Client.WalkComments(postID)
-                        │     GET  /comments/{id}          initial tree
-                        │     POST /api/morechildren       "load more comments"
-                        │     GET  /comments/{id}?comment= "continue this thread"
+                        ├─► reddit.Client.WalkComments(post reference)
+                        │     GET /.../comments/{id}/.../.json         initial tree
+                        │     GET same .json?comment={child}&context=0 expand `more`
+                        │     GET same .json?comment={parent}&context=0 continue depth
                         │        └─ streams each comment body exactly once
                         │
                         └─► words.Counter → post-local map[string]uint64
@@ -172,11 +202,13 @@ word bank URL ─┘          └──► words.LoadDictionary ─► normalize
 Each worker owns a private count map for its post and hands it to the aggregating
 goroutine only after the whole comment tree was proven complete. Nothing shared is
 mutated during traversal, so there is no lock on the hot path. One process-wide
-rate limiter and one OAuth token source are shared by every worker.
+rate limiter, retry policy, HTTP pool, and traversal budgets are shared by every worker.
 
-If a post cannot be proven complete — a `more` expansion fails, a limit is hit — its
-counts are discarded rather than partially merged, the post is reported as
-`incomplete`, and the run exits `3`. A half-counted post is worse than a missing one.
+If a post cannot be proven complete, its counts are discarded rather than partially
+merged. HTTP/transport/protocol expansion errors are reported as `failed`; explicit
+completeness or resource-limit exhaustion is `incomplete`. Best-effort mode keeps
+other complete posts and exits `3`, while strict mode cancels and exits `1`. A
+half-counted post is worse than a missing one.
 
 ### Packages
 
@@ -184,13 +216,13 @@ counts are discarded rather than partially merged, the post is reported as
 |---|---|
 | [`cmd/duckwords`](cmd/duckwords) | Thin process entrypoint: signals and one CLI call |
 | [`internal/cli`](internal/cli) | Argument lifecycle, stdout/stderr contract, exit codes |
-| [`internal/production`](internal/production) | Environment, HTTP client, OAuth/source/Reddit dependency wiring |
+| [`internal/production`](internal/production) | Environment, HTTP client, source/public-Reddit dependency wiring |
 | [`internal/runlog`](internal/runlog) | Stable sanitized lifecycle and evidence records |
 | [`internal/config`](internal/config) | Flag parsing and complete validation before any I/O |
 | [`internal/acquire`](internal/acquire) | Bounded HTTPS/file download with provenance hashing |
-| [`internal/source`](internal/source) | Post-list parsing, URL → post ID, deduplication |
+| [`internal/source`](internal/source) | Post-list parsing, URL → normalized post ID and public JSON path, deduplication |
 | [`internal/words`](internal/words) | Dictionary, tokenizer, wildcard matcher, counter |
-| [`internal/reddit`](internal/reddit) | OAuth, rate limiting, retries, comment-tree traversal |
+| [`internal/reddit`](internal/reddit) | Public JSON requests, rate limiting, retries, comment-tree traversal |
 | [`internal/app`](internal/app) | Worker pool, failure policy, per-post outcomes |
 | [`internal/aggregate`](internal/aggregate) | Merge and deterministic top-N |
 | [`internal/logging`](internal/logging) | Structured stderr logs with secret redaction |
@@ -216,11 +248,11 @@ a given input.
 - **Deleted and removed comments are skipped**, so `deleted` and `removed` never
   appear in the results.
 - **Deleted posts are not failures.** Some supplied threads may no longer exist.
-  Absence is proven by the comments endpoint answering HTTP 404 or
-  returning a listing with no post; those are reported as `skipped` and do not make
-  the run partial. A 403, or a 404 from a `more`-expansion request, stays a failure —
-  the first may be restored, and the second means the tree is incomplete rather than
-  the post being gone.
+  Absence is proven only when the initial comments endpoint answers HTTP 404 or 410;
+  those are reported as `skipped` and do not make the run partial. A 403, an empty
+  HTTP-200 listing, or a 404/410 from a focal expansion stays a failure — access may
+  be restored, and an expansion failure means the tree is incomplete rather than the
+  post being gone.
 - **Markdown is not rendered and URLs are not stripped.** A link like
   `[a duck](https://example.com/pond)` contributes `duck`, `example`, and `pond`.
   Counting the raw comment text as written is simple and predictable; stripping
@@ -247,7 +279,8 @@ make docker-verify # image build + native/container output parity
 make help          # every target
 ```
 
-CI runs the same gates plus a secret scan and container parity on every push.
+CI runs the same gates plus a secret scan and container parity on pushes to `main`
+and on pull requests.
 
 ---
 

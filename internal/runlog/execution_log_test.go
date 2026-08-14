@@ -97,3 +97,47 @@ func TestSafeLogBuildIdentityBoundsEveryField(t *testing.T) {
 		}
 	}
 }
+
+func TestSafeAccessIdentityPreservesReviewedPublicJSONContract(t *testing.T) {
+	t.Parallel()
+
+	const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	identity := safeAccessIdentity(AccessIdentity{
+		Profile:         accessProfilePublicJSON,
+		Origin:          accessOriginOldReddit,
+		Method:          accessMethodGET,
+		Auth:            accessAuthNone,
+		UserAgentSource: userAgentSourceOverride,
+		UserAgentSHA256: digest,
+	})
+	if identity.Profile != accessProfilePublicJSON || identity.Origin != accessOriginOldReddit ||
+		identity.Method != accessMethodGET || identity.Auth != accessAuthNone ||
+		identity.UserAgentSource != userAgentSourceOverride || identity.UserAgentSHA256 != digest {
+		t.Fatalf("safeAccessIdentity() = %+v, want reviewed values preserved", identity)
+	}
+}
+
+func TestSafeAccessIdentityRejectsUncontrolledValues(t *testing.T) {
+	t.Parallel()
+
+	const planted = "planted-secret"
+	identity := safeAccessIdentity(AccessIdentity{
+		Profile:         planted,
+		Origin:          planted,
+		Method:          planted,
+		Auth:            planted,
+		UserAgentSource: planted,
+		UserAgentSHA256: strings.Repeat("A", sha256DigestBytes*2),
+	})
+	for name, value := range map[string]string{
+		"profile": identity.Profile, "origin": identity.Origin, "method": identity.Method,
+		"auth": identity.Auth, "UA source": identity.UserAgentSource, "UA digest": identity.UserAgentSHA256,
+	} {
+		if value != unknownBuildLogValue {
+			t.Errorf("%s = %q, want %q", name, value, unknownBuildLogValue)
+		}
+		if strings.Contains(value, planted) {
+			t.Errorf("%s exposed planted data: %q", name, value)
+		}
+	}
+}

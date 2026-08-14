@@ -25,7 +25,6 @@ concurrency:
 env:
   GOTOOLCHAIN: local
   GOFIPS140: "off"
-  REDDIT_API_ACCESS_APPROVED: "false"
 
 jobs:
   package:

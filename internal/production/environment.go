@@ -1,87 +1,125 @@
 package production
 
 import (
+	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
-	"strings"
 )
 
 const (
-	envRedditClientID     = "REDDIT_CLIENT_ID"
-	envRedditClientSecret = "REDDIT_CLIENT_SECRET"
-	envRedditUserAgent    = "REDDIT_USER_AGENT"
-	envRedditAPIApproved  = "REDDIT_API_ACCESS_APPROVED"
+	envRedditUserAgent = "REDDIT_USER_AGENT"
+
+	// RedditAccessProfile identifies the fixed public-page JSON access contract.
+	RedditAccessProfile = "old-reddit-public-json-v1"
+	// RedditOrigin is the only Reddit origin used by the production client.
+	RedditOrigin = "old.reddit.com"
+	// RedditMethod is the only HTTP method used for Reddit requests.
+	RedditMethod = "GET"
+	// RedditAuth records that public Reddit requests carry no authentication.
+	RedditAuth = "none"
+
+	userAgentSourceBuiltin  = "builtin"
+	userAgentSourceOverride = "override"
+	minUserAgentBytes       = 8
+	maxUserAgentBytes       = 256
 )
 
-var (
-	errEnvironmentConfig = errors.New("invalid Reddit environment configuration")
-	errApprovalRequired  = errors.New("explicit Reddit Data API approval confirmation is required")
-)
+var errEnvironmentConfig = errors.New("invalid Reddit environment configuration")
 
 type environmentLookup func(string) (string, bool)
 
-type redditCredentials struct {
-	clientID     string
-	clientSecret string
-	userAgent    string
-	approved     bool
+type accessIdentityContextKey struct{}
+
+// AccessIdentity binds the resolved HTTP identity to safe audit metadata. The
+// actual User-Agent value is intentionally private so generic formatting cannot
+// accidentally copy it into logs.
+type AccessIdentity struct {
+	Profile         string
+	Origin          string
+	Method          string
+	Auth            string
+	UserAgentSource string
+	UserAgentSHA256 string
+	userAgent       string
 }
 
-// credentialsFromEnvironment keeps credentials out of process arguments and fails
-// before source or Reddit I/O. The approval value is checked first and its value is
-// intentionally exact: Reddit's Responsible Builder Policy requires approval before
-// Data API access, and holding a registered application's credentials is not that
-// approval. The CLI never infers one from the other, so an unapproved environment
-// cannot reach the network at all.
-func credentialsFromEnvironment(lookup environmentLookup) (redditCredentials, error) {
-	if lookup == nil {
-		return redditCredentials{}, fmt.Errorf("%w: environment lookup is required", errEnvironmentConfig)
-	}
-	approved, present := lookup(envRedditAPIApproved)
-	if !present || approved != "true" {
-		return redditCredentials{}, errApprovalRequired
-	}
+// UserAgent returns the validated header value used for public Reddit requests.
+// Callers must not log this value; use UserAgentSource and UserAgentSHA256 instead.
+func (identity AccessIdentity) UserAgent() string {
+	return identity.userAgent
+}
 
-	clientID, err := requiredEnvironmentValue(lookup, envRedditClientID)
-	if err != nil {
-		return redditCredentials{}, err
+// ContextWithAccessIdentity hands one already resolved identity from the CLI to
+// production composition. This prevents an environment mutation between lifecycle
+// logging and request construction from changing the actual HTTP identity.
+func ContextWithAccessIdentity(ctx context.Context, identity AccessIdentity) context.Context {
+	if ctx == nil {
+		return nil
 	}
-	clientSecret, err := requiredEnvironmentValue(lookup, envRedditClientSecret)
-	if err != nil {
-		return redditCredentials{}, err
+	return context.WithValue(ctx, accessIdentityContextKey{}, identity)
+}
+
+func accessIdentityFromContext(ctx context.Context) (AccessIdentity, bool) {
+	if ctx == nil {
+		return AccessIdentity{}, false
 	}
-	userAgent, err := requiredEnvironmentValue(lookup, envRedditUserAgent)
-	if err != nil {
-		return redditCredentials{}, err
+	identity, ok := ctx.Value(accessIdentityContextKey{}).(AccessIdentity)
+	return identity, ok
+}
+
+// ResolveAccessIdentity reads only the optional REDDIT_USER_AGENT override. Legacy
+// OAuth and approval variables are deliberately never queried or transmitted.
+func ResolveAccessIdentity(lookup func(string) (string, bool)) (AccessIdentity, error) {
+	if lookup == nil {
+		return AccessIdentity{}, fmt.Errorf("%w: environment lookup is required", errEnvironmentConfig)
 	}
-	return redditCredentials{
-		clientID:     clientID,
-		clientSecret: clientSecret,
-		userAgent:    userAgent,
-		approved:     true,
+	userAgent := redditUserAgent()
+	source := userAgentSourceBuiltin
+	if override, present := lookup(envRedditUserAgent); present {
+		if !validUserAgent(override) {
+			return AccessIdentity{}, fmt.Errorf(
+				"%w: %s must be %d..%d printable ASCII bytes without surrounding whitespace",
+				errEnvironmentConfig,
+				envRedditUserAgent,
+				minUserAgentBytes,
+				maxUserAgentBytes,
+			)
+		}
+		userAgent = override
+		source = userAgentSourceOverride
+	}
+	digest := sha256.Sum256([]byte(userAgent))
+	return AccessIdentity{
+		Profile:         RedditAccessProfile,
+		Origin:          RedditOrigin,
+		Method:          RedditMethod,
+		Auth:            RedditAuth,
+		UserAgentSource: source,
+		UserAgentSHA256: fmt.Sprintf("%x", digest),
+		userAgent:       userAgent,
 	}, nil
 }
 
-func requiredEnvironmentValue(lookup environmentLookup, name string) (string, error) {
-	value, present := lookup(name)
-	if !present || value == "" || strings.TrimSpace(value) != value {
-		return "", &environmentValueError{name: name}
+func validAccessIdentity(identity AccessIdentity) bool {
+	if identity.Profile != RedditAccessProfile || identity.Origin != RedditOrigin ||
+		identity.Method != RedditMethod || identity.Auth != RedditAuth ||
+		(identity.UserAgentSource != userAgentSourceBuiltin && identity.UserAgentSource != userAgentSourceOverride) ||
+		!validUserAgent(identity.userAgent) {
+		return false
 	}
-	return value, nil
+	digest := sha256.Sum256([]byte(identity.userAgent))
+	return identity.UserAgentSHA256 == fmt.Sprintf("%x", digest)
 }
 
-// environmentValueError exposes only a fixed variable name, never its value.
-type environmentValueError struct {
-	name string
-}
-
-func (e *environmentValueError) Error() string {
-	if e == nil {
-		return errEnvironmentConfig.Error()
+func validUserAgent(value string) bool {
+	if len(value) < minUserAgentBytes || len(value) > maxUserAgentBytes || value[0] == ' ' || value[len(value)-1] == ' ' {
+		return false
 	}
-	return fmt.Sprintf("%s: %s is required", errEnvironmentConfig, e.name)
-}
-
-func (e *environmentValueError) Is(target error) bool {
-	return target == errEnvironmentConfig
+	for index := range len(value) {
+		if value[index] < 0x20 || value[index] > 0x7e {
+			return false
+		}
+	}
+	return true
 }

@@ -24,29 +24,31 @@ import (
 )
 
 const (
-	manifestSchema         = 1
+	manifestSchema         = 2
 	maximumResultBytes     = 1 << 20
 	maximumLogBytes        = 16 << 20
 	maximumLogLineBytes    = 64 << 10
 	maximumBinaryBytes     = 64 << 20
 	maximumVersionBytes    = 1 << 10
-	maximumApprovalBytes   = 128
 	maximumLogRecords      = 100_000
 	maximumPostOutcomes    = 10_000
 	maximumResultWords     = 10
 	assignmentPostCount    = 200
 	binaryInspectionWindow = 5 * time.Second
 	binaryInspectionDrain  = time.Second
-	maximumRunDuration     = 30 * time.Minute
+	maximumRunDuration     = 2 * time.Hour
 	durationClockTolerance = 5 * time.Second
 	filePermission         = 0o644
 	stagingPermission      = 0o700
 	directoryPermission    = 0o755
 	buildDateLayout        = "2006-01-02T15:04:05Z"
-	policyDateLayout       = "2006-01-02"
 	fullLogResultMarker    = "--- DUCKWORDS RESULT JSON ---\n"
-	fixedCommand           = "duckwords live assignment run (credentials via environment)"
+	fixedCommand           = "duckwords live assignment run (public old.reddit.com JSON GET)"
 	assignmentInputProfile = "assignment-default-v1"
+	fixedAccessProfile     = "old-reddit-public-json-v1"
+	fixedRedditOrigin      = "old.reddit.com"
+	fixedRedditMethod      = "GET"
+	fixedRedditAuth        = "none"
 )
 
 var (
@@ -65,20 +67,17 @@ var (
 	goVersionPattern = regexp.MustCompile(`^go1\.26\.6$`)
 	platformPattern  = regexp.MustCompile(`^[a-z0-9]{1,16}$`)
 	postIDPattern    = regexp.MustCompile(`^[a-z0-9]{1,16}$`)
-	approvalPattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 )
 
 // Config selects one completed run and a new destination. Now is injectable only
 // for deterministic validation tests; nil selects the current UTC time.
 type Config struct {
-	ResultPath        string
-	LogPath           string
-	OutputDir         string
-	BinaryPath        string
-	ExitCode          int
-	PolicyVerifiedAt  string
-	ApprovalReference string
-	Now               func() time.Time
+	ResultPath string
+	LogPath    string
+	OutputDir  string
+	BinaryPath string
+	ExitCode   int
+	Now        func() time.Time
 }
 
 // Manifest is the sanitized, machine-readable reconciliation record emitted with a
@@ -98,7 +97,7 @@ type Manifest struct {
 	Summary        SummaryManifest   `json:"summary"`
 	Requests       RequestManifest   `json:"requests"`
 	Outcomes       []OutcomeManifest `json:"outcomes"`
-	Policy         PolicyManifest    `json:"policy"`
+	Access         AccessManifest    `json:"access"`
 	Artifacts      ArtifactManifest  `json:"artifacts"`
 }
 
@@ -159,7 +158,7 @@ type SummaryManifest struct {
 	PostsIncomplete      int    `json:"posts_incomplete"`
 	Comments             uint64 `json:"comments"`
 	BodiesVisited        uint64 `json:"bodies_visited"`
-	MoreRequests         uint64 `json:"more_requests"`
+	ExpansionRequests    uint64 `json:"expansion_requests"`
 	ContinuationRequests uint64 `json:"continuation_requests"`
 	CountedTokens        uint64 `json:"counted_tokens"`
 	DistinctWords        int    `json:"distinct_words"`
@@ -185,15 +184,20 @@ type OutcomeManifest struct {
 	HTTPStatus           int    `json:"http_status,omitempty"`
 	Comments             int    `json:"comments"`
 	BodiesVisited        int    `json:"bodies_visited"`
-	MoreRequests         int    `json:"more_requests"`
+	ExpansionRequests    int    `json:"expansion_requests"`
 	ContinuationRequests int    `json:"continuation_requests"`
 	CountedTokens        uint64 `json:"counted_tokens"`
 }
 
-// PolicyManifest records only the candidate-supplied approval attestation reference.
-type PolicyManifest struct {
-	RedditPolicyVerifiedAt string `json:"reddit_policy_verified_at"`
-	ApprovalReference      string `json:"approval_reference"`
+// AccessManifest records the fixed unauthenticated Reddit access contract without
+// retaining the potentially identifying User-Agent value itself.
+type AccessManifest struct {
+	AccessProfile   string `json:"access_profile"`
+	RedditOrigin    string `json:"reddit_origin"`
+	RedditMethod    string `json:"reddit_method"`
+	RedditAuth      string `json:"reddit_auth"`
+	UserAgentSource string `json:"ua_source"`
+	UserAgentSHA256 string `json:"ua_sha256"`
 }
 
 // ArtifactManifest records SHA-256 hashes for the other four bundle files. The
@@ -241,6 +245,7 @@ type startedRecord struct {
 	time   time.Time
 	config ConfigManifest
 	build  BuildManifest
+	access AccessManifest
 }
 
 type summaryRecord struct {
@@ -258,6 +263,7 @@ type summaryRecord struct {
 	inputProfile   string
 	filterCount    int
 	build          BuildManifest
+	access         AccessManifest
 }
 
 type outputRecord struct {
@@ -302,9 +308,6 @@ func Finalize(ctx context.Context, cfg Config) (Manifest, error) {
 	if err != nil {
 		return Manifest{}, err
 	}
-	if cfg.PolicyVerifiedAt != parsed.started.time.UTC().Format(policyDateLayout) {
-		return Manifest{}, fmt.Errorf("%w: policy review must match the run UTC date", ErrInvalidConfig)
-	}
 	if err := ctx.Err(); err != nil {
 		return Manifest{}, fmt.Errorf("%w: finalization canceled", ErrPublish)
 	}
@@ -346,10 +349,7 @@ func Finalize(ctx context.Context, cfg Config) (Manifest, error) {
 		Summary:  parsed.summary.summary,
 		Requests: parsed.summary.requests,
 		Outcomes: parsed.outcomes,
-		Policy: PolicyManifest{
-			RedditPolicyVerifiedAt: cfg.PolicyVerifiedAt,
-			ApprovalReference:      cfg.ApprovalReference,
-		},
+		Access:   parsed.started.access,
 		Artifacts: ArtifactManifest{
 			ResultSHA256:          digest(canonicalResult),
 			ApplicationLogSHA256:  digest(logBytes),
@@ -386,20 +386,8 @@ func validateConfig(cfg Config) error {
 			return fmt.Errorf("%w: %s is empty or unsafe", ErrInvalidConfig, name)
 		}
 	}
-	if cfg.ExitCode != 0 && cfg.ExitCode != 3 {
-		return fmt.Errorf("%w: exit code must be 0 or 3", ErrInvalidConfig)
-	}
-	now := time.Now
-	if cfg.Now != nil {
-		now = cfg.Now
-	}
-	date, err := time.Parse(policyDateLayout, cfg.PolicyVerifiedAt)
-	today, _ := time.Parse(policyDateLayout, now().UTC().Format(policyDateLayout))
-	if err != nil || date.Format(policyDateLayout) != cfg.PolicyVerifiedAt || date.After(today) || date.Before(today.AddDate(0, 0, -1)) {
-		return fmt.Errorf("%w: policy verification date must be current or previous UTC date", ErrInvalidConfig)
-	}
-	if !approvalPattern.MatchString(cfg.ApprovalReference) || len(cfg.ApprovalReference) > maximumApprovalBytes || containsUnsafeApprovalMarker(cfg.ApprovalReference) {
-		return fmt.Errorf("%w: approval reference must be a non-secret safe identifier", ErrInvalidConfig)
+	if cfg.ExitCode != 0 {
+		return fmt.Errorf("%w: exit code must be 0", ErrInvalidConfig)
 	}
 	return nil
 }
@@ -702,12 +690,12 @@ func validateRecordSchema(record logRecord, event string) error {
 		"time": {}, "level": {}, "msg": {}, "event": {},
 	}
 	eventFields := map[string][]string{
-		"run_started":    {"workers", "failure_mode", "input_profile", "filter_count", "rate_limit_rps", "request_timeout", "global_timeout", "max_retries", "retry_budget", "source_max_retries", "source_retry_budget", "max_distinct_words_per_post", "max_in_flight_response_bytes", "max_retained_things", "app_version", "app_commit", "app_build_date", "go_version", "goos", "goarch"},
+		"run_started":    {"workers", "failure_mode", "input_profile", "filter_count", "rate_limit_rps", "request_timeout", "global_timeout", "max_retries", "retry_budget", "source_max_retries", "source_retry_budget", "max_distinct_words_per_post", "max_in_flight_response_bytes", "max_retained_things", "access_profile", "reddit_origin", "reddit_method", "reddit_auth", "ua_source", "ua_sha256", "app_version", "app_commit", "app_build_date", "go_version", "goos", "goarch"},
 		"source_loaded":  {"source_kind", "source_mode", "source_origin", "source_bytes", "source_sha256"},
 		"source_parsed":  {"source_kind", "stage", "entries", "source_sha256", "posts_sha256"},
 		"request_retry":  {"operation", "post_id", "source_kind", "error_class", "http_status", "attempt", "delay"},
-		"post_outcome":   {"post_id", "source_line", "status", "comments", "bodies_visited", "more_requests", "continuation_requests", "counted_tokens", "error_class", "operation", "http_status"},
-		"run_summary":    {"terminal_status", "partial", "failure_mode", "workers", "input_profile", "filter_count", "duration", "posts_total", "posts_completed", "posts_skipped", "posts_failed", "posts_incomplete", "comments", "bodies_visited", "more_requests", "continuation_requests", "counted_tokens", "distinct_words", "dictionary_words", "source_retries", "reddit_http_attempts", "reddit_retries", "throttle_waits", "throttle_wait", "posts_sha256", "post_ids_sha256", "dictionary_sha256", "app_version", "app_commit", "app_build_date", "go_version", "goos", "goarch"},
+		"post_outcome":   {"post_id", "source_line", "status", "comments", "bodies_visited", "expansion_requests", "continuation_requests", "counted_tokens", "error_class", "operation", "http_status"},
+		"run_summary":    {"terminal_status", "partial", "failure_mode", "workers", "input_profile", "filter_count", "duration", "posts_total", "posts_completed", "posts_skipped", "posts_failed", "posts_incomplete", "comments", "bodies_visited", "expansion_requests", "continuation_requests", "counted_tokens", "distinct_words", "dictionary_words", "source_retries", "reddit_http_attempts", "reddit_retries", "throttle_waits", "throttle_wait", "posts_sha256", "post_ids_sha256", "dictionary_sha256", "access_profile", "reddit_origin", "reddit_method", "reddit_auth", "ua_source", "ua_sha256", "app_version", "app_commit", "app_build_date", "go_version", "goos", "goarch"},
 		"output_written": {"partial", "result_words", "result_sha256"},
 	}
 	fields, known := eventFields[event]
@@ -774,7 +762,7 @@ func parseStarted(record logRecord) (startedRecord, error) {
 	if err != nil {
 		return startedRecord{}, fmt.Errorf("filter_count: %w", err)
 	}
-	failureMode, err := enumField(record, "failure_mode", "best-effort", "strict")
+	failureMode, err := enumField(record, "failure_mode", "strict")
 	if err != nil {
 		return startedRecord{}, fmt.Errorf("failure_mode: %w", err)
 	}
@@ -826,13 +814,48 @@ func parseStarted(record logRecord) (startedRecord, error) {
 	if err != nil {
 		return startedRecord{}, fmt.Errorf("build: %w", err)
 	}
+	access, err := parseAccess(record)
+	if err != nil {
+		return startedRecord{}, fmt.Errorf("access: %w", err)
+	}
 	return startedRecord{time: timestamp, build: build, config: ConfigManifest{
 		Workers: workers, FailureMode: failureMode, InputProfile: inputProfile, RateLimitRPS: rateLimit,
 		RequestTimeout: requestTimeout.String(), GlobalTimeout: globalTimeout.String(),
 		MaxRetries: maxRetries, RetryBudget: retryBudget.String(), SourceMaxRetries: sourceMaxRetries,
 		SourceRetryBudget: sourceRetryBudget.String(), MaxDistinctWordsPerPost: maxDistinct,
 		MaxInFlightResponseBytes: maxResponse, MaxRetainedThings: maxThings, FilterCount: filterCount,
-	}}, nil
+	}, access: access}, nil
+}
+
+func parseAccess(record logRecord) (AccessManifest, error) {
+	profile, err := enumField(record, "access_profile", fixedAccessProfile)
+	if err != nil {
+		return AccessManifest{}, err
+	}
+	origin, err := enumField(record, "reddit_origin", fixedRedditOrigin)
+	if err != nil {
+		return AccessManifest{}, err
+	}
+	method, err := enumField(record, "reddit_method", fixedRedditMethod)
+	if err != nil {
+		return AccessManifest{}, err
+	}
+	auth, err := enumField(record, "reddit_auth", fixedRedditAuth)
+	if err != nil {
+		return AccessManifest{}, err
+	}
+	uaSource, err := enumField(record, "ua_source", "builtin", "override")
+	if err != nil {
+		return AccessManifest{}, err
+	}
+	uaHash, err := digestField(record, "ua_sha256")
+	if err != nil {
+		return AccessManifest{}, err
+	}
+	return AccessManifest{
+		AccessProfile: profile, RedditOrigin: origin, RedditMethod: method, RedditAuth: auth,
+		UserAgentSource: uaSource, UserAgentSHA256: uaHash,
+	}, nil
 }
 
 func parseBuild(record logRecord) (BuildManifest, error) {
@@ -937,8 +960,8 @@ func parseOutcome(record logRecord) (OutcomeManifest, error) {
 		return OutcomeManifest{}, err
 	}
 	// skipped is admitted only under the exact contract in validOutcomeFailure: the
-	// comments endpoint reported not_found, which is the one signal that proves a post
-	// is absent. A 403, or a 404 from an expansion endpoint, remains a failure.
+	// initial comments request returned 404 or 410. An access denial, or a not-found
+	// response from an expansion request, remains a failure.
 	status, err := enumField(record, "status", "completed", "skipped", "failed", "incomplete")
 	if err != nil {
 		return OutcomeManifest{}, err
@@ -950,7 +973,7 @@ func parseOutcome(record logRecord) (OutcomeManifest, error) {
 	if outcome.BodiesVisited, err = intField(record, "bodies_visited", 0, 10_000_000); err != nil {
 		return OutcomeManifest{}, err
 	}
-	if outcome.MoreRequests, err = intField(record, "more_requests", 0, 20_000); err != nil {
+	if outcome.ExpansionRequests, err = intField(record, "expansion_requests", 0, 20_000); err != nil {
 		return OutcomeManifest{}, err
 	}
 	if outcome.ContinuationRequests, err = intField(record, "continuation_requests", 0, 20_000); err != nil {
@@ -961,12 +984,12 @@ func parseOutcome(record logRecord) (OutcomeManifest, error) {
 	}
 	if raw, exists := record["error_class"]; exists {
 		if err := json.Unmarshal(raw, &outcome.ErrorClass); err != nil || !oneOf(outcome.ErrorClass,
-			"forbidden", "not_found", "rate_limited", "server", "transport", "protocol", "incomplete", "resource_limit") {
+			"access", "not_found", "rate_limited", "server", "transport", "protocol", "incomplete", "resource_limit") {
 			return OutcomeManifest{}, errors.New("invalid outcome error class")
 		}
 	}
 	if raw, exists := record["operation"]; exists {
-		if err := json.Unmarshal(raw, &outcome.Operation); err != nil || !oneOf(outcome.Operation, "oauth_token", "comments", "continuation", "morechildren") {
+		if err := json.Unmarshal(raw, &outcome.Operation); err != nil || !oneOf(outcome.Operation, "comments", "continuation", "comment_expansion") {
 			return OutcomeManifest{}, errors.New("invalid outcome operation")
 		}
 	}
@@ -997,23 +1020,24 @@ func validOutcomeFailure(outcome OutcomeManifest) bool {
 	if outcome.Status == "completed" {
 		return true
 	}
-	// A skipped post is provably absent. That is proven either by HTTP 404 on the
-	// comments endpoint or by a validated empty post listing, which is a 200 response
-	// and therefore carries no HTTP status of its own.
+	// A canonical skipped post is provably absent through an HTTP 404 or 410 from its
+	// initial public comments request. Empty or malformed 200 listings are not absence.
 	if outcome.Status == "skipped" {
 		return outcome.Operation == "comments" && outcome.ErrorClass == "not_found" &&
-			(outcome.HTTPStatus == 404 || outcome.HTTPStatus == 0)
+			(outcome.HTTPStatus == 404 || outcome.HTTPStatus == 410)
 	}
 	if outcome.Operation == "" {
 		return outcome.Status == "incomplete" && outcome.ErrorClass == "resource_limit" && outcome.HTTPStatus == 0
 	}
 	switch outcome.ErrorClass {
-	case "forbidden":
-		return outcome.HTTPStatus == 403
+	case "access":
+		return outcome.HTTPStatus == 401 || outcome.HTTPStatus == 403 ||
+			(outcome.HTTPStatus >= 300 && outcome.HTTPStatus <= 399)
 	case "not_found":
 		// The runner records an absent post as skipped, so a not_found failure can
 		// only come from an expansion endpoint that could not complete the tree.
-		return outcome.Status == "failed" && outcome.Operation != "comments" && outcome.HTTPStatus == 404
+		return outcome.Status == "failed" && outcome.Operation != "comments" &&
+			(outcome.HTTPStatus == 404 || outcome.HTTPStatus == 410)
 	case "rate_limited":
 		return outcome.HTTPStatus == 429
 	case "server":
@@ -1042,7 +1066,7 @@ func parseSummary(record logRecord) (summaryRecord, error) {
 	if err != nil {
 		return summaryRecord{}, err
 	}
-	failureMode, err := enumField(record, "failure_mode", "best-effort", "strict")
+	failureMode, err := enumField(record, "failure_mode", "strict")
 	if err != nil {
 		return summaryRecord{}, err
 	}
@@ -1084,7 +1108,7 @@ func parseSummary(record logRecord) (summaryRecord, error) {
 		name string
 		dst  *uint64
 	}{
-		{"comments", &summary.Comments}, {"bodies_visited", &summary.BodiesVisited}, {"more_requests", &summary.MoreRequests},
+		{"comments", &summary.Comments}, {"bodies_visited", &summary.BodiesVisited}, {"expansion_requests", &summary.ExpansionRequests},
 		{"continuation_requests", &summary.ContinuationRequests}, {"counted_tokens", &summary.CountedTokens},
 	}
 	for _, field := range uints {
@@ -1127,9 +1151,14 @@ func parseSummary(record logRecord) (summaryRecord, error) {
 	if err != nil {
 		return summaryRecord{}, err
 	}
+	access, err := parseAccess(record)
+	if err != nil {
+		return summaryRecord{}, err
+	}
 	return summaryRecord{time: timestamp, duration: duration, terminalStatus: terminalStatus, partial: partial, summary: summary,
 		requests: requests, postsHash: postsHash, postIDsHash: postIDsHash, dictionaryHash: dictionaryHash,
-		failureMode: failureMode, workers: workers, inputProfile: inputProfile, filterCount: filterCount, build: build}, nil
+		failureMode: failureMode, workers: workers, inputProfile: inputProfile, filterCount: filterCount, build: build,
+		access: access}, nil
 }
 
 func parseOutput(record logRecord) (outputRecord, error) {
@@ -1156,17 +1185,15 @@ func validateRetry(record logRecord) (retryRecord, error) {
 	if _, err := timeField(record); err != nil {
 		return retryRecord{}, err
 	}
-	operation, err := enumField(record, "operation", "source_download", "oauth_token", "comments", "continuation", "morechildren")
+	operation, err := enumField(record, "operation", "source_download", "comments", "continuation", "comment_expansion")
 	if err != nil {
 		return retryRecord{}, err
 	}
-	maximumAttempt := 5
+	maximumAttempt := 4
 	maximumDelay := 45 * time.Second
 	if operation == "source_download" {
 		maximumAttempt = 3
 		maximumDelay = 15 * time.Second
-	} else if operation == "oauth_token" {
-		maximumAttempt = 4
 	}
 	attempt, err := intField(record, "attempt", 2, maximumAttempt)
 	if err != nil {
@@ -1177,7 +1204,7 @@ func validateRetry(record logRecord) (retryRecord, error) {
 		return retryRecord{}, errors.New("invalid retry delay")
 	}
 	errorClass, err := enumField(record, "error_class", "transport", "http_status", "read", "close",
-		"authentication", "forbidden", "not_found", "rate_limited", "server", "protocol", "incomplete", "resource_limit", "canceled", "visitor")
+		"access", "not_found", "rate_limited", "server", "protocol", "incomplete", "resource_limit", "canceled", "visitor")
 	if err != nil {
 		return retryRecord{}, err
 	}
@@ -1204,31 +1231,26 @@ func validateRetry(record logRecord) (retryRecord, error) {
 	if _, exists := record["source_kind"]; exists {
 		return retryRecord{}, errors.New("reddit retry contains source kind")
 	}
-	if !oneOf(errorClass, "transport", "rate_limited", "server", "authentication") {
+	if !oneOf(errorClass, "transport", "rate_limited", "server") {
 		return retryRecord{}, errors.New("invalid Reddit retry class")
 	}
 	var postID string
 	if raw, exists := record["post_id"]; !exists || json.Unmarshal(raw, &postID) != nil {
 		return retryRecord{}, errors.New("invalid retry post ID")
 	}
-	if operation == "oauth_token" {
-		if postID != "" || errorClass == "authentication" {
-			return retryRecord{}, errors.New("OAuth retry unexpectedly names a post")
-		}
-	} else if !postIDPattern.MatchString(postID) {
+	if !postIDPattern.MatchString(postID) {
 		return retryRecord{}, errors.New("invalid retry post ID")
 	}
 	if !hasStatus {
 		return retryRecord{}, errors.New("reddit retry lacks producer-emitted HTTP status")
 	}
-	if (errorClass == "authentication" && status != 401) ||
-		(errorClass == "rate_limited" && status != 429) ||
+	if (errorClass == "rate_limited" && status != 429) ||
 		(errorClass == "server" && !oneOf(strconv.Itoa(status), "500", "502", "503", "504")) ||
 		(errorClass == "transport" && status != 0 && status != 200 && status != 408) {
 		return retryRecord{}, errors.New("retry class and HTTP status differ")
 	}
-	if (errorClass == "authentication") != (delay == 0) {
-		return retryRecord{}, errors.New("retry class and delay differ")
+	if delay <= 0 {
+		return retryRecord{}, errors.New("reddit retry delay must be positive")
 	}
 	return retryRecord{operation: operation, postID: postID, attempt: attempt}, nil
 }
@@ -1282,9 +1304,12 @@ func reconcile(parsed parsedLog, resultWords []resultWord, exitCode int, finaliz
 		parsed.started.config.FilterCount != parsed.summary.filterCount || parsed.started.config.FilterCount != 0 {
 		return fmt.Errorf("%w: start and summary configuration differ", ErrInvalidLog)
 	}
+	if parsed.started.access != parsed.summary.access {
+		return fmt.Errorf("%w: start and summary access identities differ", ErrInvalidLog)
+	}
 	wantConfig := ConfigManifest{
-		Workers: 4, FailureMode: "best-effort", InputProfile: assignmentInputProfile,
-		RateLimitRPS: 0.8, RequestTimeout: "20s", GlobalTimeout: "30m0s",
+		Workers: 4, FailureMode: "strict", InputProfile: assignmentInputProfile,
+		RateLimitRPS: 0.8, RequestTimeout: "20s", GlobalTimeout: "2h0m0s",
 		MaxRetries: 3, RetryBudget: "45s", SourceMaxRetries: 2,
 		SourceRetryBudget: "15s", MaxDistinctWordsPerPost: 50_000,
 		MaxInFlightResponseBytes: 32 << 20, MaxRetainedThings: 500_000,
@@ -1307,11 +1332,8 @@ func reconcile(parsed parsedLog, resultWords []resultWord, exitCode int, finaliz
 		parsed.output.resultHash != digest(mustMarshalResult(resultWords)) {
 		return fmt.Errorf("%w: output or outcome cardinality mismatch", ErrInvalidLog)
 	}
-	if parsed.output.partial != parsed.summary.partial || (parsed.summary.terminalStatus == "partial") != parsed.summary.partial {
-		return fmt.Errorf("%w: inconsistent partial indicators", ErrInvalidLog)
-	}
-	if (exitCode == 3) != parsed.summary.partial || (exitCode == 0) != !parsed.summary.partial {
-		return fmt.Errorf("%w: exit code and terminal status differ", ErrInvalidLog)
+	if exitCode != 0 || parsed.output.partial || parsed.summary.partial || parsed.summary.terminalStatus != "complete" {
+		return fmt.Errorf("%w: canonical evidence requires an exit-zero complete run", ErrInvalidLog)
 	}
 	// Skipped posts are provably absent and cannot be counted, so they never make a
 	// run partial. Only failed and incomplete posts withhold countable data.
@@ -1322,7 +1344,7 @@ func reconcile(parsed parsedLog, resultWords []resultWord, exitCode int, finaliz
 		return fmt.Errorf("%w: summary post counts do not reconcile", ErrInvalidLog)
 	}
 	var completed, skipped, failed, incomplete int
-	var comments, bodies, moreRequests, continuations, countedTokens uint64
+	var comments, bodies, expansionRequests, continuations, countedTokens uint64
 	postIdentity := sha256.New()
 	outcomesByPostID := make(map[string]OutcomeManifest, len(parsed.outcomes))
 	lastSourceLine := 0
@@ -1340,7 +1362,7 @@ func reconcile(parsed parsedLog, resultWords []resultWord, exitCode int, finaliz
 		case "completed":
 			completed++
 			if !checkedAdd(&comments, uint64(outcome.Comments)) || !checkedAdd(&bodies, uint64(outcome.BodiesVisited)) ||
-				!checkedAdd(&moreRequests, uint64(outcome.MoreRequests)) || !checkedAdd(&continuations, uint64(outcome.ContinuationRequests)) ||
+				!checkedAdd(&expansionRequests, uint64(outcome.ExpansionRequests)) || !checkedAdd(&continuations, uint64(outcome.ContinuationRequests)) ||
 				!checkedAdd(&countedTokens, outcome.CountedTokens) {
 				return fmt.Errorf("%w: outcome counter overflow", ErrInvalidLog)
 			}
@@ -1357,7 +1379,7 @@ func reconcile(parsed parsedLog, resultWords []resultWord, exitCode int, finaliz
 	}
 	if completed != summary.PostsCompleted || skipped != summary.PostsSkipped || failed != summary.PostsFailed ||
 		incomplete != summary.PostsIncomplete || comments != summary.Comments || bodies != summary.BodiesVisited ||
-		moreRequests != summary.MoreRequests || continuations != summary.ContinuationRequests || countedTokens != summary.CountedTokens {
+		expansionRequests != summary.ExpansionRequests || continuations != summary.ContinuationRequests || countedTokens != summary.CountedTokens {
 		return fmt.Errorf("%w: per-post counters do not match summary", ErrInvalidLog)
 	}
 	if parsed.sourceRetryEvents != parsed.summary.requests.SourceRetries || parsed.redditRetryEvents != parsed.summary.requests.RedditRetries {
@@ -1378,16 +1400,20 @@ func reconcile(parsed parsedLog, resultWords []resultWord, exitCode int, finaliz
 		rankedTokens > summary.CountedTokens || parsed.summary.requests.RedditHTTPAttempts < parsed.summary.requests.RedditRetries {
 		return fmt.Errorf("%w: impossible terminal counters", ErrInvalidLog)
 	}
-	// A completed traversal proves one successful initial comments request and
-	// each expansion it reports. Failed/incomplete traversals may consume their
+	// Each completed or skipped outcome proves one initial comments request; a
+	// completed traversal also proves each expansion it reports. Failed/incomplete
+	// traversals may consume their
 	// logical request budget while queued behind a shared limiter without ever
 	// reaching Client.Do, so their logical counters are not physical-attempt proof.
-	minimumHTTPAttempts := uint64(1 + summary.PostsCompleted)
+	minimumHTTPAttempts := uint64(summary.PostsCompleted + summary.PostsSkipped)
+	if !checkedAdd(&minimumHTTPAttempts, parsed.summary.requests.RedditRetries) {
+		return fmt.Errorf("%w: request lower bound overflow", ErrInvalidLog)
+	}
 	for _, outcome := range parsed.outcomes {
 		if outcome.Status != "completed" {
 			continue
 		}
-		if !checkedAdd(&minimumHTTPAttempts, uint64(outcome.MoreRequests)) ||
+		if !checkedAdd(&minimumHTTPAttempts, uint64(outcome.ExpansionRequests)) ||
 			!checkedAdd(&minimumHTTPAttempts, uint64(outcome.ContinuationRequests)) {
 			return fmt.Errorf("%w: request lower bound overflow", ErrInvalidLog)
 		}
@@ -1425,9 +1451,6 @@ func reconcileRedditRetries(retries []retryRecord, outcomes map[string]OutcomeMa
 		sequence.lastAttempt = retry.attempt
 		sequences[key] = sequence
 
-		if retry.operation == "oauth_token" {
-			continue
-		}
 		outcome, exists := outcomes[retry.postID]
 		if !exists {
 			return errors.New("reddit retry does not belong to an assignment outcome")
@@ -1436,8 +1459,8 @@ func reconcileRedditRetries(retries []retryRecord, outcomes map[string]OutcomeMa
 		switch retry.operation {
 		case "continuation":
 			maximumSessions = outcome.ContinuationRequests
-		case "morechildren":
-			maximumSessions = outcome.MoreRequests
+		case "comment_expansion":
+			maximumSessions = outcome.ExpansionRequests
 		}
 		if sequence.sessions > maximumSessions {
 			return errors.New("reddit retry sessions exceed the post outcome request count")
@@ -1755,9 +1778,6 @@ func writeFileExclusive(path string, data []byte) error {
 
 func renderRunDocument(manifest Manifest) []byte {
 	status := "complete"
-	if manifest.Partial {
-		status = "partial (exit 3)"
-	}
 	text := fmt.Sprintf(`# DuckWords submission run
 
 This directory is an atomically published, sanitized evidence bundle for one %s run.
@@ -1770,19 +1790,21 @@ This directory is an atomically published, sanitized evidence bundle for one %s 
 - Commit: %s
 - Built: %s
 - Toolchain: %s (%s/%s)
-- Reddit policy checked: %s
-- Approval reference: %s
+- Reddit access profile: %s
+- Reddit request: %s %s (authentication: %s)
+- User-Agent source/hash: %s / %s
 - Posts: %d total, %d complete, %d skipped, %d failed, %d incomplete
 - Result: %d ranked words; SHA-256 %s
 
 `+"`result.json`"+` is the exact canonical stdout document. `+"`application.log`"+` is the exact
 captured JSON operational log. `+"`full-application.log`"+` appends the exact result after a
 fixed marker. `+"`run-manifest.json`"+` contains reconciled counters, provenance, and hashes.
-Credentials, OAuth tokens, URLs, local paths, comment bodies, and raw command arguments are
-intentionally absent.
+Credentials, cookies, authorization headers, URLs, local paths, comment bodies, raw User-Agent
+text, and raw command arguments are intentionally absent.
 `, status, manifest.Command, status, manifest.StartedAt, manifest.FinishedAt, manifest.Build.Version, manifest.Build.Commit,
 		manifest.Build.BuildDate, manifest.Build.GoVersion, manifest.Build.GOOS, manifest.Build.GOARCH,
-		manifest.Policy.RedditPolicyVerifiedAt, manifest.Policy.ApprovalReference,
+		manifest.Access.AccessProfile, manifest.Access.RedditMethod, manifest.Access.RedditOrigin, manifest.Access.RedditAuth,
+		manifest.Access.UserAgentSource, manifest.Access.UserAgentSHA256,
 		manifest.Summary.PostsTotal, manifest.Summary.PostsCompleted, manifest.Summary.PostsSkipped,
 		manifest.Summary.PostsFailed, manifest.Summary.PostsIncomplete, manifest.ResultWords,
 		manifest.Artifacts.ResultSHA256)
@@ -1967,16 +1989,6 @@ func containsControl(data []byte, permitFormatting bool) bool {
 			continue
 		}
 		return true
-	}
-	return false
-}
-
-func containsUnsafeApprovalMarker(value string) bool {
-	lower := strings.ToLower(value)
-	for _, marker := range []string{"secret", "token", "password", "authorization", "bearer", "client_id", "client-id"} {
-		if strings.Contains(lower, marker) {
-			return true
-		}
 	}
 	return false
 }

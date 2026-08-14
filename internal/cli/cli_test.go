@@ -17,7 +17,6 @@ import (
 	"github.com/pointerm/duckwords/internal/app"
 	"github.com/pointerm/duckwords/internal/config"
 	"github.com/pointerm/duckwords/internal/logging"
-	"github.com/pointerm/duckwords/internal/production"
 	"github.com/pointerm/duckwords/internal/reddit"
 	"github.com/pointerm/duckwords/internal/runlog"
 )
@@ -549,14 +548,20 @@ func TestRunParentDeadlineMapsToFailure(t *testing.T) {
 	}
 }
 
-func TestRunProductionExecutorFailsClosedWithoutApproval(t *testing.T) {
-	t.Setenv("REDDIT_API_ACCESS_APPROVED", "")
-	t.Setenv("REDDIT_CLIENT_ID", "")
-	t.Setenv("REDDIT_CLIENT_SECRET", "")
+func TestRunRejectsInvalidUserAgentBeforeExecutor(t *testing.T) {
 	t.Setenv("REDDIT_USER_AGENT", "")
 
 	var stdout, stderr strings.Builder
-	code := run(context.Background(), []string{"--workers=1"}, &stdout, &stderr, production.Execute)
+	code := run(
+		context.Background(),
+		[]string{"--workers=1"},
+		&stdout,
+		&stderr,
+		func(context.Context, config.Config, *slog.Logger) (app.Result, error) {
+			t.Fatal("executor was called with an invalid User-Agent override")
+			return app.Result{}, nil
+		},
+	)
 
 	if code != exitFailure {
 		t.Fatalf("run() exit code = %d, want %d", code, exitFailure)
@@ -564,18 +569,15 @@ func TestRunProductionExecutorFailsClosedWithoutApproval(t *testing.T) {
 	if stdout.Len() != 0 {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
-	if !strings.Contains(stderr.String(), "event=run_started") ||
+	if strings.Contains(stderr.String(), "event=run_started") ||
 		!strings.Contains(stderr.String(), "event=run_failed") ||
-		!strings.HasSuffix(stderr.String(), "duckwords: Reddit Data API access is not confirmed; obtain Reddit's approval, then set REDDIT_API_ACCESS_APPROVED=true (see README)\n") {
-		t.Fatalf("stderr = %q, want structured fail-closed lifecycle and stable diagnostic", stderr.String())
+		!strings.HasSuffix(stderr.String(), "duckwords: Reddit client setup failed; if REDDIT_USER_AGENT is set, use 8..256 printable ASCII bytes without surrounding whitespace\n") {
+		t.Fatalf("stderr = %q, want fail-closed user-agent diagnostic", stderr.String())
 	}
 }
 
-func TestRunProductionExecutorFailureIsPureJSON(t *testing.T) {
-	t.Setenv("REDDIT_API_ACCESS_APPROVED", "")
-	t.Setenv("REDDIT_CLIENT_ID", "must-not-appear")
-	t.Setenv("REDDIT_CLIENT_SECRET", "must-not-appear")
-	t.Setenv("REDDIT_USER_AGENT", "must-not-appear")
+func TestRunInvalidUserAgentFailureIsPureJSON(t *testing.T) {
+	t.Setenv("REDDIT_USER_AGENT", "must-not-appear\r\nX-Test: secret")
 
 	var stdout, stderr strings.Builder
 	code := run(
@@ -583,7 +585,10 @@ func TestRunProductionExecutorFailureIsPureJSON(t *testing.T) {
 		[]string{"--workers=1", "--log-format=json"},
 		&stdout,
 		&stderr,
-		production.Execute,
+		func(context.Context, config.Config, *slog.Logger) (app.Result, error) {
+			t.Fatal("executor was called with an invalid User-Agent override")
+			return app.Result{}, nil
+		},
 	)
 
 	if code != exitFailure {
@@ -849,8 +854,8 @@ func TestConfigDiagnosticNamesTheDisallowedHost(t *testing.T) {
 		t.Fatalf("run() exit code = %d, want %d", code, exitUsage)
 	}
 	if !strings.Contains(stderr.String(), "gist.githubusercontent.com") ||
-		strings.Contains(stderr.String(), "Reddit approval") {
-		t.Fatalf("stderr = %q, want the allowed host and no Reddit-approval misdirection", stderr.String())
+		strings.Contains(stderr.String(), "REDDIT_API_ACCESS_APPROVED") {
+		t.Fatalf("stderr = %q, want the allowed host and no legacy-access misdirection", stderr.String())
 	}
 }
 

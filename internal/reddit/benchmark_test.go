@@ -45,14 +45,12 @@ func BenchmarkPreflightJSON(b *testing.B) {
 
 func BenchmarkWalkDecodedWithMore(b *testing.B) {
 	const comments = 100
-	ids := make([]string, comments)
-	things := make([]any, comments)
-	for index := range ids {
-		ids[index] = fmt.Sprintf("c%d", index)
-		things[index] = testComment(ids[index], "bounded benchmark body", "t3_post1", "")
+	descendants := make([]any, comments-1)
+	for index := 1; index < comments; index++ {
+		descendants[index-1] = testComment(fmt.Sprintf("c%d", index), "bounded benchmark body", "t1_c0", "")
 	}
-	initial := testInitial(b, "post1", testMore(ids, len(ids), "t3_post1"))
-	response := testMoreResponse(b, nil, things...)
+	initial := testInitial(b, "post1", testMore([]string{"c0"}, 1, "t3_post1"))
+	response := testFocalResponse(b, "post1", testComment("c0", "bounded benchmark body", "t3_post1", testListing(descendants...)))
 	b.ReportAllocs()
 	b.SetBytes(int64(len(initial) + len(response)))
 	b.ResetTimer()
@@ -60,7 +58,7 @@ func BenchmarkWalkDecodedWithMore(b *testing.B) {
 		stats, err := walkDecoded(context.Background(), "post1", initial, func(context.Context, []string) ([]byte, error) {
 			return response, nil
 		}, func(Comment) error { return nil })
-		if err != nil || stats.Comments != comments || stats.MoreRequests != 1 {
+		if err != nil || stats.Comments != comments || stats.ExpansionRequests != 1 {
 			b.Fatalf("walkDecoded() stats = %#v, error = %v", stats, err)
 		}
 	}

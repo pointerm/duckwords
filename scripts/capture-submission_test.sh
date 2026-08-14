@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-# Exercise the live-capture wrapper without Go compilation, network access, Reddit
-# credentials, or assignment data. Each case gets a clean minimal Git repository;
+# Exercise the live-capture wrapper without Go compilation, network access, or
+# assignment data. Each case gets a clean minimal Git repository;
 # the fake Go tool deterministically rebuilds executable fixtures from tracked HEAD.
 set -euo pipefail
 umask 077
@@ -24,10 +24,10 @@ if [[ ! -x /bin/sh || ! -x /bin/mkdir || ! -x /bin/cp || ! -x /bin/cat ]]; then
   exit 1
 fi
 
-# The harness never consumes caller credentials. Only the visibly synthetic values
-# exported inside run_wrapper reach the process fixture.
+# The harness never consumes caller credentials. Visibly synthetic legacy OAuth
+# values are exported inside run_wrapper to prove they never reach any child.
 unset REDDIT_API_ACCESS_APPROVED REDDIT_CLIENT_ID REDDIT_CLIENT_SECRET REDDIT_USER_AGENT \
-  CAPTURE_TEST_AMBIENT_VALUE
+  REDDIT_POLICY_VERIFIED_AT REDDIT_APPROVAL_REFERENCE CAPTURE_TEST_AMBIENT_VALUE
 
 for required_command in awk bash cmp cp date env find git grep mkdir mktemp rm sed; do
   if ! command -v "${required_command}" >/dev/null 2>&1; then
@@ -233,9 +233,8 @@ fi
 mkdir -p -- "$(dirname "${output}")"
 
 IFS= read -r expected_status < test-fixtures/expectations || exit 95
-IFS= read -r expected_policy < <(sed -n '2p' test-fixtures/expectations) || exit 95
-IFS= read -r expected_approval < <(sed -n '3p' test-fixtures/expectations) || exit 95
-IFS= read -r expected_finalizer_mode < <(sed -n '4p' test-fixtures/expectations) || exit 95
+IFS= read -r expected_finalizer_mode < <(sed -n '2p' test-fixtures/expectations) || exit 95
+IFS= read -r expected_user_agent_mode < <(sed -n '3p' test-fixtures/expectations) || exit 95
 
 case "${package}" in
   ./cmd/duckwords)
@@ -257,6 +256,7 @@ case "${package}" in
       fixture_line="${fixture_line//@COMMIT@/${embedded_commit}}"
       fixture_line="${fixture_line//@BUILD_DATE@/${embedded_build_date}}"
       fixture_line="${fixture_line//@APP_STATUS@/${expected_status}}"
+      fixture_line="${fixture_line//@USER_AGENT_MODE@/${expected_user_agent_mode}}"
       printf '%s\n' "${fixture_line}"
     done < test-fixtures/duckwords-template > "${output}"
     chmod 0755 "${output}"
@@ -266,8 +266,6 @@ case "${package}" in
     while IFS= read -r fixture_line || [[ -n "${fixture_line}" ]]; do
       fixture_line="${fixture_line//@EVENTS@/${events_path}}"
       fixture_line="${fixture_line//@APP_STATUS@/${expected_status}}"
-      fixture_line="${fixture_line//@POLICY_DATE@/${expected_policy}}"
-      fixture_line="${fixture_line//@APPROVAL_REFERENCE@/${expected_approval}}"
       fixture_line="${fixture_line//@FINALIZER_MODE@/${expected_finalizer_mode}}"
       printf '%s\n' "${fixture_line}"
     done < test-fixtures/evidence-template > "${output}"
@@ -290,6 +288,7 @@ case_events=""
 case_sha=""
 case_app_status=""
 case_finalizer_mode=""
+case_user_agent_mode=""
 case_policy_date=""
 case_approval_reference=""
 case_build_date=""
@@ -299,6 +298,7 @@ setup_case() {
   case_app_status="$2"
   local existing_target="${3:-false}"
   case_finalizer_mode="${4:-normal}"
+  case_user_agent_mode="${5:-override}"
   local case_root="${test_root}/cases/${case_name}"
   case_repo="${case_root}/repo"
   case_state="${case_root}/state"
@@ -325,8 +325,8 @@ EOF_GO_MOD
   case_policy_date="$(date -u '+%Y-%m-%d')"
   case_build_date="${case_policy_date}T00:00:00Z"
   case_approval_reference="approval-fixture-${case_policy_date}"
-  printf '%s\n%s\n%s\n%s\n' "${case_app_status}" "${case_policy_date}" \
-    "${case_approval_reference}" "${case_finalizer_mode}" > "${case_repo}/test-fixtures/expectations"
+  printf '%s\n%s\n%s\n' "${case_app_status}" "${case_finalizer_mode}" \
+    "${case_user_agent_mode}" > "${case_repo}/test-fixtures/expectations"
 
   cat > "${case_repo}/test-fixtures/duckwords-template" <<'DUCKWORDS_FIXTURE'
 #!/bin/sh
@@ -356,10 +356,10 @@ if [ "$#" -ne 9 ] ||
   [ "$1" != "--workers=4" ] ||
   [ "$2" != "--rate-limit=0.8" ] ||
   [ "$3" != "--request-timeout=20s" ] ||
-  [ "$4" != "--timeout=30m" ] ||
+  [ "$4" != "--timeout=2h" ] ||
   [ "$5" != "--max-retries=3" ] ||
   [ "$6" != "--retry-budget=45s" ] ||
-  [ "$7" != "--failure-mode=best-effort" ] ||
+  [ "$7" != "--failure-mode=strict" ] ||
   [ "$8" != "--log-level=info" ] ||
   [ "$9" != "--log-format=json" ]; then
   record "live:arguments-invalid"
@@ -372,16 +372,24 @@ if command -v capture_test_exported_function >/dev/null 2>&1; then
   exit 86
 fi
 
-if [ "${REDDIT_API_ACCESS_APPROVED:-}" != "true" ] ||
-  [ "${REDDIT_CLIENT_ID:-}" != "fixture-value-two" ] ||
-  [ "${REDDIT_CLIENT_SECRET:-}" != "fixture-value-three" ] ||
-  [ "${REDDIT_USER_AGENT:-}" != "fixture-value-four" ]; then
-  record "live:credentials-missing"
+if [ -n "${REDDIT_API_ACCESS_APPROVED+x}" ] || [ -n "${REDDIT_CLIENT_ID+x}" ] ||
+  [ -n "${REDDIT_CLIENT_SECRET+x}" ] || [ -n "${REDDIT_POLICY_VERIFIED_AT+x}" ] ||
+  [ -n "${REDDIT_APPROVAL_REFERENCE+x}" ]; then
+  record "live:legacy-auth-leaked"
   exit 83
 fi
-record "live:credentials-present"
+case "@USER_AGENT_MODE@" in
+  override)
+    [ "${REDDIT_USER_AGENT:-}" = "fixture-value-four" ] || exit 83
+    ;;
+  builtin)
+    [ -z "${REDDIT_USER_AGENT+x}" ] || exit 83
+    ;;
+  *) exit 83 ;;
+esac
+record "live:user-agent=@USER_AGENT_MODE@"
+record "live:legacy-auth-absent"
 if [ "${TZ:-}" != "UTC" ] || [ -n "${CAPTURE_TEST_AMBIENT_VALUE+x}" ] ||
-  [ -n "${REDDIT_POLICY_VERIFIED_AT+x}" ] || [ -n "${REDDIT_APPROVAL_REFERENCE+x}" ] ||
   [ -n "${DUCKWORDS_RELEASE_VERSION+x}" ] || [ -n "${DUCKWORDS_BUILD_DATE+x}" ] ||
   [ -n "${SUBMISSION_DIR+x}" ]; then
   record "live:environment-leaked"
@@ -424,8 +432,6 @@ log=""
 output_dir=""
 exit_code=""
 binary=""
-policy_verified_at=""
-approval_reference=""
 while [ "$#" -gt 0 ]; do
   [ "$#" -ge 2 ] || exit 72
   case "$1" in
@@ -434,8 +440,6 @@ while [ "$#" -gt 0 ]; do
     --output-dir) output_dir="$2" ;;
     --exit-code) exit_code="$2" ;;
     --binary) binary="$2" ;;
-    --policy-verified-at) policy_verified_at="$2" ;;
-    --approval-reference) approval_reference="$2" ;;
     *) exit 72 ;;
   esac
   shift 2
@@ -446,8 +450,6 @@ done
 [ -x "${binary}" ] && [ ! -L "${binary}" ] || exit 73
 [ ! -e "${output_dir}" ] && [ ! -L "${output_dir}" ] || exit 73
 [ "${exit_code}" = "@APP_STATUS@" ] || exit 73
-[ "${policy_verified_at}" = "@POLICY_DATE@" ] || exit 73
-[ "${approval_reference}" = "@APPROVAL_REFERENCE@" ] || exit 73
 
 /bin/mkdir "${output_dir}"
 /bin/cp "${result}" "${output_dir}/result.json"
@@ -457,7 +459,7 @@ done
   printf '%s\n' '--- result.json ---'
   /bin/cat "${result}"
 } > "${output_dir}/full-application.log"
-printf '%s\n' '{"schema_version":1,"fixture":true}' > "${output_dir}/run-manifest.json"
+printf '%s\n' '{"schema":2,"fixture":true}' > "${output_dir}/run-manifest.json"
 printf '%s\n' '# Offline capture fixture' > "${output_dir}/RUN.md"
 record "finalizer:exit=${exit_code}"
 if [ "@FINALIZER_MODE@" = "signal-after-publish" ]; then
@@ -554,7 +556,11 @@ run_wrapper() {
     export REDDIT_API_ACCESS_APPROVED="${fixture_approval}"
     export REDDIT_CLIENT_ID="${fixture_client_id}"
     export REDDIT_CLIENT_SECRET="${fixture_client_secret}"
-    export REDDIT_USER_AGENT="${fixture_user_agent}"
+    if [[ "${case_user_agent_mode}" == "override" ]]; then
+      export REDDIT_USER_AGENT="${fixture_user_agent}"
+    else
+      unset REDDIT_USER_AGENT
+    fi
     export CAPTURE_TEST_AMBIENT_VALUE="${fixture_ambient_value}"
     if [[ "${exported_functions}" == "true" ]]; then
       set() { return 91; }
@@ -606,7 +612,8 @@ assert_bundle_payload() {
     fail "${case_name}: published result differs from captured stdout"
   fi
   assert_event_count 1 "live:arguments-verified" "${case_name}: fixed invocation"
-  assert_event_count 1 "live:credentials-present" "${case_name}: live child environment"
+  assert_event_count 1 "live:legacy-auth-absent" "${case_name}: no-auth live child boundary"
+  assert_event_count 1 "live:user-agent=${case_user_agent_mode}" "${case_name}: User-Agent selection"
   assert_event_count 1 "live:environment-scrubbed" "${case_name}: live child boundary"
   assert_event_count 1 "finalizer:environment-scrubbed" "${case_name}: finalizer environment"
   assert_event_count 1 "finalizer:exit=${exit_code}" "${case_name}: finalizer application status"
@@ -690,6 +697,17 @@ test_success() {
   printf '%s\n' 'ok - complete exit 0 publishes one verified bundle'
 }
 
+test_success_with_builtin_user_agent() {
+  setup_case success-builtin-user-agent 0 false normal builtin
+  run_wrapper 0
+  assert_verified_preflight
+  assert_published_bundle 0
+  assert_contains "${case_state}/wrapper.stderr" \
+    'published one-run evidence at artifacts/submission (application exit 0)' \
+    'built-in User-Agent publication diagnostic'
+  printf '%s\n' 'ok - optional User-Agent override may be omitted'
+}
+
 test_xtrace_secret_boundary() {
   setup_case xtrace-secret-boundary 0
   run_wrapper 0 true
@@ -698,7 +716,7 @@ test_xtrace_secret_boundary() {
   assert_contains "${case_state}/wrapper.stderr" \
     'published one-run evidence at artifacts/submission (application exit 0)' \
     'xtrace-safe publication diagnostic'
-  printf '%s\n' 'ok - inherited xtrace is disabled before credential capture'
+  printf '%s\n' 'ok - inherited xtrace is disabled before environment capture'
 }
 
 test_exported_function_boundary() {
@@ -769,15 +787,18 @@ test_unprivileged_bash_rejected() {
   printf '%s\n' 'ok - raw non-privileged Bash invocation is rejected before helpers'
 }
 
-test_partial() {
+test_partial_rejected() {
   setup_case partial 3
   run_wrapper 3
   assert_verified_preflight
-  assert_published_bundle 3
+  assert_path_absent "${case_repo}/artifacts/submission" 'partial run publication'
+  assert_event_count 1 "live:legacy-auth-absent" 'partial no-auth boundary'
+  assert_event_count 0 "finalizer:environment-scrubbed" 'partial finalizer suppression'
   assert_contains "${case_state}/wrapper.stderr" \
-    'published one-run evidence at artifacts/submission (application exit 3)' \
-    'partial publication diagnostic'
-  printf '%s\n' 'ok - partial exit 3 publishes one explicitly partial bundle'
+    'assignment run failed with exit status 3; no submission artifacts were published' \
+    'partial rejection diagnostic'
+  assert_capture_lock_absent
+  printf '%s\n' 'ok - partial exit 3 publishes no canonical evidence'
 }
 
 test_signal_after_publish() {
@@ -818,7 +839,7 @@ test_fatal() {
   assert_verified_preflight
   assert_path_absent "${case_repo}/artifacts/submission" 'fatal run publication'
   assert_event_count 1 "live:arguments-verified" 'fatal fixed invocation'
-  assert_event_count 1 "live:credentials-present" 'fatal live child environment'
+  assert_event_count 1 "live:legacy-auth-absent" 'fatal no-auth live child environment'
   assert_event_count 1 "live:environment-scrubbed" 'fatal live child boundary'
   assert_event_count 0 "finalizer:environment-scrubbed" 'fatal finalizer suppression'
   assert_contains "${case_state}/wrapper.stderr" \
@@ -912,11 +933,12 @@ test_mismatched_finalizer() {
 }
 
 test_success
+test_success_with_builtin_user_agent
 test_xtrace_secret_boundary
 test_exported_function_boundary
 test_invalid_environment_name
 test_unprivileged_bash_rejected
-test_partial
+test_partial_rejected
 test_signal_after_publish
 test_failure_after_publish_is_not_masked
 test_fatal

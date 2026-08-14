@@ -514,11 +514,8 @@ func TestWriteUsage(t *testing.T) {
 		"--log-format",
 		"--version",
 		"--help",
-		"REDDIT_CLIENT_ID",
-		"REDDIT_CLIENT_SECRET",
 		"REDDIT_USER_AGENT",
 		"--filter 'duck*'",
-		"REDDIT_API_ACCESS_APPROVED",
 		"gist.githubusercontent.com",
 		"raw.githubusercontent.com",
 	} {
@@ -526,11 +523,15 @@ func TestWriteUsage(t *testing.T) {
 			t.Fatalf("usage does not contain %q:\n%s", want, output.String())
 		}
 	}
+	for _, legacy := range []string{"REDDIT_API_ACCESS_APPROVED", "REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET"} {
+		if strings.Contains(output.String(), legacy) {
+			t.Fatalf("usage still advertises legacy variable %q:\n%s", legacy, output.String())
+		}
+	}
 }
 
 // TestParseRejectsSourceURLOutsideOriginAllowlist keeps the acquisition host policy
-// visible at the configuration boundary. Deferring it to acquisition produced an
-// exit-1 setup failure whose message pointed at Reddit credentials instead.
+// visible at the configuration boundary rather than deferring it to acquisition.
 func TestParseRejectsSourceURLOutsideOriginAllowlist(t *testing.T) {
 	t.Parallel()
 

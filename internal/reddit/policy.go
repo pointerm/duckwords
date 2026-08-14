@@ -93,7 +93,7 @@ type RetryEvent struct {
 type RetryObserver func(RetryEvent)
 
 // RequestPolicySnapshot is a race-safe point-in-time view of process-wide request
-// activity. Retry count includes the single controlled 401 replay when it occurs.
+// activity. Retry count includes only generic transient-request retries.
 type RequestPolicySnapshot struct {
 	HTTPAttempts      uint64
 	Retries           uint64
@@ -104,7 +104,7 @@ type RequestPolicySnapshot struct {
 type policyWait func(context.Context, time.Duration) error
 type policyJitter func(time.Duration) time.Duration
 
-// RequestPolicy coordinates every OAuth and bearer-API HTTP attempt in a process.
+// RequestPolicy coordinates every public Reddit JSON HTTP attempt in a process.
 // It is safe for concurrent use. Each logical session is bounded from its first
 // limiter wait through its final HTTP attempt. The size-one permit serializes only
 // scheduling; the permit is released before network I/O, so independent requests
@@ -328,7 +328,7 @@ func (session *retrySession) doAfter(
 	if err != nil {
 		return nil, err
 	}
-	// The byte-only facade is used by OAuth and policy tests, whose attempts never
+	// The byte-only facade is used by policy tests, whose attempts never
 	// reserve traversal capacity. Fail closed if a future caller tries to discard an
 	// owned lease through this compatibility path.
 	if payload.release != nil {
@@ -482,10 +482,10 @@ func (session *retrySession) acquireAttemptSlot(
 		return func() {}, nil
 	}
 
-	// A morechildren attempt may have to wait for both the endpoint gate and the
+	// A focal expansion attempt may have to wait for both the endpoint gate and the
 	// process-wide rate slot. If the rate slot is not ready after acquiring the
 	// gate, release the gate before sleeping and try both again. This prevents a
-	// retry backoff or limiter timer from blocking unrelated morechildren cleanup.
+	// retry backoff or limiter timer from blocking unrelated expansion cleanup.
 	for {
 		release, err := gate(ctx)
 		if err != nil {
@@ -526,8 +526,8 @@ func (session *retrySession) budgetEnded(ctx context.Context) bool {
 	return errors.Is(context.Cause(ctx), errRetryBudget) || session.remainingBudget() <= 0
 }
 
-// retryBudgetFailure preserves the material error that justified an authentication
-// or generic replay. When the initial scheduling/HTTP attempt alone exhausts the
+// retryBudgetFailure preserves the material error that justified a generic replay.
+// When the initial scheduling/HTTP attempt alone exhausts the
 // session, no prior server result exists, so expose one sanitized non-cancellation
 // transport failure while retaining errRetryBudget for errors.Is classification.
 func retryBudgetFailure(endpoint Endpoint, postID string, previous error) error {
@@ -535,12 +535,6 @@ func retryBudgetFailure(endpoint Endpoint, postID string, previous error) error 
 		return previous
 	}
 	return newError(ErrorTransport, endpoint, validDiagnosticPostID(postID), 0, errRetryBudget)
-}
-
-// recordAuthenticationReplay accounts for the one token-lifecycle replay without
-// consuming the generic retry allowance shared by both bearer-token attempts.
-func (session *retrySession) recordAuthenticationReplay(endpoint Endpoint, postID string, err error) {
-	session.policy.recordRetry(endpoint, postID, err, session.httpAttempts+1, 0)
 }
 
 func retryableHTTPError(err error) bool {

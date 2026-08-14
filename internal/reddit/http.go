@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net"
 	"net/http"
+	"strings"
 )
 
 const maxRetryableResponseDrainBytes int64 = 32 << 10
@@ -22,6 +24,15 @@ var (
 	errResponseRead          = errors.New("read HTTP response")
 	errResponseClose         = errors.New("close HTTP response")
 )
+
+func hasSingleJSONContentType(header http.Header) bool {
+	values := header.Values("Content-Type")
+	if len(values) != 1 {
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(values[0])
+	return err == nil && strings.EqualFold(mediaType, "application/json")
+}
 
 func executeJSON(
 	ctx context.Context,
@@ -97,6 +108,10 @@ func executePayloadAttempt(
 	response, err := httpClient.Do(request)
 	result := policyAttemptResult{attempted: true}
 	if err != nil {
+		statusCode := 0
+		if response != nil {
+			statusCode = response.StatusCode
+		}
 		if response != nil && response.Body != nil {
 			// A response returned alongside an error is unusable according to the
 			// net/http contract. Closing it is best-effort cleanup; the transport
@@ -105,6 +120,9 @@ func executePayloadAttempt(
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return result, newError(ErrorCanceled, endpoint, postID, 0, ctxErr)
+		}
+		if errors.Is(err, ErrClientRedirect) {
+			return result, newError(ErrorAccess, endpoint, postID, statusCode, ErrClientRedirect)
 		}
 		return result, newError(ErrorTransport, endpoint, postID, 0, &httpRequestError{cause: err})
 	}

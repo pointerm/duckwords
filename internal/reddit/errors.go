@@ -1,5 +1,5 @@
-// Package reddit retrieves and walks complete Reddit comment trees through the
-// authenticated Data API without retaining raw user content.
+// Package reddit retrieves and walks complete Reddit comment trees through public
+// old.reddit.com JSON representations without retaining raw user content.
 package reddit
 
 import (
@@ -13,11 +13,10 @@ type ErrorClass string
 const (
 	// ErrorInvalidInput identifies an invalid local argument or request value.
 	ErrorInvalidInput ErrorClass = "invalid_input"
-	// ErrorAuthentication identifies rejected or unavailable OAuth credentials.
-	ErrorAuthentication ErrorClass = "authentication"
-	// ErrorForbidden identifies an HTTP 403 response from Reddit.
-	ErrorForbidden ErrorClass = "forbidden"
-	// ErrorNotFound identifies an HTTP 404 response from Reddit.
+	// ErrorAccess identifies an HTTP 401/403 response or a blocked redirect to a
+	// login/interstitial page. These responses do not prove that a post is absent.
+	ErrorAccess ErrorClass = "access"
+	// ErrorNotFound identifies an HTTP 404 or 410 response from Reddit.
 	ErrorNotFound ErrorClass = "not_found"
 	// ErrorRateLimited identifies an HTTP 429 response from Reddit.
 	ErrorRateLimited ErrorClass = "rate_limited"
@@ -44,15 +43,14 @@ const (
 type Endpoint string
 
 const (
-	// EndpointOAuthToken identifies the application-only token operation.
-	EndpointOAuthToken Endpoint = "oauth_token"
 	// EndpointComments identifies the initial post comment-listing operation.
 	EndpointComments Endpoint = "comments"
 	// EndpointContinuation identifies a focal-comment request used to continue a
 	// depth-truncated branch.
 	EndpointContinuation Endpoint = "continuation"
-	// EndpointMoreChildren identifies a comment-placeholder expansion operation.
-	EndpointMoreChildren Endpoint = "morechildren"
+	// EndpointCommentExpansion identifies a focal-comment GET used to resolve a
+	// regular kind:"more" placeholder.
+	EndpointCommentExpansion Endpoint = "comment_expansion"
 )
 
 var errInvalidAdapterError = errors.New("invalid reddit adapter error")
@@ -108,15 +106,15 @@ func (e *Error) Unwrap() error {
 
 func classForStatus(statusCode int) ErrorClass {
 	switch {
+	case statusCode >= 300 && statusCode <= 399:
+		return ErrorAccess
 	case statusCode == 400:
 		return ErrorInvalidInput
 	case statusCode == 408:
 		return ErrorTransport
-	case statusCode == 401:
-		return ErrorAuthentication
-	case statusCode == 403:
-		return ErrorForbidden
-	case statusCode == 404:
+	case statusCode == 401 || statusCode == 403:
+		return ErrorAccess
+	case statusCode == 404 || statusCode == 410:
 		return ErrorNotFound
 	case statusCode == 429:
 		return ErrorRateLimited

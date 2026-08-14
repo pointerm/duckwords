@@ -25,11 +25,7 @@ const (
 
 var (
 	// ErrConfig classifies invalid production composition without exposing secrets.
-	ErrConfig = errors.New("invalid production execution configuration")
-	// These wrap errProductionConfig so existing classification keeps working while
-	// the CLI can name the precise cause instead of one catch-all setup message.
-	ErrApproval          = fmt.Errorf("%w: Reddit Data API approval", ErrConfig)
-	ErrCredentials       = fmt.Errorf("%w: Reddit credentials", ErrConfig)
+	ErrConfig            = errors.New("invalid production execution configuration")
 	ErrSourceConfig      = fmt.Errorf("%w: input source", ErrConfig)
 	ErrSourceAcquisition = errors.New("input acquisition failed")
 	ErrSourceParsing     = errors.New("input parsing failed")
@@ -77,8 +73,8 @@ func ExecuteWithDependencies(
 	return executeProduction(ctx, cfg, logger, dependencies)
 }
 
-// executeProduction assembles exactly one dictionary, token source, request policy,
-// Reddit client, and runner. Constructors and both source specifications are
+// executeProduction assembles exactly one dictionary, request policy, public Reddit
+// client, and runner. Constructors and both source specifications are
 // validated before the first filesystem or network operation.
 func executeProduction(
 	ctx context.Context,
@@ -93,14 +89,14 @@ func executeProduction(
 	startedAt := dependencies.now()
 	log := runlog.New(logger)
 
-	credentials, err := credentialsFromEnvironment(dependencies.lookupEnv)
-	if err != nil {
-		if errors.Is(err, errApprovalRequired) {
-			log.Failed(ctx, "approval", elapsed(dependencies.now, startedAt))
-			return app.Result{}, ErrApproval
-		}
-		log.Failed(ctx, "credentials", elapsed(dependencies.now, startedAt))
-		return app.Result{}, ErrCredentials
+	access, supplied := accessIdentityFromContext(ctx)
+	var err error
+	if !supplied {
+		access, err = ResolveAccessIdentity(dependencies.lookupEnv)
+	}
+	if err != nil || !validAccessIdentity(access) {
+		log.Failed(ctx, "user_agent", elapsed(dependencies.now, startedAt))
+		return app.Result{}, ErrRedditSetup
 	}
 	httpClient, err := dependencies.newHTTP(cfg.RequestTimeout, cfg.Workers)
 	if err != nil {
@@ -136,21 +132,9 @@ func executeProduction(
 		log.Failed(ctx, "configuration", elapsed(dependencies.now, startedAt))
 		return app.Result{}, fmt.Errorf("%w: request policy", ErrConfig)
 	}
-	tokenSource, err := reddit.NewTokenSource(reddit.TokenConfig{
-		ClientID:          credentials.clientID,
-		ClientSecret:      credentials.clientSecret,
-		UserAgent:         credentials.userAgent,
-		HTTPClient:        httpClient,
-		RequestPolicy:     policy,
-		APIAccessApproved: credentials.approved,
-	})
-	if err != nil {
-		log.Failed(ctx, "configuration", elapsed(dependencies.now, startedAt))
-		return app.Result{}, ErrRedditSetup
-	}
 	redditClient, err := reddit.NewClient(reddit.ClientConfig{
 		HTTPClient:    httpClient,
-		TokenSource:   tokenSource,
+		UserAgent:     access.UserAgent(),
 		RequestPolicy: policy,
 	})
 	if err != nil {
@@ -220,6 +204,7 @@ func executeProduction(
 		log.Summary(
 			ctx,
 			cfg,
+			runlogAccessIdentity(access),
 			result,
 			policy.Snapshot(),
 			postStats.SHA256,
@@ -238,6 +223,17 @@ func executeProduction(
 		log.Failed(ctx, runErrorClass(runErr), elapsed(dependencies.now, startedAt))
 	}
 	return result, runErr
+}
+
+func runlogAccessIdentity(access AccessIdentity) runlog.AccessIdentity {
+	return runlog.AccessIdentity{
+		Profile:         access.Profile,
+		Origin:          access.Origin,
+		Method:          access.Method,
+		Auth:            access.Auth,
+		UserAgentSource: access.UserAgentSource,
+		UserAgentSHA256: access.UserAgentSHA256,
+	}
 }
 
 func acquisitionConfig(

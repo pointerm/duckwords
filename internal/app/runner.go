@@ -244,7 +244,8 @@ func (runner *Runner) processPost(ctx context.Context, job indexedPost) postResu
 	var countedTokens uint64
 	var visitorFailure error
 
-	stats, err := runner.walker.WalkComments(ctx, job.post.ID, func(comment reddit.Comment) error {
+	postRef := reddit.PostRef{ID: job.post.ID, JSONPath: job.post.JSONPath}
+	stats, err := runner.walker.WalkComments(ctx, postRef, func(comment reddit.Comment) error {
 		if visitorFailure != nil {
 			return visitorFailure
 		}
@@ -330,19 +331,19 @@ func classifyPostError(err, visitorFailure error) (OutcomeStatus, bool, reddit.E
 		}
 		switch adapterErr.Class {
 		case reddit.ErrorNotFound:
-			// Absence is proven only by the post listing itself. A 404 from a
-			// morechildren or continuation expansion says the tree could not be
-			// completed, not that the post is gone, so it stays a failure.
-			if endpoint == reddit.EndpointComments {
+			// Absence is proven only by an initial-listing HTTP 404/410. A focal
+			// expansion 404/410, or a statusless local classification, does not prove
+			// that the post is gone.
+			if endpoint == reddit.EndpointComments && (statusCode == 404 || statusCode == 410) {
 				return OutcomeSkipped, false, class, endpoint, statusCode
 			}
 			return OutcomeFailed, false, class, endpoint, statusCode
 		case reddit.ErrorIncomplete, reddit.ErrorResourceLimit:
 			return OutcomeIncomplete, false, class, endpoint, statusCode
-		case reddit.ErrorForbidden, reddit.ErrorRateLimited,
+		case reddit.ErrorAccess, reddit.ErrorRateLimited,
 			reddit.ErrorServer, reddit.ErrorTransport, reddit.ErrorProtocol:
 			return OutcomeFailed, false, class, endpoint, statusCode
-		case reddit.ErrorAuthentication, reddit.ErrorInvalidInput, reddit.ErrorVisitor,
+		case reddit.ErrorInvalidInput, reddit.ErrorVisitor,
 			reddit.ErrorCanceled:
 			return OutcomeFailed, true, class, endpoint, statusCode
 		default:
@@ -370,7 +371,7 @@ func sanitizedAdapterMetadata(adapterErr *reddit.Error) (reddit.ErrorClass, redd
 
 func knownErrorClass(class reddit.ErrorClass) bool {
 	switch class {
-	case reddit.ErrorInvalidInput, reddit.ErrorAuthentication, reddit.ErrorForbidden,
+	case reddit.ErrorInvalidInput, reddit.ErrorAccess,
 		reddit.ErrorNotFound, reddit.ErrorRateLimited, reddit.ErrorServer,
 		reddit.ErrorTransport, reddit.ErrorProtocol, reddit.ErrorIncomplete,
 		reddit.ErrorResourceLimit, reddit.ErrorCanceled, reddit.ErrorVisitor:
@@ -382,8 +383,7 @@ func knownErrorClass(class reddit.ErrorClass) bool {
 
 func knownEndpoint(endpoint reddit.Endpoint) bool {
 	switch endpoint {
-	case reddit.EndpointOAuthToken, reddit.EndpointComments,
-		reddit.EndpointContinuation, reddit.EndpointMoreChildren:
+	case reddit.EndpointComments, reddit.EndpointContinuation, reddit.EndpointCommentExpansion:
 		return true
 	default:
 		return false
@@ -396,7 +396,7 @@ func outcomeFrom(post source.Post, stats reddit.WalkStats, countedTokens uint64)
 		SourceLine:           post.SourceLine,
 		Comments:             stats.Comments,
 		BodiesVisited:        stats.BodiesVisited,
-		MoreRequests:         stats.MoreRequests,
+		ExpansionRequests:    stats.ExpansionRequests,
 		ContinuationRequests: stats.ContinuationRequests,
 		CountedTokens:        countedTokens,
 	}
@@ -431,7 +431,7 @@ func summarize(outcomes []PostOutcome, distinctWords int) (Summary, error) {
 			summary.Completed++
 			if !addSummaryValue(&summary.Comments, uint64(outcome.Comments)) ||
 				!addSummaryValue(&summary.BodiesVisited, uint64(outcome.BodiesVisited)) ||
-				!addSummaryValue(&summary.MoreRequests, uint64(outcome.MoreRequests)) ||
+				!addSummaryValue(&summary.ExpansionRequests, uint64(outcome.ExpansionRequests)) ||
 				!addSummaryValue(&summary.ContinuationRequests, uint64(outcome.ContinuationRequests)) ||
 				!addSummaryValue(&summary.CountedTokens, outcome.CountedTokens) {
 				return Summary{}, errSummaryOverflow
@@ -464,6 +464,6 @@ func addSummaryValue(total *uint64, value uint64) bool {
 func validWalkStats(stats reddit.WalkStats) bool {
 	return stats.Things >= 0 && stats.Comments >= 0 && stats.BodiesVisited >= 0 &&
 		stats.BodiesSkipped >= 0 && stats.DuplicateComments >= 0 && stats.MoreIDs >= 0 &&
-		stats.UniqueMoreIDs >= 0 && stats.DuplicateMoreIDs >= 0 && stats.MoreRequests >= 0 &&
+		stats.UniqueMoreIDs >= 0 && stats.DuplicateMoreIDs >= 0 && stats.ExpansionRequests >= 0 &&
 		stats.ContinuationRequests >= 0 && stats.BodyBytes >= 0 && stats.ResponseBytes >= 0
 }

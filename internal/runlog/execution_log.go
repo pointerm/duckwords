@@ -28,17 +28,23 @@ const (
 )
 
 const (
-	unknownBuildLogValue   = "unknown"
-	maxCommitLogBytes      = 64
-	minCommitLogBytes      = 7
-	maxVersionLogBytes     = 64
-	maxGoVersionLogBytes   = 96
-	maxPlatformLogBytes    = 16
-	buildDateLogLayout     = "2006-01-02T15:04:05Z"
-	terminalStatusComplete = "complete"
-	terminalStatusPartial  = "partial"
-	inputProfileAssignment = "assignment-default-v1"
-	inputProfileCustom     = "custom"
+	unknownBuildLogValue    = "unknown"
+	maxCommitLogBytes       = 64
+	minCommitLogBytes       = 7
+	maxVersionLogBytes      = 64
+	maxGoVersionLogBytes    = 96
+	maxPlatformLogBytes     = 16
+	buildDateLogLayout      = "2006-01-02T15:04:05Z"
+	terminalStatusComplete  = "complete"
+	terminalStatusPartial   = "partial"
+	inputProfileAssignment  = "assignment-default-v1"
+	inputProfileCustom      = "custom"
+	accessProfilePublicJSON = "old-reddit-public-json-v1"
+	accessOriginOldReddit   = "old.reddit.com"
+	accessMethodGET         = "GET"
+	accessAuthNone          = "none"
+	userAgentSourceBuiltin  = "builtin"
+	userAgentSourceOverride = "override"
 )
 
 type logBuildIdentity struct {
@@ -48,6 +54,17 @@ type logBuildIdentity struct {
 	goVersion string
 	goos      string
 	goarch    string
+}
+
+// AccessIdentity is the sanitized public-Reddit transport identity recorded at
+// both lifecycle boundaries. It intentionally contains no raw User-Agent value.
+type AccessIdentity struct {
+	Profile         string
+	Origin          string
+	Method          string
+	Auth            string
+	UserAgentSource string
+	UserAgentSHA256 string
 }
 
 // Recorder writes the stable, sanitized lifecycle schema consumed by the evidence
@@ -63,7 +80,7 @@ func New(logger *slog.Logger) Recorder {
 }
 
 // RunStarted records the validated execution configuration and bounded resource policy.
-func (log Recorder) RunStarted(ctx context.Context, cfg config.Config) {
+func (log Recorder) RunStarted(ctx context.Context, cfg config.Config, access AccessIdentity) {
 	if log.logger == nil {
 		return
 	}
@@ -86,6 +103,7 @@ func (log Recorder) RunStarted(ctx context.Context, cfg config.Config) {
 		slog.Int64("max_in_flight_response_bytes", traversalBudget.MaxInFlightResponseBytes),
 		slog.Int("max_retained_things", traversalBudget.MaxRetainedThings),
 	}
+	attributes = appendAccessIdentityAttrs(attributes, access)
 	attributes = appendBuildIdentityAttrs(attributes, currentLogBuildIdentity())
 	log.logger.LogAttrs(ctx, slog.LevelInfo, logMessageRunStarted, attributes...)
 }
@@ -203,7 +221,7 @@ func (log Recorder) Outcomes(ctx context.Context, result app.Result) {
 			slog.String("status", string(outcome.Status)),
 			slog.Int("comments", outcome.Comments),
 			slog.Int("bodies_visited", outcome.BodiesVisited),
-			slog.Int("more_requests", outcome.MoreRequests),
+			slog.Int("expansion_requests", outcome.ExpansionRequests),
 			slog.Int("continuation_requests", outcome.ContinuationRequests),
 			slog.Uint64("counted_tokens", outcome.CountedTokens),
 		}
@@ -224,6 +242,7 @@ func (log Recorder) Outcomes(ctx context.Context, result app.Result) {
 func (log Recorder) Summary(
 	ctx context.Context,
 	cfg config.Config,
+	access AccessIdentity,
 	result app.Result,
 	requestStats reddit.RequestPolicySnapshot,
 	postsHash string,
@@ -257,7 +276,7 @@ func (log Recorder) Summary(
 		slog.Int("posts_incomplete", summary.Incomplete),
 		slog.Uint64("comments", summary.Comments),
 		slog.Uint64("bodies_visited", summary.BodiesVisited),
-		slog.Uint64("more_requests", summary.MoreRequests),
+		slog.Uint64("expansion_requests", summary.ExpansionRequests),
 		slog.Uint64("continuation_requests", summary.ContinuationRequests),
 		slog.Uint64("counted_tokens", summary.CountedTokens),
 		slog.Int("distinct_words", summary.DistinctWords),
@@ -271,8 +290,60 @@ func (log Recorder) Summary(
 		slog.String("post_ids_sha256", postIDsHash),
 		slog.String("dictionary_sha256", dictionaryHash),
 	}
+	attributes = appendAccessIdentityAttrs(attributes, access)
 	attributes = appendBuildIdentityAttrs(attributes, currentLogBuildIdentity())
 	log.logger.LogAttrs(ctx, slog.LevelInfo, logMessageRunSummary, attributes...)
+}
+
+func appendAccessIdentityAttrs(attributes []slog.Attr, access AccessIdentity) []slog.Attr {
+	access = safeAccessIdentity(access)
+	return append(
+		attributes,
+		slog.String("access_profile", access.Profile),
+		slog.String("reddit_origin", access.Origin),
+		slog.String("reddit_method", access.Method),
+		slog.String("reddit_auth", access.Auth),
+		slog.String("ua_source", access.UserAgentSource),
+		slog.String("ua_sha256", access.UserAgentSHA256),
+	)
+}
+
+func safeAccessIdentity(access AccessIdentity) AccessIdentity {
+	if access.Profile != accessProfilePublicJSON {
+		access.Profile = unknownBuildLogValue
+	}
+	if access.Origin != accessOriginOldReddit {
+		access.Origin = unknownBuildLogValue
+	}
+	if access.Method != accessMethodGET {
+		access.Method = unknownBuildLogValue
+	}
+	if access.Auth != accessAuthNone {
+		access.Auth = unknownBuildLogValue
+	}
+	if access.UserAgentSource != userAgentSourceBuiltin && access.UserAgentSource != userAgentSourceOverride {
+		access.UserAgentSource = unknownBuildLogValue
+	}
+	if !validLowerHex(access.UserAgentSHA256, sha256DigestBytes*2) {
+		access.UserAgentSHA256 = unknownBuildLogValue
+	}
+	return access
+}
+
+const sha256DigestBytes = 32
+
+func validLowerHex(value string, length int) bool {
+	if len(value) != length {
+		return false
+	}
+	for _, character := range []byte(value) {
+		if character < '0' || character > '9' {
+			if character < 'a' || character > 'f' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // executionInputProfile binds evidence to the two exact assignment locators

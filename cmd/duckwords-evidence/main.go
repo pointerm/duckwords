@@ -17,8 +17,7 @@ import (
 
 const usage = `Usage:
   duckwords-evidence --result PATH --log PATH --output-dir DIR \
-    --exit-code 0|3 --binary PATH --policy-verified-at YYYY-MM-DD \
-    --approval-reference SAFE_ID
+    --exit-code 0 --binary PATH
 `
 
 func main() {
@@ -38,10 +37,8 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 	flags.StringVar(&cfg.ResultPath, "result", "", "captured canonical stdout JSON")
 	flags.StringVar(&cfg.LogPath, "log", "", "captured JSON operational log")
 	flags.StringVar(&cfg.OutputDir, "output-dir", "", "new evidence directory")
-	flags.IntVar(&cfg.ExitCode, "exit-code", -1, "DuckWords exit code (0 or 3)")
+	flags.IntVar(&cfg.ExitCode, "exit-code", -1, "DuckWords exit code (must be 0)")
 	flags.StringVar(&cfg.BinaryPath, "binary", "", "executed release binary")
-	flags.StringVar(&cfg.PolicyVerifiedAt, "policy-verified-at", "", "Reddit policy verification date")
-	flags.StringVar(&cfg.ApprovalReference, "approval-reference", "", "non-secret approval attestation reference")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		_, _ = fmt.Fprintf(stderr, "duckwords-evidence: invalid arguments\n%s", usage)
 		return 2
@@ -54,12 +51,11 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 }
 
 func validArguments(args []string) bool {
-	if len(args) != 14 {
+	if len(args) != 10 {
 		return false
 	}
 	allowed := map[string]struct{}{
 		"--result": {}, "--log": {}, "--output-dir": {}, "--exit-code": {}, "--binary": {},
-		"--policy-verified-at": {}, "--approval-reference": {},
 	}
 	seen := make(map[string]struct{}, len(allowed))
 	for index := 0; index < len(args); index += 2 {

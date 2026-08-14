@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -13,47 +12,55 @@ import (
 )
 
 const (
-	redditAPIEndpoint = "https://oauth.reddit.com"
+	redditPublicEndpoint = "https://old.reddit.com"
 
 	// A normal comment listing is much smaller than this. The default leaves room
 	// for large trees while preventing one response from exhausting process memory.
 	defaultMaxAPIResponseBytes  int64 = 16 << 20
 	absoluteMaxAPIResponseBytes int64 = 64 << 20
 	maxAPIHTTPTimeout                 = 2 * time.Minute
+	minUserAgentBytes                 = 8
+	maxUserAgentBytes                 = 256
 )
 
 var (
-	// ErrClientConfig identifies invalid or unsafe Reddit API client configuration.
-	ErrClientConfig = errors.New("invalid reddit API client configuration")
+	// ErrClientConfig identifies invalid or unsafe Reddit client configuration.
+	ErrClientConfig = errors.New("invalid reddit client configuration")
 	// ErrClientEndpoint identifies an endpoint that violates production or test policy.
-	ErrClientEndpoint = errors.New("invalid reddit API endpoint")
-	// ErrClientRedirect identifies a blocked Reddit API redirect.
-	ErrClientRedirect = errors.New("reddit API redirect blocked")
+	ErrClientEndpoint = errors.New("invalid reddit endpoint")
+	// ErrClientRedirect identifies a blocked Reddit redirect. Redirects are not
+	// followed because they may leave the pinned public origin or lead to an HTML
+	// login/interstitial page.
+	ErrClientRedirect = errors.New("reddit redirect blocked")
 )
 
-// ClientConfig contains the HTTP, authentication, and per-post resource policy for
-// a Reddit API client. A zero MaxResponseBytes or zero ThingLimits selects the
-// bounded package defaults; partially specified ThingLimits are rejected.
+// PostRef is the minimal validated input required to retrieve one post. JSONPath is
+// a relative old.reddit.com permalink path ending in "/.json"; it never contains a
+// query, fragment, credentials, host, or escaped bytes.
+type PostRef struct {
+	ID       string
+	JSONPath string
+}
+
+// ClientConfig contains the HTTP identity and per-post resource policy for a public
+// Reddit JSON client. A zero MaxResponseBytes or zero ThingLimits selects bounded
+// package defaults; partially specified ThingLimits are rejected.
 type ClientConfig struct {
-	HTTPClient  *http.Client
-	TokenSource *TokenSource
-	// RequestPolicy must be the same process-wide instance used by TokenSource. A
-	// nil value inherits the token source's policy for source compatibility.
-	RequestPolicy    *RequestPolicy
+	HTTPClient    *http.Client
+	UserAgent     string
+	RequestPolicy *RequestPolicy
+
 	MaxResponseBytes int64
 	ThingLimits      ThingLimits
 	// TraversalBudget is shared by every concurrent walk and admits accepted response
-	// bodies before they are read. A nil value constructs the bounded default for this
-	// Client; inject one instance into multiple clients when a process intentionally
-	// owns more than one.
+	// bodies before they are read. A nil value constructs the bounded default.
 	TraversalBudget *TraversalBudget
 }
 
-// Client retrieves and walks authenticated Reddit comment trees. A Client is safe
-// for concurrent use; all calls share one serialized morechildren gate.
+// Client retrieves and walks public Reddit comment trees. A Client is safe for
+// concurrent use; all focal-comment expansion attempts share one serialized gate.
 type Client struct {
 	httpClient       *http.Client
-	tokenSource      *TokenSource
 	apiBase          url.URL
 	userAgent        string
 	requestPolicy    *RequestPolicy
@@ -61,17 +68,21 @@ type Client struct {
 	thingLimits      ThingLimits
 	traversalBudget  *TraversalBudget
 
-	// Callers acquire by sending and release by receiving. Keeping the semaphore
-	// instance on the shared Client serializes the endpoint across concurrent posts
-	// without package-level mutable state.
-	moreGate chan struct{}
+	// Focal expansion requests are deliberately serialized across concurrent posts.
+	expansionGate chan struct{}
 }
 
-// NewClient constructs a Reddit client pinned to the official OAuth API origin.
-// Endpoint injection is intentionally unavailable to application configuration so
-// bearer tokens cannot be redirected to an arbitrary host.
+type endpointPolicy uint8
+
+const (
+	endpointProduction endpointPolicy = iota
+	endpointLoopbackTest
+)
+
+// NewClient constructs a client pinned to the public old.reddit.com HTTPS origin.
+// Endpoint injection is unavailable to application configuration.
 func NewClient(config ClientConfig) (*Client, error) {
-	return newClient(config, redditAPIEndpoint, endpointProduction)
+	return newClient(config, redditPublicEndpoint, endpointProduction)
 }
 
 // newTestClient accepts only a loopback origin and exists solely for deterministic
@@ -90,13 +101,10 @@ func newClient(config ClientConfig, endpoint string, policy endpointPolicy) (*Cl
 		return nil, err
 	}
 
-	// Copy the client so DuckWords can enforce a strict redirect policy without
-	// mutating a caller-owned dependency. The configured transport remains shared
-	// and must therefore obey net/http's concurrency-safety contract.
+	// Copy the client so the redirect and cookie policies do not mutate a
+	// caller-owned dependency. The transport remains shared and must be safe for
+	// concurrent use under net/http's contract.
 	httpClient := *config.HTTPClient
-	// Bearer API requests do not use cookies. Clearing a caller-owned jar prevents
-	// unrelated session cookies from crossing this security boundary or API cookies
-	// from being persisted by an external jar.
 	httpClient.Jar = nil
 	httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return ErrClientRedirect
@@ -104,14 +112,13 @@ func newClient(config ClientConfig, endpoint string, policy endpointPolicy) (*Cl
 
 	return &Client{
 		httpClient:       &httpClient,
-		tokenSource:      config.TokenSource,
 		apiBase:          *apiBase,
-		userAgent:        config.TokenSource.userAgent,
+		userAgent:        config.UserAgent,
 		requestPolicy:    requestPolicy,
 		maxResponseBytes: maxResponseBytes,
 		thingLimits:      thingLimits,
 		traversalBudget:  traversalBudget,
-		moreGate:         make(chan struct{}, 1),
+		expansionGate:    make(chan struct{}, 1),
 	}, nil
 }
 
@@ -125,16 +132,11 @@ func validateClientConfig(config ClientConfig) (int64, ThingLimits, *RequestPoli
 	if config.HTTPClient.Timeout <= 0 || config.HTTPClient.Timeout > maxAPIHTTPTimeout {
 		return 0, ThingLimits{}, nil, nil, fmt.Errorf("%w: HTTP timeout must be positive and at most %s", ErrClientConfig, maxAPIHTTPTimeout)
 	}
-	if config.TokenSource == nil || config.TokenSource.client == nil || config.TokenSource.now == nil ||
-		config.TokenSource.endpoint == "" || config.TokenSource.userAgent == "" || config.TokenSource.requestPolicy == nil {
-		return 0, ThingLimits{}, nil, nil, fmt.Errorf("%w: initialized token source is required", ErrClientConfig)
+	if !validUserAgent(config.UserAgent) {
+		return 0, ThingLimits{}, nil, nil, fmt.Errorf("%w: user agent must be %d-%d printable ASCII bytes", ErrClientConfig, minUserAgentBytes, maxUserAgentBytes)
 	}
-	requestPolicy := config.RequestPolicy
-	if requestPolicy == nil {
-		requestPolicy = config.TokenSource.requestPolicy
-	}
-	if requestPolicy != config.TokenSource.requestPolicy {
-		return 0, ThingLimits{}, nil, nil, fmt.Errorf("%w: client and token source must share one request policy", ErrClientConfig)
+	if config.RequestPolicy == nil {
+		return 0, ThingLimits{}, nil, nil, fmt.Errorf("%w: request policy is required", ErrClientConfig)
 	}
 
 	maxResponseBytes := config.MaxResponseBytes
@@ -156,9 +158,6 @@ func validateClientConfig(config ClientConfig) (int64, ThingLimits, *RequestPoli
 	traversalBudget := config.TraversalBudget
 	if traversalBudget == nil {
 		budgetConfig := DefaultTraversalBudgetConfig()
-		// A caller may intentionally raise the per-response cap. The default shared
-		// budget must still admit one legal response, while custom injected budgets
-		// retain their explicit independent policy.
 		if budgetConfig.MaxInFlightResponseBytes < maxResponseBytes {
 			budgetConfig.MaxInFlightResponseBytes = maxResponseBytes
 		}
@@ -171,7 +170,19 @@ func validateClientConfig(config ClientConfig) (int64, ThingLimits, *RequestPoli
 	if traversalBudget.responseBytes == nil || traversalBudget.maxResponse < maxResponseBytes || traversalBudget.maxRetained <= 0 {
 		return 0, ThingLimits{}, nil, nil, fmt.Errorf("%w: traversal budget cannot admit configured response limit", ErrClientConfig)
 	}
-	return maxResponseBytes, thingLimits, requestPolicy, traversalBudget, nil
+	return maxResponseBytes, thingLimits, config.RequestPolicy, traversalBudget, nil
+}
+
+func validUserAgent(value string) bool {
+	if len(value) < minUserAgentBytes || len(value) > maxUserAgentBytes || strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, character := range []byte(value) {
+		if character < 0x20 || character > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 func validateAPIEndpoint(endpoint string, policy endpointPolicy) (*url.URL, error) {
@@ -183,7 +194,7 @@ func validateAPIEndpoint(endpoint string, policy endpointPolicy) (*url.URL, erro
 
 	switch policy {
 	case endpointProduction:
-		if parsed.Scheme != "https" || parsed.Host != "oauth.reddit.com" || endpoint != redditAPIEndpoint {
+		if parsed.Scheme != "https" || parsed.Host != "old.reddit.com" || endpoint != redditPublicEndpoint {
 			return nil, ErrClientEndpoint
 		}
 	case endpointLoopbackTest:
@@ -197,51 +208,51 @@ func validateAPIEndpoint(endpoint string, policy endpointPolicy) (*url.URL, erro
 	return parsed, nil
 }
 
-// WalkComments retrieves a post's initial listing, expands every reachable
-// morechildren placeholder, and visits each usable comment body exactly once. Any
-// returned error means the tree is incomplete and the caller must discard work
-// derived from earlier visitor calls.
+// WalkComments retrieves a post's initial public JSON listing, expands every
+// reachable placeholder through focal GET requests, and visits each usable body
+// exactly once. Any error means completeness was not proven and the caller must
+// discard work derived from prior visitor calls.
 func (c *Client) WalkComments(
 	ctx context.Context,
-	postID string,
+	post PostRef,
 	visit func(Comment) error,
 ) (WalkStats, error) {
 	var stats WalkStats
-	if c == nil || c.httpClient == nil || c.tokenSource == nil || c.requestPolicy == nil || c.traversalBudget == nil || c.moreGate == nil {
+	if c == nil || c.httpClient == nil || c.requestPolicy == nil || c.traversalBudget == nil || c.expansionGate == nil {
 		return stats, newError(ErrorInvalidInput, EndpointComments, "", 0, ErrClientConfig)
 	}
 	if ctx == nil {
 		return stats, newError(ErrorInvalidInput, EndpointComments, "", 0, errMalformedResponse)
 	}
 	if err := ctx.Err(); err != nil {
-		return stats, newError(ErrorCanceled, EndpointComments, validDiagnosticPostID(postID), 0, err)
+		return stats, newError(ErrorCanceled, EndpointComments, validDiagnosticPostID(post.ID), 0, err)
 	}
-	if !validPostID(postID) {
-		return stats, newError(ErrorInvalidInput, EndpointComments, "", 0, errInvalidPostID)
+	if !validPostRef(post) {
+		return stats, newError(ErrorInvalidInput, EndpointComments, validDiagnosticPostID(post.ID), 0, errInvalidPostRef)
 	}
 	if visit == nil {
-		return stats, newError(ErrorInvalidInput, EndpointComments, postID, 0, errNilCommentVisitor)
+		return stats, newError(ErrorInvalidInput, EndpointComments, post.ID, 0, errNilCommentVisitor)
 	}
 
-	initial, err := c.requestAuthenticated(ctx, EndpointComments, postID, c.commentsRequest(postID))
+	initial, err := c.request(ctx, EndpointComments, post.ID, c.commentsRequest(post))
 	if err != nil {
 		return stats, err
 	}
-	fetch := func(fetchCtx context.Context, childIDs []string) (responsePayload, error) {
-		request, buildErr := c.moreChildrenRequest(postID, childIDs)
+	fetchExpansion := func(fetchCtx context.Context, childID string) (responsePayload, error) {
+		request, buildErr := c.focalRequest(post, childID, EndpointCommentExpansion)
 		if buildErr != nil {
 			return responsePayload{}, buildErr
 		}
-		return c.requestAuthenticated(fetchCtx, EndpointMoreChildren, postID, request)
+		return c.request(fetchCtx, EndpointCommentExpansion, post.ID, request)
 	}
 	fetchContinuation := func(fetchCtx context.Context, parentCommentID string) (responsePayload, error) {
-		request, buildErr := c.continuationRequest(postID, parentCommentID)
+		request, buildErr := c.focalRequest(post, parentCommentID, EndpointContinuation)
 		if buildErr != nil {
 			return responsePayload{}, buildErr
 		}
-		return c.requestAuthenticated(fetchCtx, EndpointContinuation, postID, request)
+		return c.request(fetchCtx, EndpointContinuation, post.ID, request)
 	}
-	return walkDecodedCompleteWithBudget(ctx, postID, initial.take(), c.thingLimits, c.traversalBudget, fetch, fetchContinuation, visit)
+	return walkDecodedCompleteWithBudget(ctx, post.ID, initial.take(), c.thingLimits, c.traversalBudget, fetchExpansion, fetchContinuation, visit)
 }
 
 func validDiagnosticPostID(postID string) string {
@@ -251,176 +262,111 @@ func validDiagnosticPostID(postID string) string {
 	return ""
 }
 
-// apiRequest is one fully specified Reddit API call. A non-empty form is sent as a
-// urlencoded request body; only /api/morechildren uses one.
+func validPostRef(post PostRef) bool {
+	if !validPostID(post.ID) || post.ID != strings.ToLower(post.ID) || !strings.HasPrefix(post.JSONPath, "/") ||
+		!strings.HasSuffix(post.JSONPath, "/.json") || strings.ContainsAny(post.JSONPath, "%?#\\") || strings.Contains(post.JSONPath, "//") {
+		return false
+	}
+	trimmed := strings.TrimSuffix(strings.TrimPrefix(post.JSONPath, "/"), "/.json")
+	segments := strings.Split(trimmed, "/")
+	idIndex := 1
+	switch {
+	case len(segments) >= 2 && len(segments) <= 3 && segments[0] == "comments":
+	case len(segments) >= 4 && len(segments) <= 5 && segments[0] == "r" && segments[2] == "comments" && validSubredditName(segments[1]):
+		idIndex = 3
+	default:
+		return false
+	}
+	if segments[idIndex] != post.ID {
+		return false
+	}
+	for _, segment := range segments {
+		if !validPublicPathSegment(segment) {
+			return false
+		}
+	}
+	return true
+}
+
+func validSubredditName(value string) bool {
+	return len(value) >= 2 && len(value) <= 21 && validPublicPathSegment(value)
+}
+
+func validPublicPathSegment(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range []byte(value) {
+		if !isASCIIAlphaNumeric(character) && character != '_' && character != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func isASCIIAlphaNumeric(character byte) bool {
+	return character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9'
+}
+
 type apiRequest struct {
-	method string
-	url    string
-	form   string
+	url string
 }
 
-func (c *Client) commentsRequest(postID string) apiRequest {
-	target := c.apiBase
-	target.Path = "/comments/" + postID
-	query := make(url.Values, 3)
-	query.Set("raw_json", "1")
-	query.Set("showmore", "true")
-	query.Set("sort", "confidence")
-	target.RawQuery = query.Encode()
-	return apiRequest{method: http.MethodGet, url: target.String()}
+func (c *Client) commentsRequest(post PostRef) apiRequest {
+	return c.publicRequest(post.JSONPath, "")
 }
 
-// continuationRequest uses the documented focal-comment view with zero parent context
-// to continue Reddit's depth-truncated t1__ placeholder. Keeping this distinct from
-// morechildren preserves both wire contracts and their independent request budgets.
-func (c *Client) continuationRequest(postID, parentCommentID string) (apiRequest, error) {
-	if !validPostID(postID) || !validCommentID(parentCommentID) {
-		return apiRequest{}, newError(ErrorInvalidInput, EndpointContinuation, validDiagnosticPostID(postID), 0, errMalformedResponse)
+func (c *Client) focalRequest(post PostRef, commentID string, endpoint Endpoint) (apiRequest, error) {
+	if !validPostRef(post) || !validCommentID(commentID) {
+		return apiRequest{}, newError(ErrorInvalidInput, endpoint, validDiagnosticPostID(post.ID), 0, errMalformedResponse)
 	}
+	return c.publicRequest(post.JSONPath, commentID), nil
+}
+
+func (c *Client) publicRequest(jsonPath, commentID string) apiRequest {
 	target := c.apiBase
-	target.Path = "/comments/" + postID
+	target.Path = jsonPath
 	query := make(url.Values, 6)
-	query.Set("comment", parentCommentID)
-	query.Set("context", "0")
+	if commentID != "" {
+		query.Set("comment", commentID)
+		query.Set("context", "0")
+	}
+	query.Set("limit", "500")
 	query.Set("raw_json", "1")
 	query.Set("showmore", "true")
 	query.Set("sort", "confidence")
 	target.RawQuery = query.Encode()
-	return apiRequest{method: http.MethodGet, url: target.String()}, nil
+	return apiRequest{url: target.String()}
 }
 
-// moreChildrenRequest builds the documented POST form for /api/morechildren. Reddit
-// specifies POST for this endpoint even though it only reads data, and a batch of
-// 100 comment IDs is well past a safe query-string length. Replaying it is therefore
-// still safe for the retry policy. raw_json stays on the query string, where Reddit
-// applies it uniformly to every request, so response bodies arrive unescaped.
-func (c *Client) moreChildrenRequest(postID string, childIDs []string) (apiRequest, error) {
-	if len(childIDs) == 0 || len(childIDs) > moreChildrenBatchSize {
-		return apiRequest{}, newError(ErrorInvalidInput, EndpointMoreChildren, postID, 0, errMalformedResponse)
-	}
-	for _, childID := range childIDs {
-		if !validCommentID(childID) {
-			return apiRequest{}, newError(ErrorInvalidInput, EndpointMoreChildren, postID, 0, errMalformedResponse)
-		}
-	}
-
-	target := c.apiBase
-	target.Path = "/api/morechildren"
-	target.RawQuery = "raw_json=1"
-	form := make(url.Values, 5)
-	form.Set("api_type", "json")
-	form.Set("children", strings.Join(childIDs, ","))
-	form.Set("limit_children", "false")
-	form.Set("link_id", "t3_"+postID)
-	form.Set("sort", "confidence")
-	return apiRequest{method: http.MethodPost, url: target.String(), form: form.Encode()}, nil
-}
-
-func (c *Client) requestAuthenticated(
-	ctx context.Context,
-	endpoint Endpoint,
-	postID string,
-	request apiRequest,
-) (responsePayload, error) {
-	token, err := c.tokenSource.Token(ctx)
-	if err != nil {
-		return responsePayload{}, c.classifyTokenError(ctx, endpoint, postID, err)
-	}
-	// Initial token acquisition owns its own bounded OAuth session. Start the
-	// bearer-request session only after a token is available so its elapsed budget
-	// describes this logical API request and its possible authentication replay.
+func (c *Client) request(ctx context.Context, endpoint Endpoint, postID string, spec apiRequest) (responsePayload, error) {
 	session := c.requestPolicy.newRetrySession()
-
-	payload, err := session.doAfterPayload(ctx, endpoint, postID, nil, c.requestGate(endpoint, postID), func(attemptCtx context.Context) (policyAttemptResult, error) {
-		return c.doAttempt(attemptCtx, endpoint, postID, request, token)
-	})
-	if !isUnauthorized(err) {
-		return payload.take(), err
-	}
-
-	// A 401 may mean that a still-cached token was revoked or expired early. Exact
-	// invalidation avoids evicting a newer token installed by a concurrent request;
-	// the logical request is replayed once and only once.
-	authenticationErr := err
-	c.tokenSource.Invalidate(token)
-	if session.remainingBudget() <= 0 {
-		return responsePayload{}, authenticationErr
-	}
-	session.recordAuthenticationReplay(endpoint, postID, authenticationErr)
-	// The observer is synchronous and may consume the remaining session time. Never
-	// start OAuth from the stale pre-observer snapshot.
-	remaining := session.remainingBudget()
-	if remaining <= 0 {
-		return responsePayload{}, authenticationErr
-	}
-	// Token refresh is part of this logical authentication replay. Bound its own
-	// OAuth retry session by the API session's remaining elapsed budget so nested
-	// retry policies cannot turn one configured 45s request budget into roughly 90s.
-	refreshCtx, cancelRefresh := context.WithTimeoutCause(ctx, remaining, errRetryBudget)
-	token, err = c.tokenSource.Token(refreshCtx)
-	refreshBudgetEnded := ctx.Err() == nil &&
-		(errors.Is(context.Cause(refreshCtx), errRetryBudget) || session.remainingBudget() <= 0)
-	cancelRefresh()
-	if err != nil {
-		if refreshBudgetEnded {
-			return responsePayload{}, authenticationErr
-		}
-		return responsePayload{}, c.classifyTokenError(ctx, endpoint, postID, err)
-	}
-	return session.doAfterPayload(ctx, endpoint, postID, authenticationErr, c.requestGate(endpoint, postID), func(attemptCtx context.Context) (policyAttemptResult, error) {
-		return c.doAttempt(attemptCtx, endpoint, postID, request, token)
+	return session.doAfterPayload(ctx, endpoint, postID, nil, c.requestGate(endpoint, postID), func(attemptCtx context.Context) (policyAttemptResult, error) {
+		return c.doAttempt(attemptCtx, endpoint, postID, spec)
 	})
 }
 
 func (c *Client) requestGate(endpoint Endpoint, postID string) policyAttemptGate {
-	if endpoint != EndpointMoreChildren {
+	if endpoint != EndpointCommentExpansion {
 		return nil
 	}
 	return func(ctx context.Context) (func(), error) {
-		if err := c.acquireMoreGate(ctx, postID); err != nil {
+		if err := c.acquireExpansionGate(ctx, postID); err != nil {
 			return nil, err
 		}
-		return c.releaseMoreGate, nil
+		return c.releaseExpansionGate, nil
 	}
 }
 
-func (c *Client) classifyTokenError(ctx context.Context, endpoint Endpoint, postID string, err error) error {
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return newError(ErrorCanceled, endpoint, postID, 0, ctxErr)
-	}
-	var adapterError *Error
-	if errors.As(err, &adapterError) {
-		return err
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return newError(ErrorCanceled, endpoint, postID, 0, err)
-	}
-	return newError(ErrorAuthentication, EndpointOAuthToken, "", 0, err)
-}
-
-// doAttempt performs one HTTP exchange. Each attempt builds its own request, so a
-// form body is recreated rather than replayed from a consumed reader.
-func (c *Client) doAttempt(
-	ctx context.Context,
-	endpoint Endpoint,
-	postID string,
-	spec apiRequest,
-	token string,
-) (policyAttemptResult, error) {
-	var body io.Reader
-	if spec.form != "" {
-		body = strings.NewReader(spec.form)
-	}
-	request, err := http.NewRequestWithContext(ctx, spec.method, spec.url, body)
+// doAttempt performs one GET exchange. A new request is built for every retry; the
+// request always has a nil body and carries neither authentication nor cookies.
+func (c *Client) doAttempt(ctx context.Context, endpoint Endpoint, postID string, spec apiRequest) (policyAttemptResult, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, spec.url, nil)
 	if err != nil {
 		return policyAttemptResult{}, newError(ErrorInvalidInput, endpoint, postID, 0, err)
 	}
 	request.Header.Set("Accept", "application/json")
-	request.Header.Set("Authorization", "Bearer "+token)
 	request.Header.Set("User-Agent", c.userAgent)
-	if spec.form != "" {
-		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	}
 
 	result, err := executePayloadAttempt(
 		ctx,
@@ -432,26 +378,25 @@ func (c *Client) doAttempt(
 		c.traversalBudget.acquireResponse,
 	)
 	if errors.Is(err, ErrClientRedirect) {
-		return result, newError(ErrorProtocol, endpoint, postID, 0, ErrClientRedirect)
+		statusCode := 0
+		var adapterErr *Error
+		if errors.As(err, &adapterErr) {
+			statusCode = adapterErr.StatusCode
+		}
+		return result, newError(ErrorAccess, endpoint, postID, statusCode, ErrClientRedirect)
 	}
 	return result, err
 }
 
-func (c *Client) acquireMoreGate(ctx context.Context, postID string) error {
+func (c *Client) acquireExpansionGate(ctx context.Context, postID string) error {
 	select {
-	case c.moreGate <- struct{}{}:
+	case c.expansionGate <- struct{}{}:
 		return nil
 	case <-ctx.Done():
-		return newError(ErrorCanceled, EndpointMoreChildren, postID, 0, ctx.Err())
+		return newError(ErrorCanceled, EndpointCommentExpansion, postID, 0, ctx.Err())
 	}
 }
 
-func (c *Client) releaseMoreGate() {
-	<-c.moreGate
-}
-
-func isUnauthorized(err error) bool {
-	var adapterError *Error
-	return errors.As(err, &adapterError) &&
-		adapterError.Class == ErrorAuthentication && adapterError.StatusCode == http.StatusUnauthorized
+func (c *Client) releaseExpansionGate() {
+	<-c.expansionGate
 }

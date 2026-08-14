@@ -304,7 +304,7 @@ func TestTraversalBudgetRetainedLeaseReleasesOnWalkFailure(t *testing.T) {
 	)
 	_, err = walkDecodedCompleteWithBudget(
 		context.Background(), "post1", responsePayload{data: initial}, limits, budget,
-		adaptMoreFetcher(unexpectedFetch(t)), nil, func(Comment) error { return nil },
+		adaptExpansionFetcher(unexpectedFetch(t)), nil, func(Comment) error { return nil },
 	)
 	assertErrorClass(t, err, ErrorResourceLimit)
 	if !errors.Is(err, errRetainedThingBudget) {
@@ -316,7 +316,7 @@ func TestTraversalBudgetRetainedLeaseReleasesOnWalkFailure(t *testing.T) {
 	one := testInitial(t, "post1", testComment("c1", "body", "t3_post1", ""))
 	stats, err := walkDecodedCompleteWithBudget(
 		context.Background(), "post1", responsePayload{data: one}, limits, budget,
-		adaptMoreFetcher(unexpectedFetch(t)), nil, func(Comment) error { return nil },
+		adaptExpansionFetcher(unexpectedFetch(t)), nil, func(Comment) error { return nil },
 	)
 	if err != nil || stats.Comments != 1 {
 		t.Fatalf("second walk stats = %#v, error = %v", stats, err)
@@ -334,7 +334,7 @@ func TestTraversalBudgetCancellationClassifiesAtWalkBoundary(t *testing.T) {
 	cancel()
 	_, err = walkDecodedCompleteWithBudget(
 		ctx, "post1", responsePayload{data: testInitial(t, "post1")}, DefaultThingLimits(), budget,
-		adaptMoreFetcher(unexpectedFetch(t)), nil, func(Comment) error { return nil },
+		adaptExpansionFetcher(unexpectedFetch(t)), nil, func(Comment) error { return nil },
 	)
 	assertErrorClass(t, err, ErrorCanceled)
 	if !errors.Is(err, context.Canceled) {
@@ -362,7 +362,7 @@ func TestWalkReleasesLeasedInitialResponseBeforeValidationReturn(t *testing.T) {
 		responsePayload{data: []byte(`{}`), release: release},
 		DefaultThingLimits(),
 		budget,
-		adaptMoreFetcher(unexpectedFetch(t)),
+		adaptExpansionFetcher(unexpectedFetch(t)),
 		nil,
 		func(Comment) error { return nil },
 	)
