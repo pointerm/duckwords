@@ -48,8 +48,6 @@ var (
 // Executor runs one validated DuckWords configuration.
 type Executor func(context.Context, config.Config, *slog.Logger) (app.Result, error)
 
-type executor = Executor
-
 type timeoutContextFactory func(context.Context, time.Duration) (context.Context, context.CancelFunc)
 
 // Run parses args, executes the application, and returns a stable process exit code.
