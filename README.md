@@ -228,6 +228,7 @@ make race          # race detector
 make lint          # pinned Staticcheck
 make vuln          # govulncheck
 make bench         # benchmarks with allocation counts
+make bench-text    # readable local text fixtures and focused counter benchmark
 make fuzz-smoke    # short fuzz campaigns
 make docker-verify # image build + native/container output parity
 make help          # every target
@@ -242,6 +243,8 @@ CI runs the same gates plus a secret scan and container parity on every push.
 - [docs/INTENTIONAL_TRADEOFFS.md](docs/INTENTIONAL_TRADEOFFS.md) — features and
   infrastructure deliberately kept outside the assignment scope, with the reason for
   each decision.
+- [BENCHMARKS.md](BENCHMARKS.md) — reproducible local text fixtures, measured
+  throughput, allocations, and interpretation limits.
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) — the single dependency
   (`golang.org/x/sync`) and its license.
 - [artifacts/](artifacts) — `review/` holds local, reproducible diagnostics;

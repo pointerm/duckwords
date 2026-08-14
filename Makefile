@@ -37,7 +37,7 @@ LDFLAGS = -X '$(BUILDINFO_PACKAGE).version=$(VERSION)' \
 	-X '$(BUILDINFO_PACKAGE).commit=$(COMMIT)' \
 	-X '$(BUILDINFO_PACKAGE).buildDate=$(BUILD_DATE)'
 
-.PHONY: help toolchain-check fmt fmt-check mod-tidy-check mod-verify vet lint vuln secret-scan test test-shuffle race fuzz-smoke bench \
+.PHONY: help toolchain-check fmt fmt-check mod-tidy-check mod-verify vet lint vuln secret-scan test test-shuffle race fuzz-smoke bench bench-text \
 	build fixture-build fixture-native docker-build docker-fixture-build docker-smoke \
 	evidence-build submission-build submission-capture submission-capture-test fixture-verify docker-verify run version verify
 
@@ -47,7 +47,7 @@ help: ## Show available targets.
 toolchain-check: ## Require the exact Go 1.26.6 toolchain.
 	@test "$$($(GO_RUN) env GOVERSION)" = "$(REQUIRED_GO_VERSION)"
 
-fmt fmt-check mod-tidy-check mod-verify vet lint vuln test test-shuffle race fuzz-smoke bench \
+fmt fmt-check mod-tidy-check mod-verify vet lint vuln test test-shuffle race fuzz-smoke bench bench-text \
 	build fixture-build evidence-build submission-build run version: toolchain-check
 
 fmt: ## Format all Go packages.
@@ -118,6 +118,9 @@ fuzz-smoke: ## Run short bounded fuzz campaigns; override FUZZ_TIME as needed.
 
 bench: ## Run core, application, source, and Reddit benchmarks with allocations.
 	$(GO_RUN) test -run='^$$' -bench=. -benchmem -count=$(BENCH_COUNT) ./internal/words ./internal/aggregate ./internal/source ./internal/reddit ./internal/app
+
+bench-text: ## Verify and benchmark the readable local text fixtures.
+	$(GO_RUN) test -run='^TestLocalTextFixtures$$' -bench='^BenchmarkCounterLocalTextFixtures$$' -benchmem -count=$(BENCH_COUNT) ./internal/words
 
 build: ## Build a reproducible local CLI binary.
 	mkdir -p bin
