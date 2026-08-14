@@ -152,6 +152,14 @@ func New(w io.Writer, options Options) (*Sink, error) {
 			if sensitiveGroup || sensitiveKey(originalKey) || sensitiveKey(attr.Key) ||
 				(attr.Value.Kind() == slog.KindAny && !safeStandardAnyAttr(attr)) {
 				attr.Value = slog.StringValue(redactedValue)
+				return attr
+			}
+			// slog renders a duration as "20s" in text but as a bare nanosecond
+			// integer in JSON. Emitting the canonical string keeps one readable,
+			// unit-bearing value in both encodings, so a JSON reader cannot mistake
+			// 20000000000 for seconds or milliseconds.
+			if attr.Value.Kind() == slog.KindDuration {
+				attr.Value = slog.StringValue(attr.Value.Duration().String())
 			}
 			return attr
 		},

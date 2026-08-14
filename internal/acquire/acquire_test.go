@@ -621,7 +621,7 @@ func TestValidateIsPureAndMatchesLoadPolicy(t *testing.T) {
 	}
 
 	invalid := validRemote
-	invalid.URL += "?secret=hidden"
+	invalid.URL += "#secret"
 	if err := Validate(invalid, validConfig); !errors.Is(err, ErrURLPolicy) {
 		t.Fatalf("Validate(invalid remote) error = %v, want ErrURLPolicy", err)
 	}
@@ -643,8 +643,9 @@ func TestValidateRemoteURLPolicy(t *testing.T) {
 		{name: "http", kind: KindPosts, raw: "http://" + postsHost + "/input"},
 		{name: "userinfo", kind: KindPosts, raw: "https://user:password@" + postsHost + "/input"},
 		{name: "port", kind: KindPosts, raw: "https://" + postsHost + ":443/input"},
-		{name: "query", kind: KindPosts, raw: "https://" + postsHost + "/input?token=secret"},
-		{name: "empty query", kind: KindPosts, raw: "https://" + postsHost + "/input?"},
+		{name: "query", kind: KindPosts, raw: "https://" + postsHost + "/input?token=value", ok: true},
+		{name: "empty query", kind: KindPosts, raw: "https://" + postsHost + "/input?", ok: true},
+		{name: "oversized query", kind: KindPosts, raw: "https://" + postsHost + "/input?q=" + strings.Repeat("a", maxSourceQueryBytes)},
 		{name: "fragment", kind: KindPosts, raw: "https://" + postsHost + "/input#secret"},
 		{name: "encoded path", kind: KindPosts, raw: "https://" + postsHost + "/owner/%69nput"},
 		{name: "encoded separator", kind: KindPosts, raw: "https://" + postsHost + "/owner%2finput"},
@@ -725,15 +726,18 @@ func FuzzValidateRemoteURL(f *testing.F) {
 			return
 		}
 
-		host, ok := allowedHost(kind)
+		host, ok := AllowedHost(kind)
 		if !ok {
 			t.Fatal("accepted unknown source kind")
 		}
 		if parsed.Scheme != "https" || parsed.Host != host || parsed.Hostname() != host {
 			t.Fatalf("accepted URL outside origin policy: scheme=%q host=%q", parsed.Scheme, parsed.Host)
 		}
-		if parsed.User != nil || parsed.Port() != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawPath != "" {
+		if parsed.User != nil || parsed.Port() != "" || parsed.Fragment != "" || parsed.RawPath != "" {
 			t.Fatal("accepted URL with ambiguous or sensitive components")
+		}
+		if len(parsed.RawQuery) > maxSourceQueryBytes {
+			t.Fatal("accepted URL with an unbounded query string")
 		}
 		if parsed.Path == "" || parsed.Path == "/" || strings.Contains(parsed.EscapedPath(), "%") {
 			t.Fatal("accepted invalid document path")
@@ -822,5 +826,39 @@ func assertZeroDocument(t *testing.T, document Document) {
 	t.Helper()
 	if document.Len() != 0 || len(document.Bytes()) != 0 || document.Provenance() != (Provenance{}) {
 		t.Fatalf("failure returned usable document: len=%d provenance=%+v", document.Len(), document.Provenance())
+	}
+}
+
+// TestLoadHTTPSPreservesQueryString covers raw-gist and CDN links whose query is
+// part of the resource identity. The query is forwarded verbatim but must never
+// reach provenance, which records the hostname only.
+func TestLoadHTTPSPreservesQueryString(t *testing.T) {
+	payload := []byte("alpha\nbeta\n")
+	const query = "token=private-looking-value&v=2"
+	var seen atomic.Value
+	server, client := newMappedTLSServer(t, postsHost, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		seen.Store(request.URL.RawQuery)
+		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = writer.Write(payload)
+	}))
+	defer server.Close()
+
+	document, err := Load(context.Background(), Spec{Kind: KindPosts, URL: "https://" + postsHost + "/owner/id/raw/posts.txt?" + query}, Config{
+		HTTPClient: client,
+		UserAgent:  testUserAgent,
+		MaxBytes:   int64(len(payload)),
+	})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got, _ := seen.Load().(string); got != query {
+		t.Fatalf("server saw query %q, want %q", got, query)
+	}
+	provenance := document.Provenance()
+	if provenance.Origin != postsHost {
+		t.Fatalf("Origin = %q, want the bare hostname", provenance.Origin)
+	}
+	if strings.Contains(fmt.Sprintf("%+v", provenance), "private-looking-value") {
+		t.Fatal("provenance retained the query string")
 	}
 }

@@ -299,6 +299,12 @@ func (runner *Runner) processPost(ctx context.Context, job indexedPost) postResu
 	// Counts from an unproven tree have no result meaning. Traversal work remains
 	// available for diagnostics, but token counts are deliberately reported as zero.
 	outcome.CountedTokens = 0
+	if status == OutcomeSkipped {
+		// A provably absent post is a reconciled outcome, not a run error. Reporting
+		// no error keeps it off the material path so strict mode does not cancel
+		// siblings over a post that no policy could ever make countable.
+		return postResult{index: job.index, outcome: outcome}
+	}
 	return postResult{index: job.index, outcome: outcome, err: err, fatal: fatal}
 }
 
@@ -323,9 +329,17 @@ func classifyPostError(err, visitorFailure error) (OutcomeStatus, bool, reddit.E
 			return OutcomeFailed, true, class, endpoint, statusCode
 		}
 		switch adapterErr.Class {
+		case reddit.ErrorNotFound:
+			// Absence is proven only by the post listing itself. A 404 from a
+			// morechildren or continuation expansion says the tree could not be
+			// completed, not that the post is gone, so it stays a failure.
+			if endpoint == reddit.EndpointComments {
+				return OutcomeSkipped, false, class, endpoint, statusCode
+			}
+			return OutcomeFailed, false, class, endpoint, statusCode
 		case reddit.ErrorIncomplete, reddit.ErrorResourceLimit:
 			return OutcomeIncomplete, false, class, endpoint, statusCode
-		case reddit.ErrorForbidden, reddit.ErrorNotFound, reddit.ErrorRateLimited,
+		case reddit.ErrorForbidden, reddit.ErrorRateLimited,
 			reddit.ErrorServer, reddit.ErrorTransport, reddit.ErrorProtocol:
 			return OutcomeFailed, false, class, endpoint, statusCode
 		case reddit.ErrorAuthentication, reddit.ErrorInvalidInput, reddit.ErrorVisitor,
@@ -433,7 +447,9 @@ func summarize(outcomes []PostOutcome, distinctWords int) (Summary, error) {
 	if summary.Completed+summary.Skipped+summary.Failed+summary.Incomplete != summary.Total {
 		return Summary{}, errMissingOutcome
 	}
-	summary.Partial = summary.Completed != summary.Total
+	// A provably absent post cannot contribute counts under any policy, so it does
+	// not make the result partial. Failed and incomplete posts do.
+	summary.Partial = summary.Completed+summary.Skipped != summary.Total
 	return summary, nil
 }
 

@@ -266,3 +266,57 @@ func (writer *sequenceErrorWriter) Write([]byte) (int, error) {
 	writer.index++
 	return 0, err
 }
+
+// TestDurationsRenderAsCanonicalStringsInBothFormats prevents the JSON encoding from
+// degrading a duration to a bare nanosecond integer, which a reader cannot tell from
+// seconds or milliseconds without knowing slog's internals.
+func TestDurationsRenderAsCanonicalStringsInBothFormats(t *testing.T) {
+	t.Parallel()
+
+	for _, format := range []Format{FormatText, FormatJSON} {
+		format := format
+		t.Run(string(format), func(t *testing.T) {
+			t.Parallel()
+
+			var output strings.Builder
+			sink, err := New(&output, Options{Level: LevelInfo, Format: format})
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			sink.Logger().Info("timings",
+				slog.Duration("request_timeout", 20*time.Second),
+				slog.Duration("global_timeout", 30*time.Minute),
+				slog.Duration("throttle_wait", 1500*time.Millisecond),
+			)
+			if err := sink.Err(); err != nil {
+				t.Fatalf("Err() = %v", err)
+			}
+
+			line := output.String()
+			for _, want := range []string{"20s", "30m0s", "1.5s"} {
+				if !strings.Contains(line, want) {
+					t.Fatalf("output does not contain %q:\n%s", want, line)
+				}
+			}
+			if strings.Contains(line, "20000000000") || strings.Contains(line, "1800000000000") {
+				t.Fatalf("output contains a raw nanosecond count:\n%s", line)
+			}
+			if format != FormatJSON {
+				return
+			}
+			var record map[string]any
+			if err := json.Unmarshal([]byte(line), &record); err != nil {
+				t.Fatalf("Unmarshal() error = %v; line = %s", err, line)
+			}
+			for key, want := range map[string]string{
+				"request_timeout": "20s",
+				"global_timeout":  "30m0s",
+				"throttle_wait":   "1.5s",
+			} {
+				if got, _ := record[key].(string); got != want {
+					t.Fatalf("%s = %#v, want the string %q", key, record[key], want)
+				}
+			}
+		})
+	}
+}

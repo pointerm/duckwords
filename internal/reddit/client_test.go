@@ -43,14 +43,15 @@ func TestClientWalkCommentsExactHTTPContractAndNestedExpansion(t *testing.T) {
 				testMore([]string{"extra"}, 1, "t3_post1"),
 			))
 		case "/api/morechildren":
-			assertExactRequest(t, request, http.MethodGet, url.Values{
-				"api_type":       {"json"},
-				"children":       {"extra"},
-				"limit_children": {"false"},
-				"link_id":        {"t3_post1"},
-				"raw_json":       {"1"},
-				"sort":           {"confidence"},
-			})
+			assertExactFormRequest(t, request,
+				url.Values{"raw_json": {"1"}},
+				url.Values{
+					"api_type":       {"json"},
+					"children":       {"extra"},
+					"limit_children": {"false"},
+					"link_id":        {"t3_post1"},
+					"sort":           {"confidence"},
+				})
 			_, _ = response.Write(testMoreResponse(t, nil,
 				testComment("extra", "expanded body", "t3_post1", nil),
 			))
@@ -218,7 +219,7 @@ func TestClientWalkCommentsBatchesMoreChildrenAtOneHundred(t *testing.T) {
 			_, _ = response.Write(testInitial(t, "post1", testMore(children, len(children), "t3_post1")))
 		case "/api/morechildren":
 			moreRequests.Add(1)
-			batch := strings.Split(request.URL.Query().Get("children"), ",")
+			batch := strings.Split(morePostForm(t, request).Get("children"), ",")
 			if len(batch) == 0 || len(batch) > moreChildrenBatchSize {
 				t.Errorf("children batch size = %d, want 1..%d", len(batch), moreChildrenBatchSize)
 			}
@@ -533,7 +534,7 @@ func TestClientConcurrentWalkCommentsSerializeMoreChildren(t *testing.T) {
 			postID := strings.TrimPrefix(request.URL.Path, "/comments/")
 			_, _ = response.Write(initialPayloads[postID])
 		case "/api/morechildren":
-			childID := request.URL.Query().Get("children")
+			childID := morePostForm(t, request).Get("children")
 			payload, ok := morePayloads[childID]
 			if !ok {
 				http.Error(response, "unexpected synthetic child", http.StatusBadRequest)
@@ -978,6 +979,30 @@ func assertExactRequest(tb testing.TB, request *http.Request, method string, que
 	}
 }
 
+// assertExactFormRequest checks a urlencoded POST. Reddit documents
+// /api/morechildren as POST, so its parameters travel in the request body while
+// raw_json stays on the query string.
+func assertExactFormRequest(tb testing.TB, request *http.Request, query, form url.Values) {
+	tb.Helper()
+	assertExactRequest(tb, request, http.MethodPost, query)
+	if got := request.Header.Get("Content-Type"); got != "application/x-www-form-urlencoded" {
+		tb.Errorf("Content-Type = %q, want application/x-www-form-urlencoded", got)
+	}
+	if got, want := morePostForm(tb, request).Encode(), form.Encode(); got != want {
+		tb.Errorf("form = %q, want %q", got, want)
+	}
+}
+
+// morePostForm parses the request body exactly once and returns only its posted
+// values, so a query parameter cannot satisfy an assertion about the body.
+func morePostForm(tb testing.TB, request *http.Request) url.Values {
+	tb.Helper()
+	if err := request.ParseForm(); err != nil {
+		tb.Fatalf("ParseForm() error = %v", err)
+	}
+	return request.PostForm
+}
+
 func assertClientError(tb testing.TB, err error, class ErrorClass, endpoint Endpoint, status int) {
 	tb.Helper()
 	if err == nil {
@@ -989,5 +1014,61 @@ func assertClientError(tb testing.TB, err error, class ErrorClass, endpoint Endp
 	}
 	if adapterError.Class != class || adapterError.Endpoint != endpoint || adapterError.StatusCode != status {
 		tb.Fatalf("error = %#v, want class=%q endpoint=%q status=%d", adapterError, class, endpoint, status)
+	}
+}
+
+// TestMoreChildrenRequestUsesDocumentedPostForm locks the wire contract for the one
+// endpoint Reddit documents as POST. A full 100-ID batch also shows why: the same
+// parameters on a query string would produce an impractically long URL.
+func TestMoreChildrenRequestUsesDocumentedPostForm(t *testing.T) {
+	t.Parallel()
+
+	client := &Client{apiBase: url.URL{Scheme: "https", Host: "oauth.reddit.com"}}
+
+	request, err := client.moreChildrenRequest("post1", []string{"aaa", "bbb"})
+	if err != nil {
+		t.Fatalf("moreChildrenRequest() error = %v", err)
+	}
+	if request.method != http.MethodPost {
+		t.Fatalf("method = %q, want POST", request.method)
+	}
+	if request.url != "https://oauth.reddit.com/api/morechildren?raw_json=1" {
+		t.Fatalf("url = %q; raw_json must stay on the query string", request.url)
+	}
+	form, err := url.ParseQuery(request.form)
+	if err != nil {
+		t.Fatalf("ParseQuery(form) error = %v", err)
+	}
+	want := url.Values{
+		"api_type":       {"json"},
+		"children":       {"aaa,bbb"},
+		"limit_children": {"false"},
+		"link_id":        {"t3_post1"},
+		"sort":           {"confidence"},
+	}
+	if form.Encode() != want.Encode() {
+		t.Fatalf("form = %q, want %q", form.Encode(), want.Encode())
+	}
+
+	batch := make([]string, moreChildrenBatchSize)
+	for index := range batch {
+		batch[index] = fmt.Sprintf("c%07d", index)
+	}
+	full, err := client.moreChildrenRequest("post1", batch)
+	if err != nil {
+		t.Fatalf("moreChildrenRequest(full batch) error = %v", err)
+	}
+	if len(full.url) > 128 {
+		t.Fatalf("url grew with the batch (%d bytes); IDs belong in the body", len(full.url))
+	}
+	if !strings.Contains(full.form, batch[moreChildrenBatchSize-1]) {
+		t.Fatal("form does not carry the whole batch")
+	}
+
+	if _, err := client.moreChildrenRequest("post1", nil); err == nil {
+		t.Fatal("moreChildrenRequest(empty) error = nil")
+	}
+	if _, err := client.moreChildrenRequest("post1", []string{"bad id"}); err == nil {
+		t.Fatal("moreChildrenRequest(invalid id) error = nil")
 	}
 }

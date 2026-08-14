@@ -12,7 +12,7 @@ const (
 )
 
 func validateRemoteURL(kind Kind, rawURL string) (*url.URL, error) {
-	host, ok := allowedHost(kind)
+	host, ok := AllowedHost(kind)
 	if !ok {
 		return nil, newLoadError(kind, ModeHTTPS, ErrInvalidSpec, 0, nil)
 	}
@@ -27,7 +27,11 @@ func validateRemoteURL(kind Kind, rawURL string) (*url.URL, error) {
 	if parsed.Scheme != "https" || parsed.Opaque != "" || parsed.User != nil || parsed.Host != host {
 		return nil, newLoadError(kind, ModeHTTPS, ErrURLPolicy, 0, nil)
 	}
-	if parsed.Port() != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+	// A query string is part of a legitimate raw-gist or CDN link, so it is accepted
+	// and forwarded verbatim. It is never logged or persisted: provenance records the
+	// hostname only, and errors never format the requested URL. A fragment is dropped
+	// by HTTP anyway, so accepting one would silently change the requested resource.
+	if parsed.Port() != "" || parsed.Fragment != "" || len(parsed.RawQuery) > maxSourceQueryBytes {
 		return nil, newLoadError(kind, ModeHTTPS, ErrURLPolicy, 0, nil)
 	}
 	if parsed.Path == "" || parsed.Path == "/" || parsed.RawPath != "" || strings.Contains(parsed.EscapedPath(), "%") {
@@ -40,7 +44,10 @@ func validateRemoteURL(kind Kind, rawURL string) (*url.URL, error) {
 	return parsed, nil
 }
 
-func allowedHost(kind Kind) (string, bool) {
+// AllowedHost returns the single HTTPS host from which a source of this kind may be
+// downloaded. Configuration layers use it to reject an unusable URL with an accurate
+// message instead of deferring to a generic acquisition failure.
+func AllowedHost(kind Kind) (string, bool) {
 	switch kind {
 	case KindPosts:
 		return postsHost, true

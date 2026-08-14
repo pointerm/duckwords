@@ -91,8 +91,11 @@ type OutcomeStatus string
 const (
 	// OutcomeCompleted means the complete post-local count was merged.
 	OutcomeCompleted OutcomeStatus = "completed"
-	// OutcomeSkipped is reserved for a future adapter signal that reliably proves an
-	// expected terminal state. HTTP 403/404 alone are not such a signal.
+	// OutcomeSkipped means the post provably does not exist: Reddit answered with
+	// HTTP 404 or a well-formed listing containing no post. A post that cannot exist
+	// can never be counted, so it is an expected absence rather than a failure. It
+	// contributes no counts, does not make the result partial, and does not trigger
+	// strict cancellation. HTTP 403 stays a failure because access may be restored.
 	OutcomeSkipped OutcomeStatus = "skipped"
 	// OutcomeFailed means the post ended in an API, transport, protocol, or fatal
 	// processing failure.
@@ -120,6 +123,8 @@ type PostOutcome struct {
 
 // Summary reconciles every unique input post. Comment and token totals include only
 // completed posts because incomplete post-local work is deliberately discarded.
+// Partial reports that at least one post that could have been counted was not;
+// provably absent posts are reconciled under Skipped and do not set it.
 type Summary struct {
 	Total                int    `json:"total"`
 	Completed            int    `json:"completed"`

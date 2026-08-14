@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pointerm/duckwords/internal/acquire"
 	"github.com/pointerm/duckwords/internal/logging"
 	"github.com/pointerm/duckwords/internal/words"
 )
@@ -105,6 +106,13 @@ var (
 	ErrDuplicateOption = errors.New("duplicate command option")
 	// ErrInvalidSource indicates an empty, unsafe, or malformed source selector.
 	ErrInvalidSource = errors.New("invalid input source")
+	// ErrSourceHostNotAllowed indicates a syntactically valid HTTPS URL that is not
+	// on the fixed origin allowlist for that input.
+	ErrSourceHostNotAllowed = errors.New("input URL host is not allowed")
+	// ErrSourcePathNotSupported indicates a URL on the correct origin whose path or
+	// query violates the acquisition policy. It is distinct from a host rejection so
+	// the diagnostic does not blame the part of the URL that was already correct.
+	ErrSourcePathNotSupported = errors.New("input URL path or query is not supported")
 	// ErrRateLimitOutOfRange indicates a non-finite or unsupported request rate.
 	ErrRateLimitOutOfRange = errors.New("rate limit out of range")
 	// ErrRequestTimeoutOutOfRange indicates an unsupported per-attempt timeout.
@@ -121,13 +129,15 @@ var (
 
 const usage = `DuckWords counts dictionary words across complete Reddit comment trees.
 
+Running it with no options processes the assignment inputs with the defaults below.
+
 Usage:
   duckwords [options]
 
 Input (URL and file forms are mutually exclusive):
-  --posts-url URL               post list (default: supplied assignment URL)
+  --posts-url URL               post list; must be on gist.githubusercontent.com
   --posts-file PATH             read the post list from a local file
-  --dictionary-url URL          word bank (default: supplied assignment URL)
+  --dictionary-url URL          word bank; must be on raw.githubusercontent.com
   --dictionary-file PATH        read the word bank from a local file
 Selection:
   --filter PATTERN              exact or '*' wildcard filter; repeatable
@@ -147,13 +157,14 @@ Information:
   -h, --help                    show this help
 
 Environment (all required for processing; values are never accepted as flags):
-  REDDIT_API_ACCESS_APPROVED    exact value "true", only after Reddit approval
+  REDDIT_API_ACCESS_APPROVED    exact value "true"; set only after Reddit approval
   REDDIT_CLIENT_ID              approved confidential OAuth client ID
   REDDIT_CLIENT_SECRET          approved confidential OAuth client secret
-  REDDIT_USER_AGENT             truthful Reddit application identity
+  REDDIT_USER_AGENT             platform:app:version (by /u/name)
 
-Example after approval:
-  duckwords --failure-mode=best-effort --filter 'duck*'
+Examples:
+  duckwords
+  duckwords --filter 'duck*' --log-format=json
 `
 
 // FailureMode controls whether a per-post failure aborts the run or permits an
@@ -201,7 +212,9 @@ type Config struct {
 	LogLevel       logging.Level
 	LogFormat      logging.Format
 	ShowVersion    bool
-	RunRequested   bool
+	// RunRequested reports that this invocation should process data. It is false only
+	// for informational modes such as --version.
+	RunRequested bool
 }
 
 // Parse parses and validates command-line arguments without writing usage or errors
@@ -272,22 +285,26 @@ func Parse(args []string) (Config, error) {
 	}
 
 	explicit := make(map[string]bool)
+	processingOption := false
 	flags.Visit(func(option *flag.Flag) {
 		explicit[option.Name] = true
 		if option.Name != "version" {
-			cfg.RunRequested = true
+			processingOption = true
 		}
 	})
-	if cfg.ShowVersion && cfg.RunRequested {
+	if cfg.ShowVersion && processingOption {
 		return Config{}, fmt.Errorf("%w: --version cannot be combined with processing options", ErrConflictingMode)
 	}
+	// Processing is the default action: an invocation with no arguments runs the
+	// assignment configuration. Only the informational modes opt out.
+	cfg.RunRequested = !cfg.ShowVersion
 
 	var err error
-	cfg.Posts, err = selectSource("posts", postsURL, postsFile, explicit["posts-url"], explicit["posts-file"])
+	cfg.Posts, err = selectSource("posts", acquire.KindPosts, postsURL, postsFile, explicit["posts-url"], explicit["posts-file"])
 	if err != nil {
 		return Config{}, err
 	}
-	cfg.Dictionary, err = selectSource("dictionary", dictionaryURL, dictionaryFile, explicit["dictionary-url"], explicit["dictionary-file"])
+	cfg.Dictionary, err = selectSource("dictionary", acquire.KindDictionary, dictionaryURL, dictionaryFile, explicit["dictionary-url"], explicit["dictionary-file"])
 	if err != nil {
 		return Config{}, err
 	}
@@ -374,7 +391,11 @@ func Parse(args []string) (Config, error) {
 	return cfg, nil
 }
 
-func selectSource(name, urlValue, fileValue string, urlExplicit, fileExplicit bool) (InputSource, error) {
+// selectSource resolves one input to exactly one validated source. Remote URLs are
+// checked against the same acquisition policy that will later download them, so an
+// unusable origin is reported here as a configuration error with the allowed host
+// rather than surfacing later as an opaque setup failure.
+func selectSource(name string, kind acquire.Kind, urlValue, fileValue string, urlExplicit, fileExplicit bool) (InputSource, error) {
 	if urlExplicit && fileExplicit {
 		return InputSource{}, fmt.Errorf(
 			"%w: --%s-url and --%s-file cannot be combined",
@@ -387,10 +408,37 @@ func selectSource(name, urlValue, fileValue string, urlExplicit, fileExplicit bo
 		if err := validateFilePath(fileValue); err != nil {
 			return InputSource{}, fmt.Errorf("%w: --%s-file must be a non-empty local path", ErrInvalidSource, name)
 		}
+		if err := acquire.ValidateSpec(acquire.Spec{Kind: kind, File: fileValue}); err != nil {
+			return InputSource{}, fmt.Errorf("%w: --%s-file must be a non-empty local path", ErrInvalidSource, name)
+		}
 		return InputSource{Kind: SourceFile, Location: fileValue}, nil
 	}
-	if err := validateRemoteURL(urlValue); err != nil {
+	parsed, err := validateRemoteURL(urlValue)
+	if err != nil {
 		return InputSource{}, fmt.Errorf("%w: --%s-url must be an HTTPS URL without credentials or fragments", ErrInvalidSource, name)
+	}
+	host, ok := acquire.AllowedHost(kind)
+	if !ok {
+		return InputSource{}, fmt.Errorf("%w: --%s-url is not a supported input", ErrInvalidSource, name)
+	}
+	// Separate the host decision from the rest of the locator policy. Reporting a
+	// path or query problem as a wrong host sends the reader to the one part of the
+	// URL that was already correct.
+	if parsed.Hostname() != host {
+		return InputSource{}, fmt.Errorf(
+			"%w: --%s-url must be on %s",
+			ErrSourceHostNotAllowed,
+			name,
+			host,
+		)
+	}
+	if err := acquire.ValidateSpec(acquire.Spec{Kind: kind, URL: urlValue}); err != nil {
+		return InputSource{}, fmt.Errorf(
+			"%w: --%s-url is on %s but its path or query is not supported",
+			ErrSourcePathNotSupported,
+			name,
+			host,
+		)
 	}
 	return InputSource{Kind: SourceURL, Location: urlValue}, nil
 }
@@ -403,19 +451,24 @@ func validateFilePath(path string) error {
 	return nil
 }
 
-func validateRemoteURL(raw string) error {
+// validateRemoteURL checks the transport-independent safety rules and returns the
+// parsed URL so the caller can report a host decision separately from path policy.
+func validateRemoteURL(raw string) (*url.URL, error) {
 	if strings.TrimSpace(raw) != raw || strings.ContainsRune(raw, '\x00') {
-		return ErrInvalidSource
+		return nil, ErrInvalidSource
 	}
 	if len(raw) > 4<<10 {
-		return ErrInvalidSource
+		return nil, ErrInvalidSource
 	}
+	// A query string is legitimate for raw-gist and CDN links and is preserved. The
+	// acquisition layer applies the host and path policy; this check only rejects
+	// forms that are unsafe or that HTTP would silently discard.
 	parsed, err := url.ParseRequestURI(raw)
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" ||
-		parsed.Port() != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.RawPath != "" {
-		return ErrInvalidSource
+		parsed.Port() != "" || parsed.RawPath != "" {
+		return nil, ErrInvalidSource
 	}
-	return nil
+	return parsed, nil
 }
 
 // WriteUsage writes the stable command synopsis to w.

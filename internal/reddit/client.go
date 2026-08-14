@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -222,23 +223,23 @@ func (c *Client) WalkComments(
 		return stats, newError(ErrorInvalidInput, EndpointComments, postID, 0, errNilCommentVisitor)
 	}
 
-	initial, err := c.getAuthenticated(ctx, EndpointComments, postID, c.commentsURL(postID))
+	initial, err := c.requestAuthenticated(ctx, EndpointComments, postID, c.commentsRequest(postID))
 	if err != nil {
 		return stats, err
 	}
 	fetch := func(fetchCtx context.Context, childIDs []string) (responsePayload, error) {
-		requestURL, buildErr := c.moreChildrenURL(postID, childIDs)
+		request, buildErr := c.moreChildrenRequest(postID, childIDs)
 		if buildErr != nil {
 			return responsePayload{}, buildErr
 		}
-		return c.getAuthenticated(fetchCtx, EndpointMoreChildren, postID, requestURL)
+		return c.requestAuthenticated(fetchCtx, EndpointMoreChildren, postID, request)
 	}
 	fetchContinuation := func(fetchCtx context.Context, parentCommentID string) (responsePayload, error) {
-		requestURL, buildErr := c.continuationURL(postID, parentCommentID)
+		request, buildErr := c.continuationRequest(postID, parentCommentID)
 		if buildErr != nil {
 			return responsePayload{}, buildErr
 		}
-		return c.getAuthenticated(fetchCtx, EndpointContinuation, postID, requestURL)
+		return c.requestAuthenticated(fetchCtx, EndpointContinuation, postID, request)
 	}
 	return walkDecodedCompleteWithBudget(ctx, postID, initial.take(), c.thingLimits, c.traversalBudget, fetch, fetchContinuation, visit)
 }
@@ -250,7 +251,15 @@ func validDiagnosticPostID(postID string) string {
 	return ""
 }
 
-func (c *Client) commentsURL(postID string) string {
+// apiRequest is one fully specified Reddit API call. A non-empty form is sent as a
+// urlencoded request body; only /api/morechildren uses one.
+type apiRequest struct {
+	method string
+	url    string
+	form   string
+}
+
+func (c *Client) commentsRequest(postID string) apiRequest {
 	target := c.apiBase
 	target.Path = "/comments/" + postID
 	query := make(url.Values, 3)
@@ -258,15 +267,15 @@ func (c *Client) commentsURL(postID string) string {
 	query.Set("showmore", "true")
 	query.Set("sort", "confidence")
 	target.RawQuery = query.Encode()
-	return target.String()
+	return apiRequest{method: http.MethodGet, url: target.String()}
 }
 
-// continuationURL uses the documented focal-comment view with zero parent context
+// continuationRequest uses the documented focal-comment view with zero parent context
 // to continue Reddit's depth-truncated t1__ placeholder. Keeping this distinct from
 // morechildren preserves both wire contracts and their independent request budgets.
-func (c *Client) continuationURL(postID, parentCommentID string) (string, error) {
+func (c *Client) continuationRequest(postID, parentCommentID string) (apiRequest, error) {
 	if !validPostID(postID) || !validCommentID(parentCommentID) {
-		return "", newError(ErrorInvalidInput, EndpointContinuation, validDiagnosticPostID(postID), 0, errMalformedResponse)
+		return apiRequest{}, newError(ErrorInvalidInput, EndpointContinuation, validDiagnosticPostID(postID), 0, errMalformedResponse)
 	}
 	target := c.apiBase
 	target.Path = "/comments/" + postID
@@ -277,37 +286,41 @@ func (c *Client) continuationURL(postID, parentCommentID string) (string, error)
 	query.Set("showmore", "true")
 	query.Set("sort", "confidence")
 	target.RawQuery = query.Encode()
-	return target.String(), nil
+	return apiRequest{method: http.MethodGet, url: target.String()}, nil
 }
 
-func (c *Client) moreChildrenURL(postID string, childIDs []string) (string, error) {
+// moreChildrenRequest builds the documented POST form for /api/morechildren. Reddit
+// specifies POST for this endpoint even though it only reads data, and a batch of
+// 100 comment IDs is well past a safe query-string length. Replaying it is therefore
+// still safe for the retry policy. raw_json stays on the query string, where Reddit
+// applies it uniformly to every request, so response bodies arrive unescaped.
+func (c *Client) moreChildrenRequest(postID string, childIDs []string) (apiRequest, error) {
 	if len(childIDs) == 0 || len(childIDs) > moreChildrenBatchSize {
-		return "", newError(ErrorInvalidInput, EndpointMoreChildren, postID, 0, errMalformedResponse)
+		return apiRequest{}, newError(ErrorInvalidInput, EndpointMoreChildren, postID, 0, errMalformedResponse)
 	}
 	for _, childID := range childIDs {
 		if !validCommentID(childID) {
-			return "", newError(ErrorInvalidInput, EndpointMoreChildren, postID, 0, errMalformedResponse)
+			return apiRequest{}, newError(ErrorInvalidInput, EndpointMoreChildren, postID, 0, errMalformedResponse)
 		}
 	}
 
 	target := c.apiBase
 	target.Path = "/api/morechildren"
-	query := make(url.Values, 6)
-	query.Set("api_type", "json")
-	query.Set("children", strings.Join(childIDs, ","))
-	query.Set("limit_children", "false")
-	query.Set("link_id", "t3_"+postID)
-	query.Set("raw_json", "1")
-	query.Set("sort", "confidence")
-	target.RawQuery = query.Encode()
-	return target.String(), nil
+	target.RawQuery = "raw_json=1"
+	form := make(url.Values, 5)
+	form.Set("api_type", "json")
+	form.Set("children", strings.Join(childIDs, ","))
+	form.Set("limit_children", "false")
+	form.Set("link_id", "t3_"+postID)
+	form.Set("sort", "confidence")
+	return apiRequest{method: http.MethodPost, url: target.String(), form: form.Encode()}, nil
 }
 
-func (c *Client) getAuthenticated(
+func (c *Client) requestAuthenticated(
 	ctx context.Context,
 	endpoint Endpoint,
 	postID string,
-	requestURL string,
+	request apiRequest,
 ) (responsePayload, error) {
 	token, err := c.tokenSource.Token(ctx)
 	if err != nil {
@@ -319,7 +332,7 @@ func (c *Client) getAuthenticated(
 	session := c.requestPolicy.newRetrySession()
 
 	payload, err := session.doAfterPayload(ctx, endpoint, postID, nil, c.requestGate(endpoint, postID), func(attemptCtx context.Context) (policyAttemptResult, error) {
-		return c.getAttempt(attemptCtx, endpoint, postID, requestURL, token)
+		return c.doAttempt(attemptCtx, endpoint, postID, request, token)
 	})
 	if !isUnauthorized(err) {
 		return payload.take(), err
@@ -355,7 +368,7 @@ func (c *Client) getAuthenticated(
 		return responsePayload{}, c.classifyTokenError(ctx, endpoint, postID, err)
 	}
 	return session.doAfterPayload(ctx, endpoint, postID, authenticationErr, c.requestGate(endpoint, postID), func(attemptCtx context.Context) (policyAttemptResult, error) {
-		return c.getAttempt(attemptCtx, endpoint, postID, requestURL, token)
+		return c.doAttempt(attemptCtx, endpoint, postID, request, token)
 	})
 }
 
@@ -385,20 +398,29 @@ func (c *Client) classifyTokenError(ctx context.Context, endpoint Endpoint, post
 	return newError(ErrorAuthentication, EndpointOAuthToken, "", 0, err)
 }
 
-func (c *Client) getAttempt(
+// doAttempt performs one HTTP exchange. Each attempt builds its own request, so a
+// form body is recreated rather than replayed from a consumed reader.
+func (c *Client) doAttempt(
 	ctx context.Context,
 	endpoint Endpoint,
 	postID string,
-	requestURL string,
+	spec apiRequest,
 	token string,
 ) (policyAttemptResult, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	var body io.Reader
+	if spec.form != "" {
+		body = strings.NewReader(spec.form)
+	}
+	request, err := http.NewRequestWithContext(ctx, spec.method, spec.url, body)
 	if err != nil {
 		return policyAttemptResult{}, newError(ErrorInvalidInput, endpoint, postID, 0, err)
 	}
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Authorization", "Bearer "+token)
 	request.Header.Set("User-Agent", c.userAgent)
+	if spec.form != "" {
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
 
 	result, err := executePayloadAttempt(
 		ctx,

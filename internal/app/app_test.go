@@ -288,7 +288,6 @@ func TestRunBestEffortFailureMatrix(t *testing.T) {
 		{name: "resource limit", class: reddit.ErrorResourceLimit, wantStatus: OutcomeIncomplete},
 		{name: "protocol", class: reddit.ErrorProtocol, wantStatus: OutcomeFailed},
 		{name: "forbidden", class: reddit.ErrorForbidden, wantStatus: OutcomeFailed},
-		{name: "not found", class: reddit.ErrorNotFound, wantStatus: OutcomeFailed},
 		{name: "rate limited", class: reddit.ErrorRateLimited, wantStatus: OutcomeFailed},
 		{name: "server", class: reddit.ErrorServer, wantStatus: OutcomeFailed},
 		{name: "transport", class: reddit.ErrorTransport, wantStatus: OutcomeFailed},
@@ -1135,4 +1134,56 @@ func awaitValue[T any](tb testing.TB, values <-chan T, label string) T {
 		var zero T
 		return zero
 	}
+}
+
+// TestRunSkipsAbsentPostsWithoutPartialResult covers the assignment post list, which
+// deliberately contains deleted threads. A post that provably does not exist cannot
+// be counted under any policy, so it is reconciled as skipped rather than reported
+// as a failure that makes an otherwise complete run partial.
+func TestRunSkipsAbsentPostsWithoutPartialResult(t *testing.T) {
+	t.Parallel()
+
+	for _, mode := range []FailureMode{FailureModeBestEffort, FailureModeStrict} {
+		t.Run(string(mode), func(t *testing.T) {
+			t.Parallel()
+
+			posts := loadPosts(t, "gone", "good")
+			walker := walkerFunc(func(_ context.Context, postID string, visit func(reddit.Comment) error) (reddit.WalkStats, error) {
+				if postID == "gone" {
+					return reddit.WalkStats{}, adapterError(reddit.ErrorNotFound, reddit.EndpointComments, postID, 404)
+				}
+				if err := visit(reddit.Comment{ID: "c1", Body: "duck duck water"}); err != nil {
+					return reddit.WalkStats{}, err
+				}
+				return reddit.WalkStats{Comments: 1, BodiesVisited: 1}, nil
+			})
+
+			result, err := runnerRun(t, mode, walker, posts)
+			if err != nil {
+				t.Fatalf("Run() error = %v, want nil; an absent post must not fail the run", err)
+			}
+			if result.Summary.Partial {
+				t.Fatalf("Summary.Partial = true, want false; summary = %+v", result.Summary)
+			}
+			if result.Summary.Skipped != 1 || result.Summary.Completed != 1 || result.Summary.Failed != 0 {
+				t.Fatalf("summary = %+v, want one skipped and one completed", result.Summary)
+			}
+			if result.Outcomes[0].Status != OutcomeSkipped || result.Outcomes[0].ErrorClass != reddit.ErrorNotFound {
+				t.Fatalf("absent-post outcome = %#v, want skipped/not_found", result.Outcomes[0])
+			}
+			if result.Outcomes[0].CountedTokens != 0 {
+				t.Fatalf("skipped post contributed %d tokens", result.Outcomes[0].CountedTokens)
+			}
+			// The surviving post still produces the complete ranked result.
+			want := []aggregate.WordCount{{Word: "duck", Count: 2}, {Word: "water", Count: 1}}
+			if !slices.Equal(result.Words, want) {
+				t.Fatalf("Words = %#v, want %#v", result.Words, want)
+			}
+		})
+	}
+}
+
+func runnerRun(tb testing.TB, mode FailureMode, walker CommentWalker, posts source.PostList) (Result, error) {
+	tb.Helper()
+	return newRunner(tb, 2, mode, walker, nil).Run(context.Background(), posts)
 }

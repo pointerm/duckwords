@@ -57,6 +57,7 @@ var (
 	errNilMoreFetcher           = errors.New("nil morechildren fetcher")
 	errNilCommentVisitor        = errors.New("nil comment visitor")
 	errMalformedResponse        = errors.New("malformed reddit response")
+	errPostNotFound             = errors.New("reddit post does not exist")
 	errIncompleteTree           = errors.New("incomplete reddit comment tree")
 	errThingLimit               = errors.New("reddit thing limit exceeded")
 	errCommentLimit             = errors.New("reddit comment limit exceeded")
@@ -298,6 +299,12 @@ func walkDecodedCompleteWithBudget(
 	postChildren, err := decodeListing(roots[0])
 	if err != nil {
 		return stats, protocolError(EndpointComments, postID, err)
+	}
+	// A deleted or never-existing post returns a well-formed listing with no post
+	// thing. That is an expected terminal absence, not a protocol violation, so it
+	// is classified exactly like an HTTP 404 and callers can skip it explicitly.
+	if len(postChildren) == 0 {
+		return stats, newError(ErrorNotFound, EndpointComments, postID, 0, errPostNotFound)
 	}
 	if len(postChildren) != 1 {
 		return stats, protocolError(EndpointComments, postID, errMalformedResponse)

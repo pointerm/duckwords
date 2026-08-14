@@ -38,12 +38,28 @@ func Load(ctx context.Context, spec Spec, config Config) (Document, error) {
 // Validate checks the complete acquisition policy without filesystem or network I/O.
 // Composition code can validate every configured source before starting either load.
 func Validate(spec Spec, config Config) error {
-	mode := selectedMode(spec)
 	if config.MaxBytes <= 0 || config.MaxBytes > MaximumDocumentBytes {
-		return newLoadError(spec.Kind, mode, ErrInvalidConfig, 0, nil)
+		return newLoadError(spec.Kind, selectedMode(spec), ErrInvalidConfig, 0, nil)
 	}
-	if _, ok := allowedHost(spec.Kind); !ok {
-		return newLoadError(spec.Kind, mode, ErrInvalidSpec, 0, nil)
+	if err := ValidateSpec(spec); err != nil {
+		return err
+	}
+	if spec.File != "" {
+		return nil
+	}
+	if err := validateHTTPConfig(config); err != nil {
+		return newLoadError(spec.Kind, ModeHTTPS, ErrInvalidConfig, 0, nil)
+	}
+	return nil
+}
+
+// ValidateSpec checks only the source locator: the kind, the URL/file exclusivity,
+// and the fixed HTTPS host and path policy. It needs no HTTP client, so command-line
+// parsing can reject an unusable source before any dependency is constructed and
+// report the precise reason rather than a generic setup failure.
+func ValidateSpec(spec Spec) error {
+	if _, ok := AllowedHost(spec.Kind); !ok {
+		return newLoadError(spec.Kind, selectedMode(spec), ErrInvalidSpec, 0, nil)
 	}
 
 	hasURL := spec.URL != ""
@@ -57,13 +73,8 @@ func Validate(spec Spec, config Config) error {
 		}
 		return nil
 	}
-	if _, err := validateRemoteURL(spec.Kind, spec.URL); err != nil {
-		return err
-	}
-	if err := validateHTTPConfig(config); err != nil {
-		return newLoadError(spec.Kind, ModeHTTPS, ErrInvalidConfig, 0, nil)
-	}
-	return nil
+	_, err := validateRemoteURL(spec.Kind, spec.URL)
+	return err
 }
 
 func loadFile(ctx context.Context, spec Spec, maxBytes int64) (document Document, resultErr error) {

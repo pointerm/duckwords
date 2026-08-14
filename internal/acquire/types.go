@@ -14,6 +14,7 @@ const (
 	MaximumDocumentBytes int64 = 64 << 20
 
 	maxSourceLocatorBytes = 4 << 10
+	maxSourceQueryBytes   = 2 << 10
 	maxUserAgentBytes     = 256
 	maxRedirects          = 3
 )

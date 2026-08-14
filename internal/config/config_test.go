@@ -54,8 +54,8 @@ func TestParseDefaults(t *testing.T) {
 	if cfg.ShowVersion {
 		t.Fatal("ShowVersion = true, want false")
 	}
-	if cfg.RunRequested {
-		t.Fatal("RunRequested = true, want false")
+	if !cfg.RunRequested {
+		t.Fatal("RunRequested = false; a bare invocation must process the assignment inputs")
 	}
 }
 
@@ -258,15 +258,15 @@ func TestParseSelectsSourcesAndRequestsExecution(t *testing.T) {
 	}{
 		{
 			name:      "explicit post URL",
-			args:      []string{"--posts-url=https://example.test/posts.txt"},
-			wantPosts: InputSource{Kind: SourceURL, Location: "https://example.test/posts.txt"},
+			args:      []string{"--posts-url=https://gist.githubusercontent.com/example/raw/posts.txt"},
+			wantPosts: InputSource{Kind: SourceURL, Location: "https://gist.githubusercontent.com/example/raw/posts.txt"},
 			wantWords: InputSource{Kind: SourceURL, Location: DefaultDictionaryURL},
 		},
 		{
 			name:      "explicit dictionary URL",
-			args:      []string{"--dictionary-url=https://example.test/words.txt"},
+			args:      []string{"--dictionary-url=https://raw.githubusercontent.com/example/words.txt"},
 			wantPosts: InputSource{Kind: SourceURL, Location: DefaultPostsURL},
-			wantWords: InputSource{Kind: SourceURL, Location: "https://example.test/words.txt"},
+			wantWords: InputSource{Kind: SourceURL, Location: "https://raw.githubusercontent.com/example/words.txt"},
 		},
 		{
 			name:      "local files",
@@ -342,7 +342,6 @@ func TestParseRejectsInvalidSourcesWithoutEchoingValue(t *testing.T) {
 		{name: "HTTP URL", args: []string{"--posts-url=http://example.test/planted-location"}},
 		{name: "URL credentials", args: []string{"--dictionary-url=https://planted:secret@example.test/words.txt"}},
 		{name: "URL fragment", args: []string{"--posts-url=https://example.test/posts.txt#planted-location"}},
-		{name: "URL query", args: []string{"--posts-url=https://example.test/posts.txt?planted=location"}},
 		{name: "URL port", args: []string{"--dictionary-url=https://example.test:443/words.txt"}},
 		{name: "escaped URL path", args: []string{"--dictionary-url=https://example.test/%77ords.txt"}},
 		{name: "surrounding URL whitespace", args: []string{"--posts-url= https://example.test/posts.txt"}},
@@ -515,14 +514,95 @@ func TestWriteUsage(t *testing.T) {
 		"--log-format",
 		"--version",
 		"--help",
-		"REDDIT_API_ACCESS_APPROVED",
 		"REDDIT_CLIENT_ID",
 		"REDDIT_CLIENT_SECRET",
 		"REDDIT_USER_AGENT",
 		"--filter 'duck*'",
+		"REDDIT_API_ACCESS_APPROVED",
+		"gist.githubusercontent.com",
+		"raw.githubusercontent.com",
 	} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("usage does not contain %q:\n%s", want, output.String())
 		}
+	}
+}
+
+// TestParseRejectsSourceURLOutsideOriginAllowlist keeps the acquisition host policy
+// visible at the configuration boundary. Deferring it to acquisition produced an
+// exit-1 setup failure whose message pointed at Reddit credentials instead.
+func TestParseRejectsSourceURLOutsideOriginAllowlist(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		args []string
+		host string
+	}{
+		{name: "posts", args: []string{"--posts-url=https://example.test/posts.txt"}, host: "gist.githubusercontent.com"},
+		{name: "dictionary", args: []string{"--dictionary-url=https://example.test/words.txt"}, host: "raw.githubusercontent.com"},
+		{name: "posts host swapped", args: []string{"--posts-url=https://raw.githubusercontent.com/a/posts.txt"}, host: "gist.githubusercontent.com"},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := Parse(test.args)
+			if !errors.Is(err, ErrSourceHostNotAllowed) {
+				t.Fatalf("Parse() error = %v, want ErrSourceHostNotAllowed", err)
+			}
+			if !strings.Contains(err.Error(), test.host) {
+				t.Fatalf("error %q does not name the allowed host %q", err, test.host)
+			}
+		})
+	}
+}
+
+// TestParseSeparatesHostFromPathRejection keeps the two source-URL failures distinct.
+// Reporting a path problem as a wrong host sends the reader to the one part of the
+// URL that was already correct.
+func TestParseSeparatesHostFromPathRejection(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		args []string
+		want error
+	}{
+		{name: "wrong host", args: []string{"--posts-url=https://example.test/posts.txt"}, want: ErrSourceHostNotAllowed},
+		{name: "right host trailing slash", args: []string{"--posts-url=https://gist.githubusercontent.com/a/b/"}, want: ErrSourcePathNotSupported},
+		{name: "right host empty segment", args: []string{"--posts-url=https://gist.githubusercontent.com/a//b.txt"}, want: ErrSourcePathNotSupported},
+		{name: "right host relative segment", args: []string{"--posts-url=https://gist.githubusercontent.com/a/../b.txt"}, want: ErrSourcePathNotSupported},
+		{name: "dictionary wrong host", args: []string{"--dictionary-url=https://gist.githubusercontent.com/a/w.txt"}, want: ErrSourceHostNotAllowed},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := Parse(test.args)
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Parse() error = %v, want %v", err, test.want)
+			}
+			if errors.Is(err, ErrSourcePathNotSupported) && errors.Is(err, ErrSourceHostNotAllowed) {
+				t.Fatalf("Parse() error is both a host and a path rejection: %v", err)
+			}
+		})
+	}
+}
+
+// TestParseAcceptsQueryOnAllowedHost covers raw-gist links whose query is part of the
+// resource identity.
+func TestParseAcceptsQueryOnAllowedHost(t *testing.T) {
+	t.Parallel()
+
+	const raw = "https://gist.githubusercontent.com/owner/id/raw/posts.txt?token=value"
+	cfg, err := Parse([]string{"--posts-url=" + raw})
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if cfg.Posts.Location != raw {
+		t.Fatalf("Posts.Location = %q, want the query preserved", cfg.Posts.Location)
 	}
 }
