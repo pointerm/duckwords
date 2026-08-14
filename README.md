@@ -19,87 +19,146 @@ Illustrative output shape (not a live assignment result):
 ]
 ```
 
-Operational logs go to stderr only, so `duckwords > result.json` always yields a
-clean JSON document.
+Operational logs go to stderr only, so redirecting stdout yields a clean JSON
+document.
 
 ---
 
 ## Quick start
 
-### 1. Verify the runtime path — no credentials, no fixture network traffic
+You need Go and network access; `go.mod` declares the Go 1.26.6 toolchain and the
+first invocation may download it plus the single module dependency. No Reddit API
+key and no separate build command are required. Clone the repository, then run from
+its root. The Make helpers select the exact Go 1.26.6 toolchain.
 
 ```bash
-make fixture-native && cat artifacts/review/native-result.json
+git clone https://github.com/pointerm/duckwords.git
+cd duckwords
 ```
 
-This runs the real CLI and the real production wiring against an in-memory
-transport, and prints (a cold Go toolchain/module cache may still download build
-dependencies before the fixture starts):
-
-```json
-[
-  {
-    "word": "duck",
-    "count": 2
-  },
-  {
-    "word": "water",
-    "count": 1
-  }
-]
-```
-
-For the richer three-post synthetic scenario with nested replies, focal comment expansion,
-continuation, deduplication, and a top-10 tie boundary:
+### Run the assignment
 
 ```bash
-make synthetic-demo-verify
-cat examples/synthetic-demo/synthetic-output.json
+go run ./cmd/duckwords > result.json 2> application.log
 ```
 
-The checked-in [synthetic demo](examples/synthetic-demo) is explicitly non-live and
-is not a substitute for the assignment's 200-post application log.
+`result.json` may remain empty until processing finishes. After a successful or
+partial run it contains only the top-ten JSON result. `application.log` is updated
+as HTTP attempts finish, so progress is visible from another terminal:
 
-### 2. Attempt the live assignment run
+```bash
+tail -f application.log
+```
 
-The assignment owner directed the submission to use cookie-free `GET`
-requests to the fixed `https://old.reddit.com/.../.json` renderer rather than the
-OAuth Data API. DuckWords retains that narrow assignment-specific default; this is
-not a claim that anonymous JSON access is currently supported or available from
-every network.
+The observed live runs completed within the default 30-minute timeout. On a slower
+network, add `--timeout=2h`. To count only matching words:
 
-On 2026-08-14 the candidate's cookie-free CLI received HTTP `302` redirects to
-`/login` or HTTP `403` HTML responses for the supplied URLs. An existing browser
-profile returned `200 application/json` only while sending Reddit session state, so
-that did not demonstrate anonymous access. The default path does not send browser
-cookies, login credentials, or tokens. An explicitly enabled,
-local-only browser-session fallback is documented below for a reviewer who wants to
-try their own temporary session; its output must be identified as authenticated.
+```bash
+go run ./cmd/duckwords --timeout=2h --filter 'duck*' \
+  > result.json 2> application.log
+```
+
+This replaces the two local output files from the previous run.
+
+Exit `0` means every available post was processed completely. Exit `3` means the
+JSON is intentionally partial; the log identifies skipped, failed, or incomplete
+posts. `go run` maps every non-zero program status to shell status `1` and appends an
+`exit status N` line to stderr. Use the artifact helper below when the exact
+application status and a clean machine-readable log matter; it reports that status
+in its final message.
+
+### Optional browser-session fallback
+
+The default request is cookie-free. If Reddit redirects it to login or returns an
+HTML denial, a reviewer may retry with their **own temporary browser session**. Copy
+only the value after the browser request's `Cookie:` header, without the `Cookie:`
+prefix:
+
+```bash
+export REDDIT_BROWSER_COOKIE='name=value; another_name=value'
+
+# Optional: copy matching values from the same browser request, or omit these lines.
+export REDDIT_USER_AGENT='Mozilla/5.0 (...)'
+export REDDIT_BROWSER_ACCEPT_LANGUAGE='en-US,en;q=0.9'
+export REDDIT_BROWSER_SEC_CH_UA='"Chromium";v="140", "Not=A?Brand";v="24"'
+export REDDIT_BROWSER_SEC_CH_UA_MOBILE='?0'
+export REDDIT_BROWSER_SEC_CH_UA_PLATFORM='"macOS"'
+
+go run ./cmd/duckwords --timeout=2h \
+  > result.json 2> application.log
+
+unset REDDIT_BROWSER_COOKIE REDDIT_USER_AGENT REDDIT_BROWSER_ACCEPT_LANGUAGE \
+  REDDIT_BROWSER_SEC_CH_UA REDDIT_BROWSER_SEC_CH_UA_MOBILE \
+  REDDIT_BROWSER_SEC_CH_UA_PLATFORM
+```
+
+Only `REDDIT_BROWSER_COOKIE` is required; the other five environment variables are
+optional. An empty or malformed value is rejected. This direct run needs no separate
+build command and writes `result.json` plus `application.log` in the repository root.
+
+The cookie is sensitive and the `export` command may remain in shell history. Use a
+temporary session you own, never commit or share it, unset it immediately after the
+run, and sign out or revoke it afterwards. DuckWords sends it only to the fixed
+`old.reddit.com` origin, never logs it, never follows redirects, keeps no cookie jar,
+and does not persist response cookies. This is authenticated browser access, not
+OAuth and not proof that anonymous Reddit JSON access works.
+
+### Create the three review files
+
+For a cookie-free run, the same helper needs no separate build step:
+
+```bash
+make assignment-run ARGS='--timeout=2h'
+```
+
+For a browser-session capture, replace the `go run` command in the previous section
+with this helper command, then run the documented `unset`:
+
+```bash
+ASSIGNMENT_OUTPUT_DIR='artifacts/run/browser-session' \
+  make assignment-run ARGS='--timeout=2h'
+```
+
+The default helper creates `artifacts/run/result.json`, `application.log`, and
+`full-application.log`. The full log is the application log followed by a fixed
+marker and the exact JSON output. The helper refuses to overwrite an existing run;
+choose another directory when repeating it:
+
+```bash
+ASSIGNMENT_OUTPUT_DIR='artifacts/run/retry-2' \
+  make assignment-run ARGS='--timeout=2h'
+```
+
+Submit a run only when the helper reports application exit `0`. Exit `3` is a valid
+but explicitly partial JSON result; exit `1` is a failed run. GNU Make itself may
+return status `2` when the application reports any non-zero status; the helper's
+final `(exit N)` message is the application status.
+
+### Reviewed output examples
+
+Reviewers who cannot access Reddit can inspect an
+[unfiltered result](artifacts/captured-runs/2026-08-14/unfiltered/result.json) and a
+[`duck*`-filtered result](artifacts/captured-runs/2026-08-14/filter-duck/result.json)
+without running the CLI. Both are explicitly **partial authenticated browser-session
+snapshots**: 179 posts completed, 20 unavailable posts were skipped, and `18gfvqs`
+remained incomplete. They demonstrate the JSON shape and filter behavior, not a
+canonical complete submission. See the
+[capture notes](artifacts/captured-runs/2026-08-14/README.md).
+
+### Reddit access note
+
+The assignment implementation uses cookie-free `GET` requests to the fixed
+`https://old.reddit.com/.../.json` renderer by default. On 2026-08-14 that path
+returned login redirects or HTML denials from the candidate's environment; an
+existing browser session returned JSON. This is why the optional fallback is
+documented above.
 
 Reddit's current [Data API Wiki](https://support.reddithelp.com/hc/en-us/articles/16160319875092-Reddit-Data-API-Wiki)
 states that traffic without OAuth or login credentials will be blocked. Reddit has
 also [announced the shutdown of unauthenticated `.json` endpoints](https://www.reddit.com/r/modnews/comments/1tq9vxo/protecting_communities_from_scrapers_and_platform/).
-The assignment owner was informed of the observed behavior and asked the candidate
-to choose and explain the implementation approach independently.
-
-DuckWords rejects redirects, non-`200` responses, and non-JSON bodies. A 200-post
-result is complete only when the process exits `0`; offline and synthetic output must
-never be presented as a live assignment result.
-
-Reviewed examples from the 2026-08-14 live assignment-data runs are available as
-[an unfiltered result](artifacts/captured-runs/2026-08-14/unfiltered/result.json) and
-[a `duck*`-filtered result](artifacts/captured-runs/2026-08-14/filter-duck/result.json).
-Both are explicitly **partial authenticated browser-session snapshots**: 179 posts
-completed, 20 unavailable posts were skipped, and `18gfvqs` remained incomplete.
-They demonstrate the stdout format and filter behavior, not a canonical complete
-submission. See the [capture notes](artifacts/captured-runs/2026-08-14/README.md).
-
-```bash
-go run ./cmd/duckwords > result.json 2> application.log
-
-# In another terminal, follow sanitized request progress as it is written.
-tail -f application.log
-```
+DuckWords rejects redirects, non-`200` responses, and non-JSON bodies rather than
+silently accepting incomplete data. Browser-session output must always be identified
+as authenticated. A 200-post result is complete only when the application exits `0`.
 
 After each physical Reddit HTTP attempt completes, the log immediately receives an
 `event=http_attempt` record with only the operation, post ID, one-based attempt,
@@ -114,116 +173,27 @@ it with a printable 8–256 byte value, but this is optional and non-secret:
 export REDDIT_USER_AGENT='duckwords/0.2.0 (+https://github.com/pointerm/duckwords)'
 ```
 
-#### Optional local browser-session fallback
+### Offline verification
 
-If cookie-free access is blocked, a reviewer may optionally retry the ordinary local
-CLI with their **own temporary Reddit browser session**. This fallback is disabled by
-default and is enabled only by a valid, non-empty `REDDIT_BROWSER_COOKIE`; an empty
-value is rejected. It is an authenticated browser-session request, not OAuth, not
-Reddit's public Data API, and not proof that anonymous `.json` access works. Label
-any output from this mode accordingly.
-
-Avoid placing the cookie in a command, shell history, `.env` file, repository,
-application log, issue, or message. Build before introducing the cookie so the Go
-toolchain never inherits it. Then, in a Bash shell, read it interactively, export it
-only for this run, and clear it immediately afterwards:
+To verify the full application path without contacting Reddit or the remote input
+sources:
 
 ```bash
-make build
-
-read -rsp 'Paste only your own temporary Reddit Cookie header value: ' REDDIT_BROWSER_COOKIE
-printf '\n'
-export REDDIT_BROWSER_COOKIE
-
-# Optional: copy matching non-secret values from the same browser request.
-export REDDIT_USER_AGENT='<your browser User-Agent header>'
-export REDDIT_BROWSER_ACCEPT_LANGUAGE='<your browser Accept-Language header>'
-export REDDIT_BROWSER_SEC_CH_UA='<your browser Sec-CH-UA header>'
-export REDDIT_BROWSER_SEC_CH_UA_MOBILE='?0' # only ?0 or ?1
-export REDDIT_BROWSER_SEC_CH_UA_PLATFORM='<your browser Sec-CH-UA-Platform header>'
-
-scripts/run-assignment.sh
-
-unset REDDIT_BROWSER_COOKIE REDDIT_USER_AGENT REDDIT_BROWSER_ACCEPT_LANGUAGE
-unset REDDIT_BROWSER_SEC_CH_UA REDDIT_BROWSER_SEC_CH_UA_MOBILE
-unset REDDIT_BROWSER_SEC_CH_UA_PLATFORM
+make fixture-native
+cat artifacts/review/native-result.json
 ```
 
-Environment variables are not a secret store: the cookie remains in this shell until
-it is unset and may be visible to same-user process inspection, crash diagnostics, or
-other tooling while DuckWords runs. Use only a session you are authorized to use,
-never reuse or share somebody else's cookie, and sign out/revoke the session when the
-test is finished. Browser sessions may expire at any time. DuckWords sends the
-configured cookie only to its fixed Reddit request origin, never logs it, keeps no
-cookie jar, and deliberately ignores response `Set-Cookie` values, so it neither
-refreshes nor persists the session.
-
-This `.json` renderer is the assignment's public-page access contract, not a claim
-that anonymous access is part of Reddit's current supported OAuth Data API. Reddit
-may return a login redirect or HTML denial based on current access policy, session
-state, IP range, or network. DuckWords rejects every redirect and non-JSON response
-rather than following it or silently returning incomplete data; run the opt-in smoke
-from the same local network intended for the final capture.
-
-With no options it attempts to process the assignment inputs using the documented
-defaults. At 0.8 requests/second the 200 initial listings alone take about 4 minutes
-10 seconds after access succeeds. Every unresolved `more` child, continuation, and
-retry adds another paced request, so the actual duration depends on the live trees and
-is bounded by the 30-minute default unless a larger validated timeout is selected
-explicitly.
+The richer checked-in scenario covers nested replies, comment expansion,
+continuations, deduplication, and a top-10 tie boundary:
 
 ```bash
-# Only words starting with "duck".
-go run ./cmd/duckwords --filter 'duck*'
-
-# Machine-readable logs, more workers, JSON on stdout as always.
-go run ./cmd/duckwords --workers=8 --log-format=json
+make synthetic-demo-verify
+cat examples/synthetic-demo/synthetic-output.json
 ```
 
-Before the final 200-post run, validate the public endpoint from your own network
-with one supplied permalink in a local file:
-
-```bash
-printf '%s\n' 'https://old.reddit.com/r/duck/comments/<id>/<slug>/' > /tmp/duckwords-one-post.txt
-make reddit-smoke LIVE_REDDIT_SMOKE=true LIVE_POSTS_FILE=/tmp/duckwords-one-post.txt
-```
-
-The smoke is deliberately opt-in and never runs in CI. It uses one worker, 0.5
-requests/second, strict completeness, and writes only ignored output under
-`artifacts/review/reddit-smoke/`. It strips every `REDDIT_BROWSER_*` value so a stale
-session cannot make this cookie-free check look successful. If it returns `302` or
-`403`, the cookie-free path is unavailable from that environment. The optional
-personal-session fallback above may be used only as an authenticated run; never
-present it as cookie-free and do not use a proxy or hidden endpoint override.
-
-To create the three files requested for review, run the lightweight assignment
-helper. It invokes the main CLI once, forces JSON operational logs, and refuses to
-overwrite existing output files:
-
-```bash
-make assignment-run ARGS='--failure-mode=strict --timeout=2h'
-```
-
-This writes `artifacts/run/result.json`, `application.log`, and
-`full-application.log`. The full log contains the application log followed by a
-fixed marker and the exact JSON output, as requested by the assignment. Submit these
-files only after checking that the command exited `0`; exit `3` is an explicitly
-partial result. The directory is local and ignored by Git.
-
-### 3. Or via Docker
-
-```bash
-make docker-build
-docker run --rm \
-  duckwords:review
-```
-
-Pass `-e REDDIT_USER_AGENT` only when using the optional non-secret override. The
-direct-environment browser-session fallback is intentionally documented for local CLI
-use only; do not place a session cookie in an image, Compose file, or Docker command.
-
-**Requirements:** Go 1.26.6 (`make toolchain-check` verifies it); `jq` for synthetic
-log normalization; Docker for container parity and the secret-scan target.
+These are implementation checks, not live assignment results. `jq` is required only
+for synthetic-log normalization. Docker is optional; `make docker-verify` runs the
+container hardening and native/container parity checks.
 
 ---
 
@@ -414,8 +384,8 @@ and on pull requests.
   the bottleneck, and how it extrapolates to larger corpora.
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) — the single dependency
   (`golang.org/x/sync`) and its license.
-- [artifacts/](artifacts) — `review/` holds local, reproducible diagnostics;
-  `submission/` holds the captured run attached to the submission.
+- [artifacts/](artifacts) — `review/` holds local diagnostics, `run/` holds the
+  current local assignment output, and `captured-runs/` contains reviewed snapshots.
 
 ## Assignment inputs
 

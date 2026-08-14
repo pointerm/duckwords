@@ -22,7 +22,7 @@ env:
 
 jobs:
   verify:
-    name: Verify Go 1.26.6
+    name: Tests and quality gates
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
@@ -32,15 +32,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Go
+      - name: Set up the Go toolchain declared by go.mod
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.26.6"
+          go-version-file: go.mod
           cache: true
           cache-dependency-path: go.sum
-
-      - name: Verify selected toolchain
-        run: test "$(go env GOVERSION)" = "go1.26.6"
 
       - name: Validate automation definitions
         run: |
@@ -48,7 +45,7 @@ jobs:
           bash -n scripts/package-release.sh
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
 
-      - name: Run deterministic quality gates
+      - name: Run format, module, vet, test, race, and build checks
         run: make verify
 
       - name: Run bounded fuzz smoke
@@ -71,10 +68,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Set up Go
+      - name: Set up the Go toolchain declared by go.mod
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.26.6"
+          go-version-file: go.mod
           cache: true
           cache-dependency-path: go.sum
 
@@ -100,10 +97,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Go for native fixture parity
+      - name: Set up the Go toolchain declared by go.mod
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.26.6"
+          go-version-file: go.mod
           cache: true
           cache-dependency-path: go.sum
 

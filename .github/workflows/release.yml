@@ -28,7 +28,7 @@ env:
 
 jobs:
   package:
-    name: Verify and package Go 1.26.6 binaries
+    name: Verify source and package binaries
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -39,10 +39,10 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Set up Go
+      - name: Set up the Go toolchain declared by go.mod
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.26.6"
+          go-version-file: go.mod
           cache: true
           cache-dependency-path: go.sum
 
