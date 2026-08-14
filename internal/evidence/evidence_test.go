@@ -103,8 +103,9 @@ func TestFinalizeReconcilesSourceAndRedditRetryEvents(t *testing.T) {
 	log := canonicalTestLog("completed")
 	sourceRetry := `{"time":"2026-08-14T10:00:00.05Z","level":"WARN","msg":"request retry scheduled","event":"request_retry","operation":"source_download","source_kind":"posts","error_class":"http_status","http_status":503,"attempt":2,"delay":"100ms"}`
 	redditRetry := `{"time":"2026-08-14T10:00:00.5Z","level":"WARN","msg":"request retry scheduled","event":"request_retry","operation":"comments","post_id":"duck123","error_class":"server","http_status":503,"attempt":2,"delay":"500ms"}`
+	redditAttempt := `{"time":"2026-08-14T10:00:00.9Z","level":"INFO","msg":"HTTP attempt completed","event":"http_attempt","scope":"reddit","operation":"comments","post_id":"duck123","attempt":2,"result":"success","http_status":200,"duration":"1ms"}`
 	log = strings.Replace(log, "\n"+`{"time":"2026-08-14T10:00:00.1Z"`, "\n"+sourceRetry+"\n"+`{"time":"2026-08-14T10:00:00.1Z"`, 1)
-	log = strings.Replace(log, "\n"+`{"time":"2026-08-14T10:00:01Z"`, "\n"+redditRetry+"\n"+`{"time":"2026-08-14T10:00:01Z"`, 1)
+	log = strings.Replace(log, "\n"+`{"time":"2026-08-14T10:00:01Z"`, "\n"+redditRetry+"\n"+redditAttempt+"\n"+`{"time":"2026-08-14T10:00:01Z"`, 1)
 	log = strings.Replace(log, `"source_retries":0`, `"source_retries":1`, 1)
 	log = strings.Replace(log, `"reddit_retries":0`, `"reddit_retries":1`, 1)
 	log = strings.Replace(log, `"reddit_http_attempts":200`, `"reddit_http_attempts":201`, 1)
@@ -118,6 +119,16 @@ func TestFinalizeReconcilesSourceAndRedditRetryEvents(t *testing.T) {
 	}
 	if manifest.Requests.SourceRetries != 1 || manifest.Requests.RedditRetries != 1 {
 		t.Fatalf("request manifest = %#v", manifest.Requests)
+	}
+}
+
+func TestFinalizeRejectsMissingHTTPAttemptEvents(t *testing.T) {
+	t.Parallel()
+
+	log := removeLogLineContaining(canonicalTestLog("completed"), `"event":"http_attempt"`)
+	err := validateTestEvidence(canonicalTestResult(), log, 0)
+	if !errors.Is(err, ErrInvalidLog) {
+		t.Fatalf("validateTestEvidence() error = %v, want ErrInvalidLog", err)
 	}
 }
 
@@ -383,6 +394,10 @@ func TestFinalizeRejectsLogTamperingWithoutPublishing(t *testing.T) {
 		}},
 		{name: "wrong access profile", edit: func(value string) string {
 			return strings.Replace(value, `"access_profile":"old-reddit-public-json-v1"`, `"access_profile":"oauth"`, 1)
+		}},
+		{name: "browser session is not canonical evidence", edit: func(value string) string {
+			value = strings.ReplaceAll(value, `"access_profile":"old-reddit-public-json-v1"`, `"access_profile":"old-reddit-browser-session-json-v1"`)
+			return strings.ReplaceAll(value, `"reddit_auth":"none"`, `"reddit_auth":"browser-session"`)
 		}},
 		{name: "access identity changes", edit: func(value string) string {
 			return strings.Replace(value, `"ua_source":"builtin"`, `"ua_source":"override"`, 1)
@@ -830,6 +845,20 @@ func canonicalTestLog(lastOutcome string) string {
 		`{"time":"2026-08-14T10:00:00.2Z","level":"INFO","msg":"source parsed","event":"source_parsed","source_kind":"posts","stage":"parsed","entries":200,"source_sha256":"` + testPosts + `","posts_sha256":"` + testPostIDs + `"}`,
 		`{"time":"2026-08-14T10:00:00.3Z","level":"INFO","msg":"source loaded","event":"source_loaded","source_kind":"dictionary","source_mode":"https","source_origin":"raw.githubusercontent.com","source_bytes":200,"source_sha256":"` + testWords + `"}`,
 		`{"time":"2026-08-14T10:00:00.4Z","level":"INFO","msg":"source parsed","event":"source_parsed","source_kind":"dictionary","stage":"parsed","entries":3,"source_sha256":"` + testWords + `"}`,
+	}
+	for index := 1; index <= assignmentPostCount; index++ {
+		postID := fmt.Sprintf("post%03d", index)
+		if index == 1 {
+			postID = "duck123"
+		}
+		resultFields := `"result":"success","http_status":200`
+		if index == assignmentPostCount && lastOutcome == "failed" {
+			resultFields = `"result":"failure","http_status":503,"error_class":"server"`
+		}
+		if index == assignmentPostCount && lastOutcome == "skipped" {
+			resultFields = `"result":"failure","http_status":404,"error_class":"not_found"`
+		}
+		lines = append(lines, fmt.Sprintf(`{"time":"2026-08-14T10:00:00.5Z","level":"INFO","msg":"HTTP attempt completed","event":"http_attempt","scope":"reddit","operation":"comments","post_id":"%s","attempt":1,%s,"duration":"1ms"}`, postID, resultFields))
 	}
 	for index := 1; index <= assignmentPostCount; index++ {
 		postID, comments, bodies, tokens := fmt.Sprintf("post%03d", index), 0, 0, 0

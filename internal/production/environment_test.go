@@ -20,8 +20,16 @@ func TestResolveAccessIdentityUsesBuiltinWithoutCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveAccessIdentity() error = %v", err)
 	}
-	if len(lookups) != 1 || lookups[0] != envRedditUserAgent {
-		t.Fatalf("lookups = %v, want only %s", lookups, envRedditUserAgent)
+	wantLookups := []string{
+		envRedditUserAgent,
+		envRedditBrowserCookie,
+		envRedditBrowserAcceptLanguage,
+		envRedditBrowserSecCHUA,
+		envRedditBrowserSecCHUAMobile,
+		envRedditBrowserSecCHUAPlatform,
+	}
+	if fmt.Sprint(lookups) != fmt.Sprint(wantLookups) {
+		t.Fatalf("lookups = %v, want %v", lookups, wantLookups)
 	}
 	wantUserAgent := redditUserAgent()
 	wantDigest := fmt.Sprintf("%x", sha256.Sum256([]byte(wantUserAgent)))
@@ -30,6 +38,93 @@ func TestResolveAccessIdentityUsesBuiltinWithoutCredentials(t *testing.T) {
 		identity.UserAgentSource != userAgentSourceBuiltin ||
 		identity.UserAgentSHA256 != wantDigest || identity.UserAgent() != wantUserAgent {
 		t.Fatalf("identity = %+v, user agent = %q", identity, identity.UserAgent())
+	}
+}
+
+func TestResolveAccessIdentityAcceptsMinimalAndFullBrowserSessions(t *testing.T) {
+	t.Parallel()
+
+	const (
+		cookie    = "reddit_session=private-canary; loid=abc123"
+		userAgent = "Mozilla/5.0 DuckWords browser-session test"
+	)
+	tests := []struct {
+		name   string
+		values map[string]string
+	}{
+		{
+			name: "minimal",
+			values: map[string]string{
+				envRedditBrowserCookie: cookie,
+			},
+		},
+		{
+			name: "full allowlist",
+			values: map[string]string{
+				envRedditUserAgent:              userAgent,
+				envRedditBrowserCookie:          cookie,
+				envRedditBrowserAcceptLanguage:  "en-US,en;q=0.9",
+				envRedditBrowserSecCHUA:         `"Chromium";v="126", "Not.A/Brand";v="24"`,
+				envRedditBrowserSecCHUAMobile:   "?0",
+				envRedditBrowserSecCHUAPlatform: `"macOS"`,
+			},
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			identity, err := ResolveAccessIdentity(mapLookup(test.values))
+			if err != nil {
+				t.Fatalf("ResolveAccessIdentity() error = %v", err)
+			}
+			if identity.Profile != RedditBrowserSessionAccessProfile ||
+				identity.Auth != RedditBrowserSessionAuth || identity.browserHeaders() == nil ||
+				!identity.browserHeaders().Valid() || !validAccessIdentity(identity) {
+				t.Fatalf("identity = %+v, want valid browser-session identity", identity)
+			}
+			formatted := fmt.Sprintf("%v %#v", identity, identity)
+			for _, secret := range []string{cookie, userAgent, "Chromium", "macOS"} {
+				if strings.Contains(formatted, secret) {
+					t.Fatalf("formatted identity leaked %q: %q", secret, formatted)
+				}
+			}
+		})
+	}
+}
+
+func TestResolveAccessIdentityRejectsInvalidBrowserEnvironmentWithoutEchoingValues(t *testing.T) {
+	t.Parallel()
+
+	const canary = "browser-private-canary"
+	tests := []struct {
+		name   string
+		values map[string]string
+	}{
+		{name: "empty cookie", values: map[string]string{envRedditBrowserCookie: ""}},
+		{name: "cookie prefix", values: map[string]string{envRedditBrowserCookie: "Cookie: session=" + canary}},
+		{name: "cookie injection", values: map[string]string{envRedditBrowserCookie: "session=" + canary + "\r\nAuthorization: secret"}},
+		{name: "cookie unicode", values: map[string]string{envRedditBrowserCookie: "session=" + canary + "-качка"}},
+		{name: "cookie too large", values: map[string]string{envRedditBrowserCookie: "session=" + strings.Repeat("a", (16<<10)+1)}},
+		{name: "header without cookie", values: map[string]string{envRedditBrowserAcceptLanguage: canary}},
+		{name: "empty optional header", values: map[string]string{envRedditBrowserCookie: "session=ok", envRedditBrowserSecCHUA: ""}},
+		{name: "header injection", values: map[string]string{envRedditBrowserCookie: "session=ok", envRedditBrowserAcceptLanguage: "en\r\nX-Secret: " + canary}},
+		{name: "invalid mobile", values: map[string]string{envRedditBrowserCookie: "session=ok", envRedditBrowserSecCHUAMobile: canary}},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			identity, err := ResolveAccessIdentity(mapLookup(test.values))
+			if identity != (AccessIdentity{}) || !errors.Is(err, errEnvironmentConfig) {
+				t.Fatalf("identity = %+v, error = %v", identity, err)
+			}
+			if strings.Contains(err.Error(), canary) {
+				t.Fatalf("error leaked browser session value: %q", err)
+			}
+		})
 	}
 }
 
@@ -110,6 +205,12 @@ func TestContextWithAccessIdentityPreservesValidatedIdentity(t *testing.T) {
 	tampered.UserAgentSHA256 = strings.Repeat("0", 64)
 	if validAccessIdentity(tampered) {
 		t.Fatal("tampered identity was accepted")
+	}
+	tampered = identity
+	tampered.Profile = RedditBrowserSessionAccessProfile
+	tampered.Auth = RedditBrowserSessionAuth
+	if validAccessIdentity(tampered) {
+		t.Fatal("browser-session metadata without a browser session was accepted")
 	}
 }
 

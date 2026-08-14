@@ -65,8 +65,9 @@ const (
 	// MaxMaxRetries caps amplification of a failed request.
 	MaxMaxRetries = 5
 
-	// DefaultRetryBudget bounds total elapsed retry-session time for one logical
-	// request from session creation, including limiter waits and HTTP attempts.
+	// DefaultRetryBudget bounds cumulative HTTP-attempt, observer, and retry-backoff
+	// work for one logical request. Shared limiter/gate waits remain bounded by the
+	// global run timeout and do not consume this per-request budget.
 	DefaultRetryBudget = 45 * time.Second
 	// MinRetryBudget rejects zero and negative retry windows.
 	MinRetryBudget = time.Second
@@ -147,7 +148,7 @@ Reliability:
   --request-timeout DURATION    one HTTP attempt (default 20s; range 1s..2m)
   --timeout DURATION            global execution timeout (default 30m; range 1s..2h)
   --max-retries N               transient retries (default 3; range 0..5)
-  --retry-budget DURATION       total retry session (default 45s; range 1s..5m)
+  --retry-budget DURATION       HTTP/retry work per request (default 45s; range 1s..5m)
   --failure-mode MODE           best-effort or strict (default best-effort)
 Observability:
   --log-level LEVEL             debug, info, warn, or error (default info)
@@ -158,6 +159,10 @@ Information:
 
 Environment (optional; values are never accepted as flags):
   REDDIT_USER_AGENT             override the built-in public-request identity
+  REDDIT_BROWSER_COOKIE         own Cookie value; name=value pairs, max 16 KiB (sensitive)
+  REDDIT_BROWSER_ACCEPT_LANGUAGE, REDDIT_BROWSER_SEC_CH_UA,
+  REDDIT_BROWSER_SEC_CH_UA_MOBILE, REDDIT_BROWSER_SEC_CH_UA_PLATFORM
+                                optional printable-ASCII browser-session headers
 
 Examples:
   duckwords

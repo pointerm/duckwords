@@ -13,6 +13,8 @@
 /artifacts/review/
 /artifacts/submission/
 /artifacts/**/*.capture-lock/
+/artifacts/application.log
+/artifacts/result.json
 
 # Local configuration and secrets.
 .env*

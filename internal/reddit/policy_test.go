@@ -157,6 +157,7 @@ func TestRequestPolicyRetriesWithRetryAfterAndSanitizedObserver(t *testing.T) {
 
 	clock := newPolicyTestClock()
 	var events []RetryEvent
+	var attemptEvents []AttemptEvent
 	policy := mustPolicyForTest(t, clock, RequestPolicyConfig{
 		RequestsPerSecond: maxRequestsPerSecond,
 		MaxRetries:        2,
@@ -164,17 +165,19 @@ func TestRequestPolicyRetriesWithRetryAfterAndSanitizedObserver(t *testing.T) {
 		InitialBackoff:    100 * time.Millisecond,
 		MaxBackoff:        5 * time.Second,
 		Observer:          func(event RetryEvent) { events = append(events, event) },
+		AttemptObserver:   func(event AttemptEvent) { attemptEvents = append(attemptEvents, event) },
 	})
 	attempts := 0
 	payload, err := policy.do(context.Background(), EndpointComments, "post1", func(context.Context) (policyAttemptResult, error) {
 		attempts++
 		if attempts == 1 {
 			return policyAttemptResult{
-				attempted: true,
-				headers:   responsePolicyHeaders{retryAfter: "2"},
+				attempted:  true,
+				statusCode: http.StatusTooManyRequests,
+				headers:    responsePolicyHeaders{retryAfter: "2"},
 			}, newError(ErrorRateLimited, EndpointComments, "post1", http.StatusTooManyRequests, errors.New("secret-bearing raw error"))
 		}
-		return policyAttemptResult{attempted: true, payload: []byte("accepted")}, nil
+		return policyAttemptResult{attempted: true, statusCode: http.StatusOK, payload: []byte("accepted")}, nil
 	})
 	if err != nil || string(payload) != "accepted" || attempts != 2 {
 		t.Fatalf("policy.do() = %q, %v after %d attempts", payload, err, attempts)
@@ -189,12 +192,71 @@ func TestRequestPolicyRetriesWithRetryAfterAndSanitizedObserver(t *testing.T) {
 	if len(events) != 1 || events[0] != wantEvent {
 		t.Fatalf("retry events = %#v, want %#v", events, wantEvent)
 	}
+	wantAttempts := []AttemptEvent{
+		{Endpoint: EndpointComments, PostID: "post1", Attempt: 1, Class: ErrorRateLimited, StatusCode: http.StatusTooManyRequests},
+		{Endpoint: EndpointComments, PostID: "post1", Attempt: 2, Succeeded: true, StatusCode: http.StatusOK},
+	}
+	if !slices.Equal(attemptEvents, wantAttempts) {
+		t.Fatalf("attempt events = %#v, want %#v", attemptEvents, wantAttempts)
+	}
 	snapshot := policy.Snapshot()
 	if snapshot.HTTPAttempts != 2 || snapshot.Retries != 1 || snapshot.ThrottleWaitCount != 0 {
 		t.Fatalf("snapshot = %#v, want two attempts and one retry", snapshot)
 	}
 	if formatted := fmt.Sprintf("%#v", events); strings.Contains(formatted, "secret-bearing") {
 		t.Fatalf("observer event leaked underlying error: %s", formatted)
+	}
+}
+
+func TestAttemptObserverPublishesBeforeLogicalRequestReturns(t *testing.T) {
+	t.Parallel()
+
+	clock := newPolicyTestClock()
+	observed := make(chan AttemptEvent, 1)
+	releaseObserver := make(chan struct{})
+	policy := mustPolicyForTest(t, clock, RequestPolicyConfig{
+		RequestsPerSecond: maxRequestsPerSecond,
+		MaxRetries:        0,
+		MaxRetryElapsed:   10 * time.Second,
+		InitialBackoff:    time.Second,
+		MaxBackoff:        time.Second,
+		AttemptObserver: func(event AttemptEvent) {
+			observed <- event
+			<-releaseObserver
+		},
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := policy.do(context.Background(), EndpointComments, "post1", func(context.Context) (policyAttemptResult, error) {
+			return policyAttemptResult{attempted: true, statusCode: http.StatusOK}, nil
+		})
+		done <- err
+	}()
+
+	var event AttemptEvent
+	select {
+	case event = <-observed:
+	case <-time.After(time.Second):
+		t.Fatal("attempt observer was not called while the request was running")
+	}
+	if event.Endpoint != EndpointComments || event.PostID != "post1" || event.Attempt != 1 ||
+		!event.Succeeded || event.StatusCode != http.StatusOK {
+		t.Fatalf("attempt event = %#v", event)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("policy.do() returned before synchronous attempt logging completed: %v", err)
+	default:
+	}
+	close(releaseObserver)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("policy.do() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("policy.do() did not return after attempt logging completed")
 	}
 }
 
@@ -350,7 +412,7 @@ func TestRequestPolicyElapsedBudgetPreventsLateAttempt(t *testing.T) {
 	}
 }
 
-func TestRequestPolicyInitialLimiterWaitHonorsElapsedBudget(t *testing.T) {
+func TestRequestPolicyInitialLimiterWaitDoesNotConsumeRetryWorkBudget(t *testing.T) {
 	t.Parallel()
 
 	clock := newPolicyTestClock()
@@ -370,17 +432,27 @@ func TestRequestPolicyInitialLimiterWaitHonorsElapsedBudget(t *testing.T) {
 		t.Fatalf("first policy.do() error = %v", err)
 	}
 
-	_, err := policy.do(context.Background(), EndpointComments, "post2", attempt)
-	assertClientError(t, err, ErrorTransport, EndpointComments, 0)
-	if !errors.Is(err, errRetryBudget) || errors.Is(err, context.Canceled) ||
-		errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("second policy.do() error = %v, want internal non-cancellation budget failure", err)
+	var secondAttemptBudget time.Duration
+	_, err := policy.do(context.Background(), EndpointComments, "post2", func(attemptCtx context.Context) (policyAttemptResult, error) {
+		attempts++
+		deadline, ok := attemptCtx.Deadline()
+		if !ok {
+			t.Fatal("second attempt context has no retry-work deadline")
+		}
+		secondAttemptBudget = time.Until(deadline)
+		return policyAttemptResult{attempted: true}, nil
+	})
+	if err != nil {
+		t.Fatalf("second policy.do() error = %v", err)
 	}
-	if attempts != 1 {
-		t.Fatalf("HTTP attempts = %d, want no initial request after limiter delay exceeds session budget", attempts)
+	if attempts != 2 {
+		t.Fatalf("HTTP attempts = %d, want both requests attempted", attempts)
 	}
-	if got := clock.delays(); len(got) != 0 {
-		t.Fatalf("limiter delays = %v, want refusal before an over-budget wait", got)
+	if secondAttemptBudget <= 0 {
+		t.Fatalf("second attempt retry-work budget = %s, want a fresh positive budget", secondAttemptBudget)
+	}
+	if got := clock.delays(); !slices.Equal(got, []time.Duration{2 * time.Second}) {
+		t.Fatalf("limiter delays = %v, want the compliant 2s wait", got)
 	}
 }
 
@@ -451,7 +523,7 @@ func TestRequestPolicyBackoffReceivesRemainingBudgetContext(t *testing.T) {
 	}
 }
 
-func TestRequestPolicyBudgetExpiresWhileWaitingForSharedPermit(t *testing.T) {
+func TestRequestPolicySharedPermitWaitDoesNotConsumeRetryWorkBudget(t *testing.T) {
 	t.Parallel()
 
 	clock := newPolicyTestClock()
@@ -463,10 +535,9 @@ func TestRequestPolicyBudgetExpiresWhileWaitingForSharedPermit(t *testing.T) {
 		MaxBackoff:        time.Second,
 	})
 	session := policy.newRetrySession()
-	previousErr := newError(ErrorTransport, EndpointComments, "post1", 0, io.ErrUnexpectedEOF)
-
-	// Hold the process-wide permit. The endpoint gate signal proves the replay
-	// passed its initial budget check and reached the permit acquisition boundary.
+	// Hold the process-wide permit long enough to exceed the per-request retry-work
+	// budget. Releasing it must still allow the first HTTP attempt because compliant
+	// queueing is bounded by the caller/global context instead.
 	<-policy.permit
 	gateEntered := make(chan struct{})
 	result := make(chan error, 1)
@@ -476,7 +547,7 @@ func TestRequestPolicyBudgetExpiresWhileWaitingForSharedPermit(t *testing.T) {
 			context.Background(),
 			EndpointComments,
 			"post1",
-			previousErr,
+			nil,
 			func(context.Context) (func(), error) {
 				close(gateEntered)
 				return func() {}, nil
@@ -492,11 +563,11 @@ func TestRequestPolicyBudgetExpiresWhileWaitingForSharedPermit(t *testing.T) {
 	clock.advance(11 * time.Second)
 	policy.permit <- struct{}{}
 
-	if err := <-result; err != previousErr {
-		t.Fatalf("doAfter() error = %v, want original transient error", err)
+	if err := <-result; err != nil {
+		t.Fatalf("doAfter() error = %v, want success after compliant queue wait", err)
 	}
-	if attempts.Load() != 0 {
-		t.Fatalf("HTTP attempts = %d, want no late replay", attempts.Load())
+	if attempts.Load() != 1 {
+		t.Fatalf("HTTP attempts = %d, want one attempt after the permit is released", attempts.Load())
 	}
 }
 
@@ -533,6 +604,39 @@ func TestRequestPolicyBudgetBoundsReplayHTTPAttempt(t *testing.T) {
 	}
 	if attempts != 1 {
 		t.Fatalf("replay attempts = %d, want 1", attempts)
+	}
+}
+
+func TestRequestPolicyInternalAttemptBudgetIsNotReportedAsCallerCancellation(t *testing.T) {
+	t.Parallel()
+
+	observed := make(chan AttemptEvent, 1)
+	policy, err := NewRequestPolicy(RequestPolicyConfig{
+		RequestsPerSecond: maxRequestsPerSecond,
+		MaxRetries:        0,
+		MaxRetryElapsed:   20 * time.Millisecond,
+		InitialBackoff:    time.Millisecond,
+		MaxBackoff:        time.Millisecond,
+		AttemptObserver: func(event AttemptEvent) {
+			observed <- event
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = policy.do(context.Background(), EndpointComments, "post1", func(attemptCtx context.Context) (policyAttemptResult, error) {
+		<-attemptCtx.Done()
+		return policyAttemptResult{attempted: true}, newError(ErrorCanceled, EndpointComments, "post1", 0, attemptCtx.Err())
+	})
+	assertClientError(t, err, ErrorTransport, EndpointComments, 0)
+	if !errors.Is(err, errRetryBudget) || errors.Is(err, context.Canceled) {
+		t.Fatalf("policy.do() error = %v, want internal transport budget exhaustion", err)
+	}
+
+	event := <-observed
+	if event.Succeeded || event.Class != ErrorTransport || event.StatusCode != 0 || event.Attempt != 1 {
+		t.Fatalf("attempt event = %#v, want transport failure for internal budget expiry", event)
 	}
 }
 

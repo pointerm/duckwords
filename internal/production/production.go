@@ -95,7 +95,7 @@ func executeProduction(
 		access, err = ResolveAccessIdentity(dependencies.lookupEnv)
 	}
 	if err != nil || !validAccessIdentity(access) {
-		log.Failed(ctx, "user_agent", elapsed(dependencies.now, startedAt))
+		log.Failed(ctx, "reddit_environment", elapsed(dependencies.now, startedAt))
 		return app.Result{}, ErrRedditSetup
 	}
 	httpClient, err := dependencies.newHTTP(cfg.RequestTimeout, cfg.Workers)
@@ -127,15 +127,17 @@ func executeProduction(
 		InitialBackoff:    policyInitialBackoff,
 		MaxBackoff:        policyMaximumBackoff,
 		Observer:          log.RetryObserver(ctx),
+		AttemptObserver:   log.AttemptObserver(ctx),
 	})
 	if err != nil {
 		log.Failed(ctx, "configuration", elapsed(dependencies.now, startedAt))
 		return app.Result{}, fmt.Errorf("%w: request policy", ErrConfig)
 	}
 	redditClient, err := reddit.NewClient(reddit.ClientConfig{
-		HTTPClient:    httpClient,
-		UserAgent:     access.UserAgent(),
-		RequestPolicy: policy,
+		HTTPClient:     httpClient,
+		UserAgent:      access.UserAgent(),
+		RequestPolicy:  policy,
+		BrowserSession: access.browserHeaders(),
 	})
 	if err != nil {
 		log.Failed(ctx, "configuration", elapsed(dependencies.now, startedAt))

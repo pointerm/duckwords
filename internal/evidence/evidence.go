@@ -217,15 +217,16 @@ type resultWord struct {
 type logRecord map[string]json.RawMessage
 
 type parsedLog struct {
-	started           startedRecord
-	sources           map[string]SourceManifest
-	summary           summaryRecord
-	output            outputRecord
-	outcomes          []OutcomeManifest
-	redditRetries     []retryRecord
-	intermediateTimes []eventTimestamp
-	sourceRetryEvents uint64
-	redditRetryEvents uint64
+	started             startedRecord
+	sources             map[string]SourceManifest
+	summary             summaryRecord
+	output              outputRecord
+	outcomes            []OutcomeManifest
+	redditRetries       []retryRecord
+	intermediateTimes   []eventTimestamp
+	sourceRetryEvents   uint64
+	redditRetryEvents   uint64
+	redditAttemptEvents uint64
 }
 
 type eventTimestamp struct {
@@ -562,6 +563,14 @@ func parseLog(data []byte) (parsedLog, error) {
 					parsedSources[kind] = source
 				}
 			}
+		case "http_attempt":
+			if parsedSources["dictionary"].SHA256 == "" || outcomesStarted {
+				err = errors.New("HTTP attempt outside expected lifecycle stage")
+				break
+			}
+			if err = validateHTTPAttempt(record); err == nil {
+				parsed.redditAttemptEvents++
+			}
 		case "post_outcome":
 			if parsedSources["dictionary"].SHA256 == "" {
 				err = errors.New("post outcome precedes parsed inputs")
@@ -694,6 +703,7 @@ func validateRecordSchema(record logRecord, event string) error {
 		"source_loaded":  {"source_kind", "source_mode", "source_origin", "source_bytes", "source_sha256"},
 		"source_parsed":  {"source_kind", "stage", "entries", "source_sha256", "posts_sha256"},
 		"request_retry":  {"operation", "post_id", "source_kind", "error_class", "http_status", "attempt", "delay"},
+		"http_attempt":   {"scope", "operation", "post_id", "attempt", "result", "http_status", "duration", "error_class"},
 		"post_outcome":   {"post_id", "source_line", "status", "comments", "bodies_visited", "expansion_requests", "continuation_requests", "counted_tokens", "error_class", "operation", "http_status"},
 		"run_summary":    {"terminal_status", "partial", "failure_mode", "workers", "input_profile", "filter_count", "duration", "posts_total", "posts_completed", "posts_skipped", "posts_failed", "posts_incomplete", "comments", "bodies_visited", "expansion_requests", "continuation_requests", "counted_tokens", "distinct_words", "dictionary_words", "source_retries", "reddit_http_attempts", "reddit_retries", "throttle_waits", "throttle_wait", "posts_sha256", "post_ids_sha256", "dictionary_sha256", "access_profile", "reddit_origin", "reddit_method", "reddit_auth", "ua_source", "ua_sha256", "app_version", "app_commit", "app_build_date", "go_version", "goos", "goarch"},
 		"output_written": {"partial", "result_words", "result_sha256"},
@@ -727,7 +737,7 @@ func validateRecordSchema(record logRecord, event string) error {
 	}
 	wantMessage := map[string]string{
 		"run_started": "run started", "source_loaded": "source loaded", "source_parsed": "source parsed",
-		"request_retry": "request retry scheduled", "post_outcome": "post processing completed",
+		"request_retry": "request retry scheduled", "http_attempt": "HTTP attempt completed", "post_outcome": "post processing completed",
 		"run_summary": "processing summary", "output_written": "result written",
 	}[event]
 	if message != wantMessage {
@@ -1181,6 +1191,47 @@ func parseOutput(record logRecord) (outputRecord, error) {
 	return outputRecord{time: timestamp, partial: partial, resultWords: words, resultHash: resultHash}, nil
 }
 
+func validateHTTPAttempt(record logRecord) error {
+	if scope, err := enumField(record, "scope", "reddit"); err != nil || scope != "reddit" {
+		return errors.New("invalid HTTP attempt scope")
+	}
+	if _, err := enumField(record, "operation", "comments", "continuation", "comment_expansion"); err != nil {
+		return err
+	}
+	postID, err := stringField(record, "post_id", true)
+	if err != nil || !postIDPattern.MatchString(postID) {
+		return errors.New("invalid HTTP attempt post ID")
+	}
+	if _, err := intField(record, "attempt", 1, 6); err != nil {
+		return err
+	}
+	result, err := enumField(record, "result", "success", "failure")
+	if err != nil {
+		return err
+	}
+	status, hasStatus, err := retryStatusField(record)
+	if err != nil || !hasStatus {
+		return errors.New("invalid HTTP attempt status")
+	}
+	if _, err := durationField(record, "duration", 0, 2*time.Minute); err != nil {
+		return err
+	}
+	_, hasClass := record["error_class"]
+	if result == "success" {
+		if hasClass || status != 200 {
+			return errors.New("successful HTTP attempt has failure metadata")
+		}
+		return nil
+	}
+	if !hasClass {
+		return errors.New("failed HTTP attempt lacks error class")
+	}
+	if _, err := enumField(record, "error_class", "access", "not_found", "rate_limited", "server", "transport", "protocol", "resource_limit", "canceled"); err != nil {
+		return err
+	}
+	return nil
+}
+
 func validateRetry(record logRecord) (retryRecord, error) {
 	if _, err := timeField(record); err != nil {
 		return retryRecord{}, err
@@ -1384,6 +1435,9 @@ func reconcile(parsed parsedLog, resultWords []resultWord, exitCode int, finaliz
 	}
 	if parsed.sourceRetryEvents != parsed.summary.requests.SourceRetries || parsed.redditRetryEvents != parsed.summary.requests.RedditRetries {
 		return fmt.Errorf("%w: retry events do not match summary", ErrInvalidLog)
+	}
+	if parsed.redditAttemptEvents != parsed.summary.requests.RedditHTTPAttempts {
+		return fmt.Errorf("%w: HTTP attempt events do not match summary", ErrInvalidLog)
 	}
 	if err := reconcileRedditRetries(parsed.redditRetries, outcomesByPostID); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidLog, err)

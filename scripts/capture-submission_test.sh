@@ -12,6 +12,11 @@ readonly fixture_client_id="fixture-value-two"
 readonly fixture_client_secret="fixture-value-three"
 readonly fixture_user_agent="fixture-value-four"
 readonly fixture_ambient_value="fixture-unrelated-value-five"
+readonly fixture_browser_cookie="fixture-browser-cookie-six"
+readonly fixture_browser_accept_language="fixture-browser-language-seven"
+readonly fixture_browser_sec_ch_ua="fixture-browser-ua-eight"
+readonly fixture_browser_sec_ch_ua_mobile="fixture-browser-mobile-nine"
+readonly fixture_browser_sec_ch_ua_platform="fixture-browser-platform-ten"
 readonly fixture_version="1.2.3"
 readonly fixture_command_path="${PATH}"
 readonly fixture_home="${HOME}"
@@ -25,9 +30,12 @@ if [[ ! -x /bin/sh || ! -x /bin/mkdir || ! -x /bin/cp || ! -x /bin/cat ]]; then
 fi
 
 # The harness never consumes caller credentials. Visibly synthetic legacy OAuth
-# values are exported inside run_wrapper to prove they never reach any child.
+# and browser-session values are exported inside run_wrapper to prove they never
+# reach any child or appear in diagnostics.
 unset REDDIT_API_ACCESS_APPROVED REDDIT_CLIENT_ID REDDIT_CLIENT_SECRET REDDIT_USER_AGENT \
-  REDDIT_POLICY_VERIFIED_AT REDDIT_APPROVAL_REFERENCE CAPTURE_TEST_AMBIENT_VALUE
+  REDDIT_POLICY_VERIFIED_AT REDDIT_APPROVAL_REFERENCE CAPTURE_TEST_AMBIENT_VALUE \
+  REDDIT_BROWSER_COOKIE REDDIT_BROWSER_ACCEPT_LANGUAGE REDDIT_BROWSER_SEC_CH_UA \
+  REDDIT_BROWSER_SEC_CH_UA_MOBILE REDDIT_BROWSER_SEC_CH_UA_PLATFORM
 
 for required_command in awk bash cmp cp date env find git grep mkdir mktemp rm sed; do
   if ! command -v "${required_command}" >/dev/null 2>&1; then
@@ -133,7 +141,9 @@ assert_no_fixture_values() {
   local path="$1"
   local value
   for value in "${fixture_client_id}" "${fixture_client_secret}" "${fixture_user_agent}" \
-    "${fixture_ambient_value}"; do
+    "${fixture_ambient_value}" "${fixture_browser_cookie}" \
+    "${fixture_browser_accept_language}" "${fixture_browser_sec_ch_ua}" \
+    "${fixture_browser_sec_ch_ua_mobile}" "${fixture_browser_sec_ch_ua_platform}"; do
     if grep -F -- "${value}" "${path}" >/dev/null 2>&1; then
       fail "fixture environment value leaked into ${path}"
     fi
@@ -142,9 +152,16 @@ assert_no_fixture_values() {
 
 assert_private_cleanup() {
   local remaining
-  remaining="$(find "${case_tmp}" -mindepth 1 -print -quit)"
+
+  # Apple's command shims may create this process-local cache when the isolated
+  # fixture invokes /usr/bin/git through xcrun. It is not wrapper-owned capture
+  # state, and the harness's outer private-root cleanup removes it at test exit.
+  if [[ -e "${case_tmp}/xcrun_db" || -L "${case_tmp}/xcrun_db" ]]; then
+    assert_regular_file "${case_tmp}/xcrun_db" "${case_name}: xcrun cache"
+  fi
+  remaining="$(find "${case_tmp}" -mindepth 1 ! -path "${case_tmp}/xcrun_db" -print -quit)"
   if [[ -n "${remaining}" ]]; then
-    fail "${case_name}: private build/capture state was not removed"
+    fail "${case_name}: private build/capture state was not removed: ${remaining#"${case_tmp}/"}"
   fi
 }
 
@@ -168,6 +185,9 @@ record() {
 untrusted_environment_present() {
   [[ -n "${REDDIT_API_ACCESS_APPROVED+x}" || -n "${REDDIT_CLIENT_ID+x}" ||
     -n "${REDDIT_CLIENT_SECRET+x}" || -n "${REDDIT_USER_AGENT+x}" ||
+    -n "${REDDIT_BROWSER_COOKIE+x}" || -n "${REDDIT_BROWSER_ACCEPT_LANGUAGE+x}" ||
+    -n "${REDDIT_BROWSER_SEC_CH_UA+x}" || -n "${REDDIT_BROWSER_SEC_CH_UA_MOBILE+x}" ||
+    -n "${REDDIT_BROWSER_SEC_CH_UA_PLATFORM+x}" ||
     -n "${CAPTURE_TEST_AMBIENT_VALUE+x}" || -n "${REDDIT_POLICY_VERIFIED_AT+x}" ||
     -n "${REDDIT_APPROVAL_REFERENCE+x}" || -n "${DUCKWORDS_RELEASE_VERSION+x}" ||
     -n "${DUCKWORDS_BUILD_DATE+x}" || -n "${SUBMISSION_DIR+x}" ]]
@@ -187,7 +207,10 @@ assert_reference_build_environment() {
 if [[ "$#" -eq 2 && "$1" == "env" && "$2" == "GOVERSION" ]]; then
   [[ "${GOTOOLCHAIN:-}" == "go1.26.6" ]] || exit 91
   if [[ -n "${REDDIT_CLIENT_ID+x}" || -n "${REDDIT_CLIENT_SECRET+x}" ||
-    -n "${REDDIT_USER_AGENT+x}" || -n "${CAPTURE_TEST_AMBIENT_VALUE+x}" ]]; then
+    -n "${REDDIT_USER_AGENT+x}" || -n "${REDDIT_BROWSER_COOKIE+x}" ||
+    -n "${REDDIT_BROWSER_ACCEPT_LANGUAGE+x}" || -n "${REDDIT_BROWSER_SEC_CH_UA+x}" ||
+    -n "${REDDIT_BROWSER_SEC_CH_UA_MOBILE+x}" || -n "${REDDIT_BROWSER_SEC_CH_UA_PLATFORM+x}" ||
+    -n "${CAPTURE_TEST_AMBIENT_VALUE+x}" ]]; then
     record "go-env:environment-present"
   else
     record "go-env:environment-scrubbed"
@@ -341,6 +364,9 @@ if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then
   if [ "${TZ:-}" != "UTC" ] || [ -n "${REDDIT_API_ACCESS_APPROVED+x}" ] ||
     [ -n "${REDDIT_CLIENT_ID+x}" ] || [ -n "${REDDIT_CLIENT_SECRET+x}" ] ||
     [ -n "${REDDIT_USER_AGENT+x}" ] || [ -n "${CAPTURE_TEST_AMBIENT_VALUE+x}" ] ||
+    [ -n "${REDDIT_BROWSER_COOKIE+x}" ] || [ -n "${REDDIT_BROWSER_ACCEPT_LANGUAGE+x}" ] ||
+    [ -n "${REDDIT_BROWSER_SEC_CH_UA+x}" ] || [ -n "${REDDIT_BROWSER_SEC_CH_UA_MOBILE+x}" ] ||
+    [ -n "${REDDIT_BROWSER_SEC_CH_UA_PLATFORM+x}" ] ||
     [ -n "${REDDIT_POLICY_VERIFIED_AT+x}" ] || [ -n "${REDDIT_APPROVAL_REFERENCE+x}" ] ||
     [ -n "${DUCKWORDS_RELEASE_VERSION+x}" ] || [ -n "${DUCKWORDS_BUILD_DATE+x}" ] ||
     [ -n "${SUBMISSION_DIR+x}" ]; then
@@ -377,6 +403,12 @@ if [ -n "${REDDIT_API_ACCESS_APPROVED+x}" ] || [ -n "${REDDIT_CLIENT_ID+x}" ] ||
   [ -n "${REDDIT_APPROVAL_REFERENCE+x}" ]; then
   record "live:legacy-auth-leaked"
   exit 83
+fi
+if [ -n "${REDDIT_BROWSER_COOKIE+x}" ] || [ -n "${REDDIT_BROWSER_ACCEPT_LANGUAGE+x}" ] ||
+  [ -n "${REDDIT_BROWSER_SEC_CH_UA+x}" ] || [ -n "${REDDIT_BROWSER_SEC_CH_UA_MOBILE+x}" ] ||
+  [ -n "${REDDIT_BROWSER_SEC_CH_UA_PLATFORM+x}" ]; then
+  record "live:browser-session-leaked"
+  exit 87
 fi
 case "@USER_AGENT_MODE@" in
   override)
@@ -419,6 +451,9 @@ record() {
 if [ "${TZ:-}" != "UTC" ] || [ -n "${REDDIT_API_ACCESS_APPROVED+x}" ] ||
   [ -n "${REDDIT_CLIENT_ID+x}" ] || [ -n "${REDDIT_CLIENT_SECRET+x}" ] ||
   [ -n "${REDDIT_USER_AGENT+x}" ] || [ -n "${CAPTURE_TEST_AMBIENT_VALUE+x}" ] ||
+  [ -n "${REDDIT_BROWSER_COOKIE+x}" ] || [ -n "${REDDIT_BROWSER_ACCEPT_LANGUAGE+x}" ] ||
+  [ -n "${REDDIT_BROWSER_SEC_CH_UA+x}" ] || [ -n "${REDDIT_BROWSER_SEC_CH_UA_MOBILE+x}" ] ||
+  [ -n "${REDDIT_BROWSER_SEC_CH_UA_PLATFORM+x}" ] ||
   [ -n "${REDDIT_POLICY_VERIFIED_AT+x}" ] || [ -n "${REDDIT_APPROVAL_REFERENCE+x}" ] ||
   [ -n "${DUCKWORDS_RELEASE_VERSION+x}" ] || [ -n "${DUCKWORDS_BUILD_DATE+x}" ] ||
   [ -n "${SUBMISSION_DIR+x}" ]; then
@@ -505,6 +540,8 @@ EVIDENCE_FIXTURE
     cd "${case_repo}"
     env -u REDDIT_API_ACCESS_APPROVED -u REDDIT_CLIENT_ID -u REDDIT_CLIENT_SECRET \
       -u REDDIT_USER_AGENT -u CAPTURE_TEST_AMBIENT_VALUE -u REDDIT_POLICY_VERIFIED_AT \
+      -u REDDIT_BROWSER_COOKIE -u REDDIT_BROWSER_ACCEPT_LANGUAGE -u REDDIT_BROWSER_SEC_CH_UA \
+      -u REDDIT_BROWSER_SEC_CH_UA_MOBILE -u REDDIT_BROWSER_SEC_CH_UA_PLATFORM \
       -u REDDIT_APPROVAL_REFERENCE -u DUCKWORDS_RELEASE_VERSION -u DUCKWORDS_BUILD_DATE \
       -u SUBMISSION_DIR \
       PATH="${mock_bin}:${fixture_command_path}" TMPDIR="${case_tmp}" HOME="${fixture_home}" TZ=UTC \
@@ -515,6 +552,8 @@ EVIDENCE_FIXTURE
       -o "${case_repo}/bin/duckwords" ./cmd/duckwords
     env -u REDDIT_API_ACCESS_APPROVED -u REDDIT_CLIENT_ID -u REDDIT_CLIENT_SECRET \
       -u REDDIT_USER_AGENT -u CAPTURE_TEST_AMBIENT_VALUE -u REDDIT_POLICY_VERIFIED_AT \
+      -u REDDIT_BROWSER_COOKIE -u REDDIT_BROWSER_ACCEPT_LANGUAGE -u REDDIT_BROWSER_SEC_CH_UA \
+      -u REDDIT_BROWSER_SEC_CH_UA_MOBILE -u REDDIT_BROWSER_SEC_CH_UA_PLATFORM \
       -u REDDIT_APPROVAL_REFERENCE -u DUCKWORDS_RELEASE_VERSION -u DUCKWORDS_BUILD_DATE \
       -u SUBMISSION_DIR \
       PATH="${mock_bin}:${fixture_command_path}" TMPDIR="${case_tmp}" HOME="${fixture_home}" TZ=UTC \
@@ -536,6 +575,7 @@ run_wrapper() {
   local exported_functions="${3:-false}"
   local invalid_environment_name="${4:-false}"
   local unprivileged_bash="${5:-false}"
+  local browser_environment="${6:-}"
   local actual_status
   : > "${case_state}/wrapper.stdout"
   : > "${case_state}/wrapper.stderr"
@@ -562,6 +602,16 @@ run_wrapper() {
       unset REDDIT_USER_AGENT
     fi
     export CAPTURE_TEST_AMBIENT_VALUE="${fixture_ambient_value}"
+    case "${browser_environment}" in
+      "") ;;
+      REDDIT_BROWSER_COOKIE) export REDDIT_BROWSER_COOKIE="${fixture_browser_cookie}" ;;
+      REDDIT_BROWSER_COOKIE_EMPTY) export REDDIT_BROWSER_COOKIE= ;;
+      REDDIT_BROWSER_ACCEPT_LANGUAGE) export REDDIT_BROWSER_ACCEPT_LANGUAGE="${fixture_browser_accept_language}" ;;
+      REDDIT_BROWSER_SEC_CH_UA) export REDDIT_BROWSER_SEC_CH_UA="${fixture_browser_sec_ch_ua}" ;;
+      REDDIT_BROWSER_SEC_CH_UA_MOBILE) export REDDIT_BROWSER_SEC_CH_UA_MOBILE="${fixture_browser_sec_ch_ua_mobile}" ;;
+      REDDIT_BROWSER_SEC_CH_UA_PLATFORM) export REDDIT_BROWSER_SEC_CH_UA_PLATFORM="${fixture_browser_sec_ch_ua_platform}" ;;
+      *) exit 98 ;;
+    esac
     if [[ "${exported_functions}" == "true" ]]; then
       set() { return 91; }
       unset() { return 92; }
@@ -588,6 +638,7 @@ run_wrapper() {
   assert_equal "${expected_status}" "${actual_status}" "${case_name}: wrapper exit status"
   assert_no_fixture_values "${case_state}/wrapper.stdout"
   assert_no_fixture_values "${case_state}/wrapper.stderr"
+  assert_no_fixture_values "${case_events}"
   assert_private_cleanup
 }
 
@@ -717,6 +768,64 @@ test_xtrace_secret_boundary() {
     'published one-run evidence at artifacts/submission (application exit 0)' \
     'xtrace-safe publication diagnostic'
   printf '%s\n' 'ok - inherited xtrace is disabled before environment capture'
+}
+
+test_browser_session_environment_rejected() {
+  local case_suffix environment_name
+  while read -r case_suffix environment_name; do
+    setup_case "browser-session-${case_suffix}" 0
+    run_wrapper 2 true false false false "${environment_name}"
+    assert_path_absent "${case_repo}/artifacts/submission" \
+      "${case_name}: browser-session publication"
+    assert_capture_lock_absent
+    assert_event_count 0 "go-env:${expected_go_version}" \
+      "${case_name}: browser-session toolchain suppression"
+    assert_event_count 0 "build:duckwords:environment-scrubbed" \
+      "${case_name}: browser-session build suppression"
+    assert_event_count 0 "version:environment-scrubbed" \
+      "${case_name}: browser-session version suppression"
+    assert_event_count 0 "build:duckwords-evidence:environment-scrubbed" \
+      "${case_name}: browser-session finalizer-build suppression"
+    assert_event_count 0 "live:arguments-verified" \
+      "${case_name}: browser-session live suppression"
+    assert_event_count 0 "finalizer:environment-scrubbed" \
+      "${case_name}: browser-session finalizer suppression"
+    assert_contains "${case_state}/wrapper.stderr" \
+      'browser-session environment is not accepted for canonical unauthenticated evidence' \
+      "${case_name}: browser-session rejection diagnostic"
+    assert_equal "" "$(< "${case_state}/wrapper.stdout")" \
+      "${case_name}: browser-session wrapper stdout"
+  done <<'BROWSER_ENVIRONMENTS'
+cookie REDDIT_BROWSER_COOKIE
+accept-language REDDIT_BROWSER_ACCEPT_LANGUAGE
+sec-ch-ua REDDIT_BROWSER_SEC_CH_UA
+sec-ch-ua-mobile REDDIT_BROWSER_SEC_CH_UA_MOBILE
+sec-ch-ua-platform REDDIT_BROWSER_SEC_CH_UA_PLATFORM
+BROWSER_ENVIRONMENTS
+
+  setup_case "browser-session-empty-cookie" 0
+  run_wrapper 2 true false false false REDDIT_BROWSER_COOKIE_EMPTY
+  assert_path_absent "${case_repo}/artifacts/submission" \
+    "${case_name}: empty browser-session publication"
+  assert_capture_lock_absent
+  assert_event_count 0 "go-env:${expected_go_version}" \
+    "${case_name}: empty browser-session toolchain suppression"
+  assert_event_count 0 "build:duckwords:environment-scrubbed" \
+    "${case_name}: empty browser-session build suppression"
+  assert_event_count 0 "version:environment-scrubbed" \
+    "${case_name}: empty browser-session version suppression"
+  assert_event_count 0 "build:duckwords-evidence:environment-scrubbed" \
+    "${case_name}: empty browser-session finalizer-build suppression"
+  assert_event_count 0 "live:arguments-verified" \
+    "${case_name}: empty browser-session live suppression"
+  assert_event_count 0 "finalizer:environment-scrubbed" \
+    "${case_name}: empty browser-session finalizer suppression"
+  assert_contains "${case_state}/wrapper.stderr" \
+    'browser-session environment is not accepted for canonical unauthenticated evidence' \
+    "${case_name}: empty browser-session rejection diagnostic"
+  assert_equal "" "$(< "${case_state}/wrapper.stdout")" \
+    "${case_name}: empty browser-session wrapper stdout"
+  printf '%s\n' 'ok - browser-session environment is rejected before canonical capture helpers'
 }
 
 test_exported_function_boundary() {
@@ -935,6 +1044,7 @@ test_mismatched_finalizer() {
 test_success
 test_success_with_builtin_user_agent
 test_xtrace_secret_boundary
+test_browser_session_environment_rejected
 test_exported_function_boundary
 test_invalid_environment_name
 test_unprivileged_bash_rejected

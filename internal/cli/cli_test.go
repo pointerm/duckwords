@@ -64,6 +64,27 @@ func TestRunInformationalPathsDoNotExecute(t *testing.T) {
 	}
 }
 
+func TestRunInformationalPathsDoNotReadBrowserSession(t *testing.T) {
+	t.Setenv("REDDIT_BROWSER_COOKIE", "invalid browser session that has no equals sign")
+
+	for _, arguments := range [][]string{{"--help"}, {"--version"}} {
+		var stdout, stderr strings.Builder
+		code := run(
+			context.Background(),
+			arguments,
+			&stdout,
+			&stderr,
+			func(context.Context, config.Config, *slog.Logger) (app.Result, error) {
+				t.Fatal("executor was called on an informational path")
+				return app.Result{}, nil
+			},
+		)
+		if code != exitSuccess || stdout.Len() == 0 || stderr.Len() != 0 {
+			t.Fatalf("run(%v) = code %d, stdout %q, stderr %q", arguments, code, stdout.String(), stderr.String())
+		}
+	}
+}
+
 func TestRunRejectsInvalidArgumentsBeforeExecution(t *testing.T) {
 	t.Parallel()
 
@@ -571,8 +592,34 @@ func TestRunRejectsInvalidUserAgentBeforeExecutor(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), "event=run_started") ||
 		!strings.Contains(stderr.String(), "event=run_failed") ||
-		!strings.HasSuffix(stderr.String(), "duckwords: Reddit client setup failed; if REDDIT_USER_AGENT is set, use 8..256 printable ASCII bytes without surrounding whitespace\n") {
+		!strings.HasSuffix(stderr.String(), "duckwords: Reddit client setup failed; check the optional REDDIT_USER_AGENT and REDDIT_BROWSER_* values documented by --help\n") {
 		t.Fatalf("stderr = %q, want fail-closed user-agent diagnostic", stderr.String())
+	}
+}
+
+func TestRunRejectsInvalidBrowserSessionWithoutEchoingIt(t *testing.T) {
+	const canary = "browser-session-private-canary"
+	t.Setenv("REDDIT_BROWSER_COOKIE", "reddit_session="+canary+"\r\nAuthorization: planted")
+
+	var stdout, stderr strings.Builder
+	code := run(
+		context.Background(),
+		[]string{"--workers=1"},
+		&stdout,
+		&stderr,
+		func(context.Context, config.Config, *slog.Logger) (app.Result, error) {
+			t.Fatal("executor was called with an invalid browser session")
+			return app.Result{}, nil
+		},
+	)
+
+	if code != exitFailure || stdout.Len() != 0 {
+		t.Fatalf("run() exit code = %d, stdout = %q", code, stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "event=run_failed") ||
+		!strings.HasSuffix(stderr.String(), "duckwords: Reddit client setup failed; check the optional REDDIT_USER_AGENT and REDDIT_BROWSER_* values documented by --help\n") ||
+		strings.Contains(stderr.String(), canary) {
+		t.Fatalf("stderr = %q, want sanitized browser-session rejection", stderr.String())
 	}
 }
 

@@ -1,12 +1,43 @@
 package runlog
 
 import (
+	"context"
+	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pointerm/duckwords/internal/buildinfo"
 	"github.com/pointerm/duckwords/internal/config"
+	"github.com/pointerm/duckwords/internal/reddit"
 )
+
+func TestAttemptObserverWritesSanitizedProgressImmediately(t *testing.T) {
+	t.Parallel()
+
+	var output strings.Builder
+	observer := New(slog.New(slog.NewTextHandler(&output, nil))).AttemptObserver(context.Background())
+	observer(reddit.AttemptEvent{
+		Endpoint: reddit.EndpointComments, PostID: "duck123", Attempt: 1,
+		Succeeded: true, StatusCode: 200, Duration: 125 * time.Millisecond,
+	})
+
+	logged := output.String()
+	for _, want := range []string{
+		`msg="HTTP attempt completed"`, "event=http_attempt", "scope=reddit",
+		"operation=comments", "post_id=duck123", "attempt=1", "result=success",
+		"http_status=200", "duration=125ms",
+	} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("attempt log does not contain %q: %s", want, logged)
+		}
+	}
+	for _, forbidden := range []string{"url=", "cookie=", "body=", "user_agent="} {
+		if strings.Contains(strings.ToLower(logged), forbidden) {
+			t.Fatalf("attempt log contains forbidden field %q: %s", forbidden, logged)
+		}
+	}
+}
 
 func TestExecutionInputProfileBindsExactAssignmentLocators(t *testing.T) {
 	t.Parallel()
@@ -114,6 +145,40 @@ func TestSafeAccessIdentityPreservesReviewedPublicJSONContract(t *testing.T) {
 		identity.Method != accessMethodGET || identity.Auth != accessAuthNone ||
 		identity.UserAgentSource != userAgentSourceOverride || identity.UserAgentSHA256 != digest {
 		t.Fatalf("safeAccessIdentity() = %+v, want reviewed values preserved", identity)
+	}
+}
+
+func TestSafeAccessIdentityPreservesReviewedBrowserSessionContract(t *testing.T) {
+	t.Parallel()
+
+	const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	identity := safeAccessIdentity(AccessIdentity{
+		Profile:         accessProfileBrowserSessionJSON,
+		Origin:          accessOriginOldReddit,
+		Method:          accessMethodGET,
+		Auth:            accessAuthBrowserSession,
+		UserAgentSource: userAgentSourceOverride,
+		UserAgentSHA256: digest,
+	})
+	if identity.Profile != accessProfileBrowserSessionJSON || identity.Origin != accessOriginOldReddit ||
+		identity.Method != accessMethodGET || identity.Auth != accessAuthBrowserSession ||
+		identity.UserAgentSource != userAgentSourceOverride || identity.UserAgentSHA256 != digest {
+		t.Fatalf("safeAccessIdentity() = %+v, want reviewed browser-session values preserved", identity)
+	}
+}
+
+func TestSafeAccessIdentityRejectsMismatchedProfileAndAuthentication(t *testing.T) {
+	t.Parallel()
+
+	const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	for _, identity := range []AccessIdentity{
+		{Profile: accessProfilePublicJSON, Origin: accessOriginOldReddit, Method: accessMethodGET, Auth: accessAuthBrowserSession, UserAgentSource: userAgentSourceBuiltin, UserAgentSHA256: digest},
+		{Profile: accessProfileBrowserSessionJSON, Origin: accessOriginOldReddit, Method: accessMethodGET, Auth: accessAuthNone, UserAgentSource: userAgentSourceBuiltin, UserAgentSHA256: digest},
+	} {
+		identity := safeAccessIdentity(identity)
+		if identity.Profile != unknownBuildLogValue || identity.Auth != unknownBuildLogValue {
+			t.Fatalf("safeAccessIdentity() = %+v, want mismatched pair rejected", identity)
+		}
 	}
 }
 

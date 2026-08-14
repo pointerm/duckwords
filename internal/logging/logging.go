@@ -57,6 +57,8 @@ const (
 	EventSourceParsed Event = "source_parsed"
 	// EventRetry records a scheduled transient-request retry.
 	EventRetry Event = "request_retry"
+	// EventHTTPAttempt records one sanitized completed Reddit HTTP attempt.
+	EventHTTPAttempt Event = "http_attempt"
 	// EventPostOutcome records one sanitized per-post terminal outcome.
 	EventPostOutcome Event = "post_outcome"
 	// EventRunSummary records reconciled processing counters and provenance.

@@ -158,7 +158,7 @@ func runWithTimeoutContext(
 	}
 	access, err := production.ResolveAccessIdentity(os.LookupEnv)
 	if err != nil {
-		runlog.New(logSink.Logger()).Failed(executionCtx, "user_agent", 0)
+		runlog.New(logSink.Logger()).Failed(executionCtx, "reddit_environment", 0)
 		if logErr := logSink.Err(); logErr != nil {
 			return exitFailure
 		}
@@ -319,7 +319,7 @@ func executionFailureDiagnostic(err error) string {
 	case errors.Is(err, production.ErrSourceParsing):
 		return "an input source was downloaded but could not be parsed"
 	case errors.Is(err, production.ErrRedditSetup):
-		return "Reddit client setup failed; if REDDIT_USER_AGENT is set, use 8..256 printable ASCII bytes without surrounding whitespace"
+		return "Reddit client setup failed; check the optional REDDIT_USER_AGENT and REDDIT_BROWSER_* values documented by --help"
 	case errors.Is(err, production.ErrConfig):
 		return "production setup failed; check the configuration reported in the log"
 	}

@@ -42,13 +42,16 @@ type PostRef struct {
 	JSONPath string
 }
 
-// ClientConfig contains the HTTP identity and per-post resource policy for a public
+// ClientConfig contains the HTTP identity and per-post resource policy for the fixed
 // Reddit JSON client. A zero MaxResponseBytes or zero ThingLimits selects bounded
 // package defaults; partially specified ThingLimits are rejected.
 type ClientConfig struct {
 	HTTPClient    *http.Client
 	UserAgent     string
 	RequestPolicy *RequestPolicy
+	// BrowserSession is an explicit, immutable opt-in header profile. Nil keeps
+	// the default cookie-free public JSON contract.
+	BrowserSession *BrowserSession
 
 	MaxResponseBytes int64
 	ThingLimits      ThingLimits
@@ -57,12 +60,13 @@ type ClientConfig struct {
 	TraversalBudget *TraversalBudget
 }
 
-// Client retrieves and walks public Reddit comment trees. A Client is safe for
-// concurrent use; all focal-comment expansion attempts share one serialized gate.
+// Client retrieves and walks Reddit comment trees at the fixed origin. A Client is
+// safe for concurrent use; all focal-comment expansion attempts share one gate.
 type Client struct {
 	httpClient       *http.Client
 	apiBase          url.URL
 	userAgent        string
+	browserSession   *BrowserSession
 	requestPolicy    *RequestPolicy
 	maxResponseBytes int64
 	thingLimits      ThingLimits
@@ -79,7 +83,7 @@ const (
 	endpointLoopbackTest
 )
 
-// NewClient constructs a client pinned to the public old.reddit.com HTTPS origin.
+// NewClient constructs a client pinned to the old.reddit.com HTTPS origin.
 // Endpoint injection is unavailable to application configuration.
 func NewClient(config ClientConfig) (*Client, error) {
 	return newClient(config, redditPublicEndpoint, endpointProduction)
@@ -114,6 +118,7 @@ func newClient(config ClientConfig, endpoint string, policy endpointPolicy) (*Cl
 		httpClient:       &httpClient,
 		apiBase:          *apiBase,
 		userAgent:        config.UserAgent,
+		browserSession:   config.BrowserSession,
 		requestPolicy:    requestPolicy,
 		maxResponseBytes: maxResponseBytes,
 		thingLimits:      thingLimits,
@@ -134,6 +139,9 @@ func validateClientConfig(config ClientConfig) (int64, ThingLimits, *RequestPoli
 	}
 	if !validUserAgent(config.UserAgent) {
 		return 0, ThingLimits{}, nil, nil, fmt.Errorf("%w: user agent must be %d-%d printable ASCII bytes", ErrClientConfig, minUserAgentBytes, maxUserAgentBytes)
+	}
+	if config.BrowserSession != nil && !config.BrowserSession.valid() {
+		return 0, ThingLimits{}, nil, nil, fmt.Errorf("%w: browser session is invalid", ErrClientConfig)
 	}
 	if config.RequestPolicy == nil {
 		return 0, ThingLimits{}, nil, nil, fmt.Errorf("%w: request policy is required", ErrClientConfig)
@@ -359,7 +367,8 @@ func (c *Client) requestGate(endpoint Endpoint, postID string) policyAttemptGate
 }
 
 // doAttempt performs one GET exchange. A new request is built for every retry; the
-// request always has a nil body and carries neither authentication nor cookies.
+// request always has a nil body. By default it carries neither authentication nor
+// cookies; an explicitly configured BrowserSession adds only its reviewed headers.
 func (c *Client) doAttempt(ctx context.Context, endpoint Endpoint, postID string, spec apiRequest) (policyAttemptResult, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, spec.url, nil)
 	if err != nil {
@@ -367,6 +376,7 @@ func (c *Client) doAttempt(ctx context.Context, endpoint Endpoint, postID string
 	}
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("User-Agent", c.userAgent)
+	c.browserSession.apply(request)
 
 	result, err := executePayloadAttempt(
 		ctx,

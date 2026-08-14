@@ -12,6 +12,21 @@ fi
 set -euo pipefail
 umask 077
 
+# Canonical evidence attests the reviewed cookie-free access contract. An optional
+# browser session is useful only for direct local diagnostics; accepting it here
+# would make the published reddit_auth=none claim false. Check presence without
+# expanding any value, after disabling inherited xtrace and before invoking an
+# external helper or performing live I/O.
+if [[ -n "${REDDIT_BROWSER_COOKIE+x}" ||
+  -n "${REDDIT_BROWSER_ACCEPT_LANGUAGE+x}" ||
+  -n "${REDDIT_BROWSER_SEC_CH_UA+x}" ||
+  -n "${REDDIT_BROWSER_SEC_CH_UA_MOBILE+x}" ||
+  -n "${REDDIT_BROWSER_SEC_CH_UA_PLATFORM+x}" ]]; then
+  command builtin printf \
+    'capture-submission: browser-session environment is not accepted for canonical unauthenticated evidence\n' >&2
+  exit 2
+fi
+
 # Canonical launch uses this privileged-mode shebang or `bash -p` from Make. Bash
 # privileged mode is required here because it refuses to import environment-defined
 # functions before this script executes; ordinary in-script cleanup cannot safely

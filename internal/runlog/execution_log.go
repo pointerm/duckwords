@@ -19,6 +19,7 @@ import (
 const (
 	logMessageRunStarted  = "run started"
 	logMessageSource      = "source loaded"
+	logMessageHTTPAttempt = "HTTP attempt completed"
 	logMessageRetry       = "request retry scheduled"
 	logMessagePostOutcome = "post processing completed"
 	logMessageRunSummary  = "processing summary"
@@ -28,23 +29,25 @@ const (
 )
 
 const (
-	unknownBuildLogValue    = "unknown"
-	maxCommitLogBytes       = 64
-	minCommitLogBytes       = 7
-	maxVersionLogBytes      = 64
-	maxGoVersionLogBytes    = 96
-	maxPlatformLogBytes     = 16
-	buildDateLogLayout      = "2006-01-02T15:04:05Z"
-	terminalStatusComplete  = "complete"
-	terminalStatusPartial   = "partial"
-	inputProfileAssignment  = "assignment-default-v1"
-	inputProfileCustom      = "custom"
-	accessProfilePublicJSON = "old-reddit-public-json-v1"
-	accessOriginOldReddit   = "old.reddit.com"
-	accessMethodGET         = "GET"
-	accessAuthNone          = "none"
-	userAgentSourceBuiltin  = "builtin"
-	userAgentSourceOverride = "override"
+	unknownBuildLogValue            = "unknown"
+	maxCommitLogBytes               = 64
+	minCommitLogBytes               = 7
+	maxVersionLogBytes              = 64
+	maxGoVersionLogBytes            = 96
+	maxPlatformLogBytes             = 16
+	buildDateLogLayout              = "2006-01-02T15:04:05Z"
+	terminalStatusComplete          = "complete"
+	terminalStatusPartial           = "partial"
+	inputProfileAssignment          = "assignment-default-v1"
+	inputProfileCustom              = "custom"
+	accessProfilePublicJSON         = "old-reddit-public-json-v1"
+	accessProfileBrowserSessionJSON = "old-reddit-browser-session-json-v1"
+	accessOriginOldReddit           = "old.reddit.com"
+	accessMethodGET                 = "GET"
+	accessAuthNone                  = "none"
+	accessAuthBrowserSession        = "browser-session"
+	userAgentSourceBuiltin          = "builtin"
+	userAgentSourceOverride         = "override"
 )
 
 type logBuildIdentity struct {
@@ -56,8 +59,8 @@ type logBuildIdentity struct {
 	goarch    string
 }
 
-// AccessIdentity is the sanitized public-Reddit transport identity recorded at
-// both lifecycle boundaries. It intentionally contains no raw User-Agent value.
+// AccessIdentity is the sanitized Reddit transport identity recorded at both
+// lifecycle boundaries. It intentionally contains no raw User-Agent or session value.
 type AccessIdentity struct {
 	Profile         string
 	Origin          string
@@ -106,6 +109,35 @@ func (log Recorder) RunStarted(ctx context.Context, cfg config.Config, access Ac
 	attributes = appendAccessIdentityAttrs(attributes, access)
 	attributes = appendBuildIdentityAttrs(attributes, currentLogBuildIdentity())
 	log.logger.LogAttrs(ctx, slog.LevelInfo, logMessageRunStarted, attributes...)
+}
+
+// AttemptObserver returns the sanitized observer for completed Reddit HTTP
+// attempts. The request policy calls it synchronously, so each record reaches the
+// configured log writer while the run is still in progress.
+func (log Recorder) AttemptObserver(ctx context.Context) reddit.AttemptObserver {
+	return func(event reddit.AttemptEvent) {
+		if log.logger == nil {
+			return
+		}
+		result := "failure"
+		if event.Succeeded {
+			result = "success"
+		}
+		attributes := []slog.Attr{
+			logging.EventAttr(logging.EventHTTPAttempt),
+			slog.String("scope", "reddit"),
+			slog.String(logging.KeyOperation, string(event.Endpoint)),
+			slog.String(logging.KeyPostID, event.PostID),
+			slog.Int("attempt", event.Attempt),
+			slog.String("result", result),
+			slog.Int("http_status", event.StatusCode),
+			slog.Duration("duration", event.Duration),
+		}
+		if !event.Succeeded {
+			attributes = append(attributes, logging.ErrorClassAttr(string(event.Class)))
+		}
+		log.logger.LogAttrs(ctx, slog.LevelInfo, logMessageHTTPAttempt, attributes...)
+	}
 }
 
 // RetryObserver returns the sanitized observer for Reddit HTTP retries.
@@ -309,8 +341,11 @@ func appendAccessIdentityAttrs(attributes []slog.Attr, access AccessIdentity) []
 }
 
 func safeAccessIdentity(access AccessIdentity) AccessIdentity {
-	if access.Profile != accessProfilePublicJSON {
+	publicAccess := access.Profile == accessProfilePublicJSON && access.Auth == accessAuthNone
+	browserAccess := access.Profile == accessProfileBrowserSessionJSON && access.Auth == accessAuthBrowserSession
+	if !publicAccess && !browserAccess {
 		access.Profile = unknownBuildLogValue
+		access.Auth = unknownBuildLogValue
 	}
 	if access.Origin != accessOriginOldReddit {
 		access.Origin = unknownBuildLogValue
@@ -318,7 +353,7 @@ func safeAccessIdentity(access AccessIdentity) AccessIdentity {
 	if access.Method != accessMethodGET {
 		access.Method = unknownBuildLogValue
 	}
-	if access.Auth != accessAuthNone {
+	if access.Auth != accessAuthNone && access.Auth != accessAuthBrowserSession {
 		access.Auth = unknownBuildLogValue
 	}
 	if access.UserAgentSource != userAgentSourceBuiltin && access.UserAgentSource != userAgentSourceOverride {

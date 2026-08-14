@@ -2,8 +2,11 @@
 
 GO ?= go
 override REQUIRED_GO_VERSION := go1.26.6
-GO_RUN := env GOFIPS140=off GOTOOLCHAIN=$(REQUIRED_GO_VERSION) $(GO)
-RELEASE_GO_RUN := env -u GOOS -u GOARCH -u GOAMD64 -u GOARM64 -u GO386 -u GOARM \
+BROWSER_ENV_UNSET := -u REDDIT_BROWSER_COOKIE -u REDDIT_BROWSER_ACCEPT_LANGUAGE \
+	-u REDDIT_BROWSER_SEC_CH_UA -u REDDIT_BROWSER_SEC_CH_UA_MOBILE \
+	-u REDDIT_BROWSER_SEC_CH_UA_PLATFORM
+GO_RUN := env $(BROWSER_ENV_UNSET) GOFIPS140=off GOTOOLCHAIN=$(REQUIRED_GO_VERSION) $(GO)
+RELEASE_GO_RUN := env $(BROWSER_ENV_UNSET) -u GOOS -u GOARCH -u GOAMD64 -u GOARM64 -u GO386 -u GOARM \
 	-u GOMIPS -u GOMIPS64 -u GOPPC64 -u GORISCV64 -u GOWASM -u GOROOT \
 	CGO_ENABLED=0 GOFLAGS= GOWORK=off GOENV=off GOEXPERIMENT= GOFIPS140=off \
 	GOTOOLCHAIN=$(REQUIRED_GO_VERSION) $(GO)
@@ -156,20 +159,20 @@ fixture-build: ## Compile the test-only deterministic offline process fixture.
 
 fixture-native: fixture-build ## Run the native offline fixture into ignored review artifacts.
 	mkdir -p $(REVIEW_DIR)
-	env -u REDDIT_USER_AGENT \
+	env $(BROWSER_ENV_UNSET) -u REDDIT_USER_AGENT \
 		DUCKWORDS_OFFLINE_FIXTURE_PROCESS=1 DUCKWORDS_OFFLINE_FIXTURE_PROFILE= $(FIXTURE_BINARY) \
 		> $(REVIEW_DIR)/native-result.json \
 		2> $(REVIEW_DIR)/native-stderr.log
 
 synthetic-demo: fixture-build ## Run the richer non-live synthetic E2E demo into ignored review artifacts.
 	mkdir -p $(SYNTHETIC_REVIEW_DIR)
-	env -u REDDIT_USER_AGENT \
+	env $(BROWSER_ENV_UNSET) -u REDDIT_USER_AGENT \
 		DUCKWORDS_OFFLINE_FIXTURE_PROCESS=1 \
 		DUCKWORDS_OFFLINE_FIXTURE_PROFILE=synthetic-demo \
 		$(FIXTURE_BINARY) \
 		> $(SYNTHETIC_REVIEW_DIR)/raw-stdout.json \
 		2> $(SYNTHETIC_REVIEW_DIR)/raw-application.ndjson
-	$(JQ) -cS 'del(.time, .duration, .throttle_wait, .throttle_waits, .goos, .goarch)' \
+	$(JQ) -cS -s 'map(del(.time, .duration, .throttle_wait, .throttle_waits, .goos, .goarch)) as $$records | ($$records | map(select(.event != "http_attempt"))) as $$stable | $$stable[:5][], ($$records | map(select(.event == "http_attempt")) | sort_by([.post_id, .operation, .attempt])[]), $$stable[5:][]' \
 		$(SYNTHETIC_REVIEW_DIR)/raw-application.ndjson \
 		> $(SYNTHETIC_REVIEW_DIR)/normalized-application.ndjson
 
@@ -187,7 +190,7 @@ synthetic-demo-docker-verify: docker-fixture-build ## Verify the richer syntheti
 		$(DOCKER_FIXTURE_IMAGE) \
 		> $(SYNTHETIC_REVIEW_DIR)/docker-stdout.json \
 		2> $(SYNTHETIC_REVIEW_DIR)/docker-application.ndjson
-	$(JQ) -cS 'del(.time, .duration, .throttle_wait, .throttle_waits, .goos, .goarch)' \
+	$(JQ) -cS -s 'map(del(.time, .duration, .throttle_wait, .throttle_waits, .goos, .goarch)) as $$records | ($$records | map(select(.event != "http_attempt"))) as $$stable | $$stable[:5][], ($$records | map(select(.event == "http_attempt")) | sort_by([.post_id, .operation, .attempt])[]), $$stable[5:][]' \
 		$(SYNTHETIC_REVIEW_DIR)/docker-application.ndjson \
 		> $(SYNTHETIC_REVIEW_DIR)/docker-application.normalized.ndjson
 	cmp $(SYNTHETIC_DEMO_DIR)/synthetic-output.json \
@@ -249,15 +252,15 @@ reddit-smoke: build ## Opt-in one-post public-JSON smoke (never run in CI).
 		exit 2; \
 	}
 	mkdir -p $(REDDIT_SMOKE_DIR)
-	env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY \
+	env $(BROWSER_ENV_UNSET) -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY \
 		-u http_proxy -u https_proxy -u all_proxy -u no_proxy \
 		$(BINARY) --posts-file="$(LIVE_POSTS_FILE)" --workers=1 \
 		--rate-limit=0.5 --failure-mode=strict --timeout=10m --log-format=json \
 		> $(REDDIT_SMOKE_DIR)/result.json \
 		2> $(REDDIT_SMOKE_DIR)/application.ndjson
 
-run: ## Run the CLI; pass options with ARGS='...'.
-	$(GO_RUN) run ./cmd/duckwords $(ARGS)
+run: build ## Build, then run the CLI; pass options with ARGS='...'.
+	$(BINARY) $(ARGS)
 
 version: ## Print CLI build metadata.
 	$(GO_RUN) run ./cmd/duckwords --version

@@ -107,6 +107,9 @@ func executePayloadAttempt(
 
 	response, err := httpClient.Do(request)
 	result := policyAttemptResult{attempted: true}
+	if response != nil {
+		result.statusCode = response.StatusCode
+	}
 	if err != nil {
 		statusCode := 0
 		if response != nil {

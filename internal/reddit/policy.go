@@ -46,10 +46,11 @@ var (
 )
 
 // RequestPolicyConfig defines the process-wide Reddit request ceiling and bounded
-// retry behavior. MaxRetryElapsed is the hard total budget measured from the start
-// of one logical request session. It covers limiter and endpoint-gate waits, the
-// initial HTTP attempt, backoff, and every replay. An internal expiry is distinct
-// from caller cancellation. A completely zero config selects
+// retry behavior. MaxRetryElapsed is the hard cumulative budget for HTTP attempts,
+// retry-observer work, and backoff within one logical request. Mandatory waits for
+// the shared rate limiter or endpoint gate are excluded: those waits enforce
+// process-wide policy and remain bounded by the caller/global context. An internal
+// expiry is distinct from caller cancellation. A completely zero config selects
 // DefaultRequestPolicyConfig; otherwise all duration and rate fields must be set
 // explicitly. MaxRetries may be zero to disable generic retries while retaining
 // request pacing.
@@ -60,6 +61,7 @@ type RequestPolicyConfig struct {
 	InitialBackoff    time.Duration
 	MaxBackoff        time.Duration
 	Observer          RetryObserver
+	AttemptObserver   AttemptObserver
 }
 
 // DefaultRequestPolicyConfig returns conservative, finite production defaults. The
@@ -92,6 +94,25 @@ type RetryEvent struct {
 // return quickly, and not call back into the same RequestPolicy.
 type RetryObserver func(RetryEvent)
 
+// AttemptEvent contains only allowlisted metadata for one completed physical HTTP
+// attempt. Attempt is one-based within its logical request session. The event
+// deliberately excludes URLs, query strings, headers, bodies, tokens, cookies,
+// User-Agent values, and raw errors.
+type AttemptEvent struct {
+	Endpoint   Endpoint
+	PostID     string
+	Attempt    int
+	Succeeded  bool
+	Class      ErrorClass
+	StatusCode int
+	Duration   time.Duration
+}
+
+// AttemptObserver receives sanitized HTTP-attempt completion events synchronously.
+// Calls from independent requests may overlap, so implementations must be
+// concurrency-safe, return quickly, and not call back into the same RequestPolicy.
+type AttemptObserver func(AttemptEvent)
+
 // RequestPolicySnapshot is a race-safe point-in-time view of process-wide request
 // activity. Retry count includes only generic transient-request retries.
 type RequestPolicySnapshot struct {
@@ -105,10 +126,10 @@ type policyWait func(context.Context, time.Duration) error
 type policyJitter func(time.Duration) time.Duration
 
 // RequestPolicy coordinates every public Reddit JSON HTTP attempt in a process.
-// It is safe for concurrent use. Each logical session is bounded from its first
-// limiter wait through its final HTTP attempt. The size-one permit serializes only
-// scheduling; the permit is released before network I/O, so independent requests
-// may overlap.
+// It is safe for concurrent use. Each logical session has a cumulative retry-work
+// budget, while compliant waits behind the shared limiter remain bounded by the
+// caller/global context. The size-one permit serializes only scheduling; the permit
+// is released before network I/O, so independent requests may overlap.
 type RequestPolicy struct {
 	baseInterval    time.Duration
 	maxRetries      int
@@ -116,6 +137,7 @@ type RequestPolicy struct {
 	initialBackoff  time.Duration
 	maxBackoff      time.Duration
 	observer        RetryObserver
+	attemptObserver AttemptObserver
 	now             func() time.Time
 	wait            policyWait
 	jitter          policyJitter
@@ -169,6 +191,7 @@ func newRequestPolicy(
 		initialBackoff:  config.InitialBackoff,
 		maxBackoff:      config.MaxBackoff,
 		observer:        config.Observer,
+		attemptObserver: config.AttemptObserver,
 		now:             now,
 		wait:            wait,
 		jitter:          jitter,
@@ -181,7 +204,7 @@ func newRequestPolicy(
 func zeroRequestPolicyConfig(config RequestPolicyConfig) bool {
 	return config.RequestsPerSecond == 0 && config.MaxRetries == 0 &&
 		config.MaxRetryElapsed == 0 && config.InitialBackoff == 0 &&
-		config.MaxBackoff == 0 && config.Observer == nil
+		config.MaxBackoff == 0 && config.Observer == nil && config.AttemptObserver == nil
 }
 
 func validateRequestPolicyConfig(config RequestPolicyConfig) error {
@@ -228,6 +251,7 @@ type policyAttemptResult struct {
 	payload        []byte
 	releasePayload func()
 	headers        responsePolicyHeaders
+	statusCode     int
 	attempted      bool
 }
 
@@ -286,13 +310,13 @@ type policyAttemptGate func(context.Context) (func(), error)
 
 type retrySession struct {
 	policy         *RequestPolicy
-	startedAt      time.Time
+	chargedElapsed time.Duration
 	httpAttempts   int
 	genericRetries int
 }
 
 func (p *RequestPolicy) newRetrySession() *retrySession {
-	return &retrySession{policy: p, startedAt: p.now()}
+	return &retrySession{policy: p}
 }
 
 func (p *RequestPolicy) do(
@@ -359,47 +383,51 @@ func (session *retrySession) doAfterPayload(
 		if remaining <= 0 {
 			return responsePayload{}, retryBudgetFailure(endpoint, postID, lastErr)
 		}
-		// One child context covers both scheduling and network I/O. Creating it for
-		// the initial attempt is essential: a saturated limiter or slow first HTTP
-		// exchange must not outlive the logical-session budget merely because no
-		// replay has occurred yet.
-		attemptCtx, cancelAttempt := context.WithTimeoutCause(ctx, remaining, errRetryBudget)
-		release, slotErr := session.acquireAttemptSlot(attemptCtx, gate)
+		// Limiter and endpoint-gate waits enforce process-wide policy. Charging them
+		// to each queued request can leave a worker with no time to perform its first
+		// HTTP attempt when Reddit lowers the shared rate. The caller/global context
+		// still bounds these waits.
+		release, slotErr := session.acquireAttemptSlot(ctx, gate)
 		if slotErr != nil {
-			budgetEnded := session.budgetEnded(attemptCtx) || errors.Is(slotErr, errRetryBudget)
-			cancelAttempt()
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return responsePayload{}, newError(ErrorCanceled, endpoint, validDiagnosticPostID(postID), 0, ctxErr)
-			}
-			if budgetEnded {
-				return responsePayload{}, retryBudgetFailure(endpoint, postID, lastErr)
 			}
 			return responsePayload{}, newError(ErrorCanceled, endpoint, validDiagnosticPostID(postID), 0, slotErr)
 		}
-		// Recheck the injected monotonic clock after scheduling. A deterministic
-		// test wait can advance it without firing the wall-clock context timer; in
-		// production this also closes the narrow boundary race before Client.Do.
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			release()
-			cancelAttempt()
 			return responsePayload{}, newError(ErrorCanceled, endpoint, validDiagnosticPostID(postID), 0, ctxErr)
 		}
-		if session.budgetEnded(attemptCtx) {
+		remaining = session.remainingBudget()
+		if remaining <= 0 {
 			release()
-			cancelAttempt()
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return responsePayload{}, newError(ErrorCanceled, endpoint, validDiagnosticPostID(postID), 0, ctxErr)
-			}
 			return responsePayload{}, retryBudgetFailure(endpoint, postID, lastErr)
 		}
 
+		attemptCtx, cancelAttempt := context.WithTimeoutCause(ctx, remaining, errRetryBudget)
+		attemptStarted := p.now()
 		result, err := attempt(attemptCtx)
 		release()
+		attemptCompleted := p.now()
+		attemptDuration := attemptCompleted.Sub(attemptStarted)
+		if attemptDuration < 0 {
+			attemptDuration = 0
+		}
+		// The HTTP exchange consumes retry-work budget. Logging the completed
+		// physical attempt does not: a slow diagnostic sink must never turn an
+		// already accepted response into a failed logical request.
+		session.charge(attemptDuration)
 		budgetEnded := session.budgetEnded(attemptCtx)
 		cancelAttempt()
 		if result.attempted {
 			session.httpAttempts++
 			p.httpAttempts.Add(1)
+			attemptErr := err
+			var adapterErr *Error
+			if budgetEnded && ctx.Err() == nil && errors.As(err, &adapterErr) && adapterErr.Class == ErrorCanceled {
+				attemptErr = newError(ErrorTransport, endpoint, validDiagnosticPostID(postID), result.statusCode, errRetryBudget)
+			}
+			p.recordAttempt(endpoint, postID, attemptErr, result.statusCode, session.httpAttempts, attemptDuration)
 			p.observeRateHeaders(result.headers)
 			p.observeSharedRetryAfter(err, result.headers.retryAfter)
 		}
@@ -430,7 +458,9 @@ func (session *retrySession) doAfterPayload(
 			return responsePayload{}, err
 		}
 		session.genericRetries++
+		observerStarted := p.now()
 		p.recordRetry(endpoint, postID, err, session.httpAttempts+1, delay)
+		session.charge(p.now().Sub(observerStarted))
 		budgetEnded, waitErr := session.waitForRetry(ctx, delay)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return responsePayload{}, newError(ErrorCanceled, endpoint, validDiagnosticPostID(postID), 0, ctxErr)
@@ -454,8 +484,10 @@ func (session *retrySession) waitForRetry(ctx context.Context, delay time.Durati
 		return true, nil
 	}
 	waitCtx, cancel := context.WithTimeoutCause(ctx, remaining, errRetryBudget)
+	waitStarted := session.policy.now()
 	waitErr := session.policy.waitForRetry(waitCtx, delay)
 	waitCause := context.Cause(waitCtx)
+	session.charge(session.policy.now().Sub(waitStarted))
 	cancel()
 
 	if ctx.Err() != nil {
@@ -472,11 +504,7 @@ func (session *retrySession) acquireAttemptSlot(
 	gate policyAttemptGate,
 ) (func(), error) {
 	if gate == nil {
-		budget := session.remainingBudget()
-		if budget <= 0 {
-			return nil, errRetryBudget
-		}
-		if err := session.policy.waitForPermit(ctx, budget); err != nil {
+		if err := session.policy.waitForPermit(ctx); err != nil {
 			return nil, err
 		}
 		return func() {}, nil
@@ -491,10 +519,6 @@ func (session *retrySession) acquireAttemptSlot(
 		if err != nil {
 			return nil, err
 		}
-		if session.remainingBudget() <= 0 {
-			release()
-			return nil, errRetryBudget
-		}
 		delay, granted, err := session.policy.tryPermit(ctx)
 		if err != nil {
 			release()
@@ -504,10 +528,6 @@ func (session *retrySession) acquireAttemptSlot(
 			return release, nil
 		}
 		release()
-		remaining := session.remainingBudget()
-		if remaining <= 0 || delay >= remaining {
-			return nil, errRetryBudget
-		}
 		if err := session.policy.waitForThrottle(ctx, delay); err != nil {
 			return nil, err
 		}
@@ -515,11 +535,19 @@ func (session *retrySession) acquireAttemptSlot(
 }
 
 func (session *retrySession) remainingBudget() time.Duration {
-	elapsed := session.policy.now().Sub(session.startedAt)
-	if elapsed < 0 {
-		elapsed = 0
+	return session.policy.maxRetryElapsed - session.chargedElapsed
+}
+
+func (session *retrySession) charge(elapsed time.Duration) {
+	if elapsed <= 0 || session.chargedElapsed >= session.policy.maxRetryElapsed {
+		return
 	}
-	return session.policy.maxRetryElapsed - elapsed
+	remaining := session.policy.maxRetryElapsed - session.chargedElapsed
+	if elapsed >= remaining {
+		session.chargedElapsed = session.policy.maxRetryElapsed
+		return
+	}
+	session.chargedElapsed += elapsed
 }
 
 func (session *retrySession) budgetEnded(ctx context.Context) bool {
@@ -527,9 +555,9 @@ func (session *retrySession) budgetEnded(ctx context.Context) bool {
 }
 
 // retryBudgetFailure preserves the material error that justified a generic replay.
-// When the initial scheduling/HTTP attempt alone exhausts the
-// session, no prior server result exists, so expose one sanitized non-cancellation
-// transport failure while retaining errRetryBudget for errors.Is classification.
+// When the initial HTTP attempt alone exhausts the session, no prior server result
+// exists, so expose one sanitized non-cancellation transport failure while retaining
+// errRetryBudget for errors.Is classification.
 func retryBudgetFailure(endpoint Endpoint, postID string, previous error) error {
 	if previous != nil {
 		return previous
@@ -710,6 +738,36 @@ func (p *RequestPolicy) recordRetry(
 	})
 }
 
+func (p *RequestPolicy) recordAttempt(
+	endpoint Endpoint,
+	postID string,
+	err error,
+	statusCode int,
+	attempt int,
+	duration time.Duration,
+) {
+	if p.attemptObserver == nil {
+		return
+	}
+	event := AttemptEvent{
+		Endpoint:   endpoint,
+		PostID:     validDiagnosticPostID(postID),
+		Attempt:    attempt,
+		Succeeded:  err == nil,
+		StatusCode: statusCode,
+		Duration:   duration,
+	}
+	if err != nil {
+		event.Class = ErrorProtocol
+		var adapterError *Error
+		if errors.As(err, &adapterError) {
+			event.Class = adapterError.Class
+			event.StatusCode = adapterError.StatusCode
+		}
+	}
+	p.attemptObserver(event)
+}
+
 func (p *RequestPolicy) waitForRetry(ctx context.Context, delay time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -719,8 +777,10 @@ func (p *RequestPolicy) waitForRetry(ctx context.Context, delay time.Duration) e
 
 // waitForPermit holds the size-one scheduling permit while waiting, then releases
 // it before network I/O. Rechecking after each wait lets a concurrent response
-// tighten runtime rate limits without leaving a queue of stale reservations.
-func (p *RequestPolicy) waitForPermit(ctx context.Context, sessionBudget time.Duration) error {
+// tighten runtime rate limits without leaving a queue of stale reservations. The
+// caller/global context, rather than a per-request retry budget, bounds this
+// mandatory compliance wait.
+func (p *RequestPolicy) waitForPermit(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -751,17 +811,8 @@ func (p *RequestPolicy) waitForPermit(ctx context.Context, sessionBudget time.Du
 		delay := target.Sub(now)
 		p.mu.Unlock()
 
-		if sessionBudget > 0 && delay >= sessionBudget {
-			return errRetryBudget
-		}
 		if err := p.waitForThrottle(ctx, delay); err != nil {
 			return err
-		}
-		if sessionBudget > 0 {
-			sessionBudget -= delay
-			if sessionBudget <= 0 {
-				return errRetryBudget
-			}
 		}
 	}
 }

@@ -247,13 +247,16 @@ func TestOfflineFixtureProcessProducesGoldenJSON(t *testing.T) {
 		t.Fatalf("offline fixture stdout mismatch:\ngot:\n%s\nwant:\n%s", stdout.String(), want)
 	}
 	for _, event := range []string{
-		"event=run_started", "event=run_summary", "event=output_written",
+		"event=run_started", "event=http_attempt", "result=success", "event=run_summary", "event=output_written",
 		"access_profile=old-reddit-public-json-v1", "reddit_origin=old.reddit.com",
 		"reddit_method=GET", "reddit_auth=none", "ua_source=", "ua_sha256=",
 	} {
 		if !strings.Contains(stderr.String(), event) {
 			t.Fatalf("offline fixture stderr does not contain %q:\n%s", event, stderr.String())
 		}
+	}
+	if got := strings.Count(stderr.String(), "event=http_attempt"); got != 1 {
+		t.Fatalf("HTTP attempt event count = %d, want 1:\n%s", got, stderr.String())
 	}
 	access, err := production.ResolveAccessIdentity(os.LookupEnv)
 	if err != nil {

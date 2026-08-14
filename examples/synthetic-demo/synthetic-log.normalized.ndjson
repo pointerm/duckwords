@@ -3,6 +3,12 @@
 {"entries":3,"event":"source_parsed","level":"INFO","msg":"source parsed","posts_sha256":"2a6b638862a7d50f5966eec44fcc99b9704184ae14f4375b24824551b751d19e","source_kind":"posts","source_sha256":"ffd51f42f2b9c93693502a27dfd1766ec68f56d09527ac5b32dc4f3adb642061","stage":"parsed"}
 {"event":"source_loaded","level":"INFO","msg":"source loaded","source_bytes":87,"source_kind":"dictionary","source_mode":"https","source_origin":"raw.githubusercontent.com","source_sha256":"08f35c92a4663a921bd77397351a362abe2327c79e394bf633e531245898163b"}
 {"entries":15,"event":"source_parsed","level":"INFO","msg":"source parsed","source_kind":"dictionary","source_sha256":"08f35c92a4663a921bd77397351a362abe2327c79e394bf633e531245898163b","stage":"parsed"}
+{"attempt":1,"event":"http_attempt","http_status":200,"level":"INFO","msg":"HTTP attempt completed","operation":"comment_expansion","post_id":"synth001","result":"success","scope":"reddit"}
+{"attempt":1,"event":"http_attempt","http_status":200,"level":"INFO","msg":"HTTP attempt completed","operation":"comment_expansion","post_id":"synth001","result":"success","scope":"reddit"}
+{"attempt":1,"event":"http_attempt","http_status":200,"level":"INFO","msg":"HTTP attempt completed","operation":"comments","post_id":"synth001","result":"success","scope":"reddit"}
+{"attempt":1,"event":"http_attempt","http_status":200,"level":"INFO","msg":"HTTP attempt completed","operation":"comments","post_id":"synth002","result":"success","scope":"reddit"}
+{"attempt":1,"event":"http_attempt","http_status":200,"level":"INFO","msg":"HTTP attempt completed","operation":"comments","post_id":"synth003","result":"success","scope":"reddit"}
+{"attempt":1,"event":"http_attempt","http_status":200,"level":"INFO","msg":"HTTP attempt completed","operation":"continuation","post_id":"synth003","result":"success","scope":"reddit"}
 {"bodies_visited":3,"comments":6,"continuation_requests":0,"counted_tokens":11,"event":"post_outcome","expansion_requests":2,"level":"INFO","msg":"post processing completed","post_id":"synth001","source_line":1,"status":"completed"}
 {"bodies_visited":3,"comments":3,"continuation_requests":0,"counted_tokens":12,"event":"post_outcome","expansion_requests":0,"level":"INFO","msg":"post processing completed","post_id":"synth002","source_line":2,"status":"completed"}
 {"bodies_visited":2,"comments":2,"continuation_requests":1,"counted_tokens":7,"event":"post_outcome","expansion_requests":0,"level":"INFO","msg":"post processing completed","post_id":"synth003","source_line":3,"status":"completed"}
