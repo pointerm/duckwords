@@ -253,12 +253,28 @@ func (c *Client) WalkComments(
 		}
 		return c.request(fetchCtx, EndpointCommentExpansion, post.ID, request)
 	}
-	fetchContinuation := func(fetchCtx context.Context, parentCommentID string) (responsePayload, error) {
+	fetchContinuation := func(fetchCtx context.Context, parentCommentID string) (continuationResponse, error) {
 		request, buildErr := c.focalRequest(post, parentCommentID, EndpointContinuation)
 		if buildErr != nil {
-			return responsePayload{}, buildErr
+			return continuationResponse{}, buildErr
 		}
-		return c.request(fetchCtx, EndpointContinuation, post.ID, request)
+		session := c.requestPolicy.newRetrySession()
+		payload, requestErr := c.requestWithSession(fetchCtx, session, EndpointContinuation, post.ID, request)
+		if requestErr != nil {
+			return continuationResponse{}, requestErr
+		}
+		response := continuationResponse{payload: payload.take()}
+		if session.canRetry() {
+			response.canReplay = session.canRetry
+			response.replay = func(retryCtx context.Context, previousErr error) (responsePayload, error) {
+				fallback, fallbackErr := c.continuationFallbackRequest(post, parentCommentID)
+				if fallbackErr != nil {
+					return responsePayload{}, fallbackErr
+				}
+				return c.retryRequestWithSession(retryCtx, session, EndpointContinuation, post.ID, previousErr, fallback)
+			}
+		}
+		return response, nil
 	}
 	return walkDecodedCompleteWithBudget(ctx, post.ID, initial.take(), c.thingLimits, c.traversalBudget, fetchExpansion, fetchContinuation, visit)
 }
@@ -331,6 +347,26 @@ func (c *Client) focalRequest(post PostRef, commentID string, endpoint Endpoint)
 	return c.publicRequest(post.JSONPath, commentID), nil
 }
 
+// continuationFallbackRequest uses Reddit's equivalent path-form focal route for
+// bounded semantic replays. The distinct cache key can recover a transient stale
+// query-form response without changing the fixed origin or accepting an incomplete
+// tree as complete.
+func (c *Client) continuationFallbackRequest(post PostRef, commentID string) (apiRequest, error) {
+	if !validPostRef(post) || !validCommentID(commentID) {
+		return apiRequest{}, newError(ErrorInvalidInput, EndpointContinuation, validDiagnosticPostID(post.ID), 0, errMalformedResponse)
+	}
+	target := c.apiBase
+	target.Path = "/comments/" + post.ID + "/_/" + commentID + "/.json"
+	query := make(url.Values, 5)
+	query.Set("context", "0")
+	query.Set("limit", "500")
+	query.Set("raw_json", "1")
+	query.Set("showmore", "true")
+	query.Set("sort", "confidence")
+	target.RawQuery = query.Encode()
+	return apiRequest{url: target.String()}, nil
+}
+
 func (c *Client) publicRequest(jsonPath, commentID string) apiRequest {
 	target := c.apiBase
 	target.Path = jsonPath
@@ -349,7 +385,24 @@ func (c *Client) publicRequest(jsonPath, commentID string) apiRequest {
 
 func (c *Client) request(ctx context.Context, endpoint Endpoint, postID string, spec apiRequest) (responsePayload, error) {
 	session := c.requestPolicy.newRetrySession()
+	return c.requestWithSession(ctx, session, endpoint, postID, spec)
+}
+
+func (c *Client) requestWithSession(ctx context.Context, session *retrySession, endpoint Endpoint, postID string, spec apiRequest) (responsePayload, error) {
 	return session.doAfterPayload(ctx, endpoint, postID, nil, c.requestGate(endpoint, postID), func(attemptCtx context.Context) (policyAttemptResult, error) {
+		return c.doAttempt(attemptCtx, endpoint, postID, spec)
+	})
+}
+
+func (c *Client) retryRequestWithSession(
+	ctx context.Context,
+	session *retrySession,
+	endpoint Endpoint,
+	postID string,
+	previousErr error,
+	spec apiRequest,
+) (responsePayload, error) {
+	return session.retryAfterPayload(ctx, endpoint, postID, previousErr, c.requestGate(endpoint, postID), func(attemptCtx context.Context) (policyAttemptResult, error) {
 		return c.doAttempt(attemptCtx, endpoint, postID, spec)
 	})
 }

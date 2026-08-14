@@ -57,8 +57,8 @@ const (
 	// MaxRequestTimeout prevents a single stuck attempt from consuming the run.
 	MaxRequestTimeout = 2 * time.Minute
 
-	// DefaultMaxRetries permits a small number of transient retries without hiding a
-	// persistent failure.
+	// DefaultMaxRetries permits a small number of transient HTTP or proven
+	// no-progress continuation retries without hiding a persistent failure.
 	DefaultMaxRetries = 3
 	// MinMaxRetries allows retries to be disabled explicitly.
 	MinMaxRetries = 0
@@ -259,7 +259,7 @@ func Parse(args []string) (Config, error) {
 	flags.Float64Var(&cfg.RateLimit, "rate-limit", cfg.RateLimit, "requests per second")
 	flags.DurationVar(&cfg.RequestTimeout, "request-timeout", cfg.RequestTimeout, "one HTTP attempt timeout")
 	flags.DurationVar(&cfg.Timeout, "timeout", cfg.Timeout, "global execution timeout")
-	flags.IntVar(&cfg.MaxRetries, "max-retries", cfg.MaxRetries, "transient retries")
+	flags.IntVar(&cfg.MaxRetries, "max-retries", cfg.MaxRetries, "transient HTTP and no-progress continuation retries")
 	flags.DurationVar(&cfg.RetryBudget, "retry-budget", cfg.RetryBudget, "total retry session")
 	flags.StringVar(&failureMode, "failure-mode", failureMode, "best-effort or strict")
 	flags.StringVar(&logLevel, "log-level", logLevel, "debug, info, warn, or error")

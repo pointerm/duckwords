@@ -158,6 +158,151 @@ func TestClientWalkCommentsContinuesDepthTruncatedBranchWithPublicFocalGET(t *te
 	}
 }
 
+func TestClientRetriesNoProgressContinuationWithAlternatePath(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		if request.Header.Get("Cookie") != "session=semantic-retry" {
+			t.Errorf("Cookie = %q", request.Header.Get("Cookie"))
+		}
+		response.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.URL.Path == testPostRef.JSONPath && request.URL.Query().Get("comment") == "":
+			_, _ = response.Write(testInitial(t, "post1",
+				testComment("root", "root body", "t3_post1", testListing(
+					testComment("child", "child body", "t1_root", ""),
+					testMore([]string{}, 0, "t1_root"),
+				)),
+			))
+		case request.URL.Path == testPostRef.JSONPath && request.URL.Query().Get("comment") == "root":
+			// A valid focal response that adds nothing is semantically incomplete,
+			// even though the HTTP exchange itself succeeded.
+			_, _ = response.Write(testInitial(t, "post1",
+				testComment("root", "duplicate root", "t3_post1", testListing(
+					testComment("child", "duplicate child", "t1_root", ""),
+					testMore([]string{}, 1, "t1_root"),
+				)),
+			))
+		case request.URL.Path == "/comments/post1/_/root/.json":
+			if request.URL.Query().Get("comment") != "" || request.URL.Query().Get("context") != "0" {
+				t.Errorf("fallback query = %q", request.URL.RawQuery)
+			}
+			_, _ = response.Write(testInitial(t, "post1",
+				testComment("root", "duplicate root", "t3_post1", testListing(
+					testComment("child", "duplicate child", "t1_root", testListing(
+						testComment("grandchild", "grandchild body", "t1_child", ""),
+					)),
+				)),
+			))
+		default:
+			t.Errorf("unexpected request path=%q query=%q", request.URL.Path, request.URL.RawQuery)
+			http.Error(response, "unexpected", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	var retries []RetryEvent
+	var attempts []AttemptEvent
+	config := validPublicClientConfig(t, server)
+	browserSession, err := NewBrowserSession(BrowserSessionConfig{Cookie: "session=semantic-retry"})
+	if err != nil {
+		t.Fatalf("NewBrowserSession() error = %v", err)
+	}
+	config.BrowserSession = browserSession
+	policyConfig := DefaultRequestPolicyConfig()
+	policyConfig.MaxRetries = 1
+	policyConfig.Observer = func(event RetryEvent) { retries = append(retries, event) }
+	policyConfig.AttemptObserver = func(event AttemptEvent) { attempts = append(attempts, event) }
+	clock := newPolicyTestClock()
+	config.RequestPolicy = mustPolicyForTest(t, clock, policyConfig)
+	client := newPublicTestClient(t, config, server.URL)
+
+	var visited []string
+	stats, err := client.WalkComments(context.Background(), testPostRef, func(comment Comment) error {
+		visited = append(visited, comment.ID)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WalkComments() error = %v", err)
+	}
+	if !slices.Equal(visited, []string{"root", "child", "grandchild"}) {
+		t.Fatalf("visited = %q", visited)
+	}
+	if stats.ContinuationRequests != 2 || requests.Load() != 3 {
+		t.Fatalf("stats = %#v, requests = %d", stats, requests.Load())
+	}
+	if len(retries) != 1 || retries[0].Endpoint != EndpointContinuation || retries[0].Class != ErrorIncomplete || retries[0].Attempt != 2 {
+		t.Fatalf("retry events = %#v", retries)
+	}
+	var continuationAttempts []AttemptEvent
+	for _, event := range attempts {
+		if event.Endpoint == EndpointContinuation {
+			continuationAttempts = append(continuationAttempts, event)
+		}
+	}
+	if len(continuationAttempts) != 2 || continuationAttempts[0].Attempt != 1 || continuationAttempts[1].Attempt != 2 {
+		t.Fatalf("continuation attempts = %#v", continuationAttempts)
+	}
+	if snapshot := config.RequestPolicy.Snapshot(); snapshot.HTTPAttempts != 3 || snapshot.Retries != 1 {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+}
+
+func TestClientBoundsPersistentNoProgressContinuation(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		response.Header().Set("Content-Type", "application/json")
+		if request.URL.Query().Get("comment") == "" && request.URL.Path == testPostRef.JSONPath {
+			_, _ = response.Write(testInitial(t, "post1",
+				testComment("root", "root body", "t3_post1", testListing(testMore([]string{}, 0, "t1_root"))),
+			))
+			return
+		}
+		_, _ = response.Write(testInitial(t, "post1", testComment("root", "duplicate root", "t3_post1", "")))
+	}))
+	defer server.Close()
+
+	config := validPublicClientConfig(t, server)
+	config.RequestPolicy = newInstantTestRequestPolicyWithRetries(t, 1)
+	client := newPublicTestClient(t, config, server.URL)
+	stats, err := client.WalkComments(context.Background(), testPostRef, func(Comment) error { return nil })
+	assertClientError(t, err, ErrorIncomplete, EndpointContinuation, 0)
+	if !errors.Is(err, errContinuationNoProgress) || stats.ContinuationRequests != 2 || requests.Load() != 3 {
+		t.Fatalf("error = %v, stats = %#v, requests = %d", err, stats, requests.Load())
+	}
+}
+
+func TestClientDoesNotReplayContinuationWhenRetriesAreDisabled(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		response.Header().Set("Content-Type", "application/json")
+		if request.URL.Query().Get("comment") == "" {
+			_, _ = response.Write(testInitial(t, "post1",
+				testComment("root", "root body", "t3_post1", testListing(testMore([]string{}, 0, "t1_root"))),
+			))
+			return
+		}
+		_, _ = response.Write(testInitial(t, "post1", testComment("root", "duplicate root", "t3_post1", "")))
+	}))
+	defer server.Close()
+
+	config := validPublicClientConfig(t, server)
+	client := newPublicTestClient(t, config, server.URL)
+	stats, err := client.WalkComments(context.Background(), testPostRef, func(Comment) error { return nil })
+	assertClientError(t, err, ErrorIncomplete, EndpointContinuation, 0)
+	if stats.ContinuationRequests != 1 || requests.Load() != 2 || config.RequestPolicy.Snapshot().Retries != 0 {
+		t.Fatalf("stats = %#v, requests = %d, snapshot = %#v", stats, requests.Load(), config.RequestPolicy.Snapshot())
+	}
+}
+
 func TestClientWalkCommentsFailsClosedWhenFocalListingOmitsRequestedComment(t *testing.T) {
 	t.Parallel()
 
@@ -499,6 +644,14 @@ func TestPublicRequestBuilderPinsPathAndExactQuery(t *testing.T) {
 	assertRequestURL(t, focal.url, testPostRef.JSONPath, url.Values{
 		"comment": {"child"}, "context": {"0"}, "limit": {"500"},
 		"raw_json": {"1"}, "showmore": {"true"}, "sort": {"confidence"},
+	})
+	fallback, err := client.continuationFallbackRequest(testPostRef, "child")
+	if err != nil {
+		t.Fatalf("continuationFallbackRequest() error = %v", err)
+	}
+	assertRequestURL(t, fallback.url, "/comments/post1/_/child/.json", url.Values{
+		"context": {"0"}, "limit": {"500"}, "raw_json": {"1"},
+		"showmore": {"true"}, "sort": {"confidence"},
 	})
 }
 

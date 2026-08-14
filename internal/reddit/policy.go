@@ -77,8 +77,9 @@ func DefaultRequestPolicyConfig() RequestPolicyConfig {
 	}
 }
 
-// RetryEvent contains only allowlisted, bounded metadata for an HTTP replay. It
-// deliberately excludes URLs, headers, bodies, tokens, and underlying error text.
+// RetryEvent contains only allowlisted, bounded metadata for an HTTP or semantic
+// continuation replay. It deliberately excludes URLs, headers, bodies, tokens,
+// and underlying error text.
 type RetryEvent struct {
 	Endpoint   Endpoint
 	PostID     string
@@ -114,7 +115,8 @@ type AttemptEvent struct {
 type AttemptObserver func(AttemptEvent)
 
 // RequestPolicySnapshot is a race-safe point-in-time view of process-wide request
-// activity. Retry count includes only generic transient-request retries.
+// activity. Retry count includes transient HTTP replays and bounded semantic
+// continuation replays.
 type RequestPolicySnapshot struct {
 	HTTPAttempts      uint64
 	Retries           uint64
@@ -474,6 +476,52 @@ func (session *retrySession) doAfterPayload(
 	}
 }
 
+// retryAfterPayload schedules one semantic continuation replay inside the same
+// logical request session as the accepted but no-progress HTTP response. Sharing
+// the retry count, elapsed budget, backoff, limiter, and attempt numbering prevents
+// semantic validation from multiplying the configured retry policy.
+func (session *retrySession) retryAfterPayload(
+	ctx context.Context,
+	endpoint Endpoint,
+	postID string,
+	previousErr error,
+	gate policyAttemptGate,
+	attempt policyAttempt,
+) (responsePayload, error) {
+	if session == nil || session.policy == nil || ctx == nil || attempt == nil ||
+		endpoint != EndpointContinuation || !errors.Is(previousErr, errContinuationNoProgress) {
+		return responsePayload{}, newError(ErrorInvalidInput, endpoint, validDiagnosticPostID(postID), 0, ErrRequestPolicyConfig)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return responsePayload{}, newError(ErrorCanceled, endpoint, validDiagnosticPostID(postID), 0, ctxErr)
+	}
+	p := session.policy
+	if session.genericRetries >= p.maxRetries {
+		return responsePayload{}, previousErr
+	}
+	delay := p.retryDelay("", session.genericRetries)
+	remaining := session.remainingBudget()
+	if remaining <= 0 || delay >= remaining {
+		return responsePayload{}, previousErr
+	}
+
+	session.genericRetries++
+	observerStarted := p.now()
+	p.recordRetry(endpoint, postID, previousErr, session.httpAttempts+1, delay)
+	session.charge(p.now().Sub(observerStarted))
+	budgetEnded, waitErr := session.waitForRetry(ctx, delay)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return responsePayload{}, newError(ErrorCanceled, endpoint, validDiagnosticPostID(postID), 0, ctxErr)
+	}
+	if budgetEnded {
+		return responsePayload{}, previousErr
+	}
+	if waitErr != nil {
+		return responsePayload{}, newError(ErrorCanceled, endpoint, validDiagnosticPostID(postID), 0, waitErr)
+	}
+	return session.doAfterPayload(ctx, endpoint, postID, previousErr, gate, attempt)
+}
+
 // waitForRetry rechecks elapsed time after the synchronous observer and gives the
 // backoff wait a child context bounded by the remaining retry-session budget. An
 // internal budget deadline is policy exhaustion, not caller cancellation, so the
@@ -536,6 +584,11 @@ func (session *retrySession) acquireAttemptSlot(
 
 func (session *retrySession) remainingBudget() time.Duration {
 	return session.policy.maxRetryElapsed - session.chargedElapsed
+}
+
+func (session *retrySession) canRetry() bool {
+	return session != nil && session.policy != nil &&
+		session.genericRetries < session.policy.maxRetries && session.remainingBudget() > 0
 }
 
 func (session *retrySession) charge(elapsed time.Duration) {
@@ -727,6 +780,8 @@ func (p *RequestPolicy) recordRetry(
 	if errors.As(err, &adapterError) {
 		class = adapterError.Class
 		status = adapterError.StatusCode
+	} else if errors.Is(err, errContinuationNoProgress) {
+		class = ErrorIncomplete
 	}
 	p.observer(RetryEvent{
 		Endpoint:   endpoint,

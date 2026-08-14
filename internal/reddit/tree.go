@@ -58,6 +58,9 @@ var (
 	errNilCommentVisitor        = errors.New("nil comment visitor")
 	errMalformedResponse        = errors.New("malformed reddit response")
 	errIncompleteTree           = errors.New("incomplete reddit comment tree")
+	errContinuationNoProgress   = fmt.Errorf("%w: continuation made no progress", errIncompleteTree)
+	errContinuationRepeated     = fmt.Errorf("%w: continuation marker repeated", errIncompleteTree)
+	errContinuationChildrenGone = fmt.Errorf("%w: continuation child IDs unavailable", errIncompleteTree)
 	errThingLimit               = errors.New("reddit thing limit exceeded")
 	errCommentLimit             = errors.New("reddit comment limit exceeded")
 	errMoreIDLimit              = errors.New("reddit more-child ID limit exceeded")
@@ -131,7 +134,15 @@ type WalkStats struct {
 type expansionFetcher func(context.Context, []string) ([]byte, error)
 type continuationFetcher func(context.Context, string) ([]byte, error)
 type admittedExpansionFetcher func(context.Context, string) (responsePayload, error)
-type admittedContinuationFetcher func(context.Context, string) (responsePayload, error)
+type continuationReplay func(context.Context, error) (responsePayload, error)
+
+type continuationResponse struct {
+	payload   responsePayload
+	replay    continuationReplay
+	canReplay func() bool
+}
+
+type admittedContinuationFetcher func(context.Context, string) (continuationResponse, error)
 type commentVisitor func(Comment) error
 
 type visitError struct {
@@ -151,6 +162,16 @@ type continuationCheckpoint struct {
 	comments      int
 	uniqueMoreIDs int
 	continuations int
+	parentID      string
+	replay        continuationReplay
+	canReplay     func() bool
+	unresolved    error
+}
+
+type pendingContinuation struct {
+	parentID  string
+	replay    continuationReplay
+	canReplay func() bool
 }
 
 type jsonObject map[string]any
@@ -227,11 +248,11 @@ func adaptContinuationFetcher(fetch continuationFetcher) admittedContinuationFet
 	if fetch == nil {
 		return nil
 	}
-	return func(ctx context.Context, parentID string) (responsePayload, error) {
+	return func(ctx context.Context, parentID string) (continuationResponse, error) {
 		payload, err := fetch(ctx, parentID)
 		owned := responsePayload{data: payload}
 		payload = nil
-		return owned.take(), err
+		return continuationResponse{payload: owned.take()}, err
 	}
 }
 
@@ -329,11 +350,12 @@ func walkDecodedCompleteWithBudget(
 	commentOrder := make([]string, 0, initialCommentCapacity)
 	moreParents := make(map[string]string)
 	pendingMore := make([]string, 0)
-	pendingContinuations := make([]string, 0)
+	pendingContinuations := make([]pendingContinuation, 0)
 	seenContinuations := make(map[string]struct{})
 	var activeContinuation *continuationCheckpoint
+	var retryContinuation *pendingContinuation
 
-	for len(stack) > 0 || len(pendingMore) > 0 || len(pendingContinuations) > 0 || activeContinuation != nil {
+	for len(stack) > 0 || len(pendingMore) > 0 || len(pendingContinuations) > 0 || activeContinuation != nil || retryContinuation != nil {
 		if err := ctx.Err(); err != nil {
 			return stats, newError(ErrorCanceled, EndpointComments, postID, 0, err)
 		}
@@ -355,9 +377,18 @@ func walkDecodedCompleteWithBudget(
 			case "t1":
 				err = processComment(ctx, data, item.expectedParent, item.endpoint, postID, limits, visit, commentParents, commentOrigins, &commentOrder, moreParents, &stack, &stats, &retained)
 			case "more":
-				err = processMore(ctx, data, item.expectedParent, postID, limits, fetchContinuation != nil, commentParents, moreParents, seenContinuations, &pendingMore, &pendingContinuations, &stats, &retained)
+				err = processMore(ctx, data, item.expectedParent, item.endpoint, postID, limits, fetchContinuation != nil, commentParents, moreParents, seenContinuations, &pendingMore, &pendingContinuations, &stats, &retained)
 			default:
 				err = errMalformedResponse
+			}
+			if (errors.Is(err, errContinuationRepeated) || errors.Is(err, errContinuationChildrenGone)) &&
+				item.endpoint == EndpointContinuation && activeContinuation != nil {
+				// Finish the accepted focal response before deciding whether it made
+				// progress. An unresolved marker mixed with new comments is not replayed:
+				// combining two mutable snapshots after visitor side effects would be
+				// unsafe. A duplicate-only response remains replayable below.
+				activeContinuation.unresolved = err
+				err = nil
 			}
 			if err != nil {
 				return stats, classifyTreeError(item.endpoint, postID, err)
@@ -365,15 +396,30 @@ func walkDecodedCompleteWithBudget(
 			continue
 		}
 		if activeContinuation != nil {
-			if stats.Comments == activeContinuation.comments &&
+			noProgress := stats.Comments == activeContinuation.comments &&
 				stats.UniqueMoreIDs == activeContinuation.uniqueMoreIDs &&
-				len(seenContinuations) == activeContinuation.continuations {
-				return stats, protocolError(EndpointContinuation, postID, errIncompleteTree)
+				len(seenContinuations) == activeContinuation.continuations
+			if activeContinuation.unresolved != nil && !noProgress {
+				return stats, protocolError(EndpointContinuation, postID, activeContinuation.unresolved)
+			}
+			if noProgress {
+				if activeContinuation.replay == nil ||
+					(activeContinuation.canReplay != nil && !activeContinuation.canReplay()) {
+					return stats, protocolError(EndpointContinuation, postID, errContinuationNoProgress)
+				}
+				retryContinuation = &pendingContinuation{
+					parentID:  activeContinuation.parentID,
+					replay:    activeContinuation.replay,
+					canReplay: activeContinuation.canReplay,
+				}
 			}
 			activeContinuation = nil
+			if retryContinuation != nil {
+				continue
+			}
 		}
 
-		if len(pendingMore) > 0 {
+		if retryContinuation == nil && len(pendingMore) > 0 {
 			childID, found := takeMoreID(&pendingMore, commentParents)
 			if !found {
 				continue
@@ -416,13 +462,20 @@ func walkDecodedCompleteWithBudget(
 			activeResponse.data = nil
 			continue
 		}
-		if len(pendingContinuations) == 0 {
+		if retryContinuation == nil && len(pendingContinuations) == 0 {
 			continue
 		}
 
-		parentID := pendingContinuations[0]
-		pendingContinuations[0] = ""
-		pendingContinuations = pendingContinuations[1:]
+		var pending pendingContinuation
+		if retryContinuation != nil {
+			pending = *retryContinuation
+			retryContinuation = nil
+		} else {
+			pending = pendingContinuations[0]
+			pendingContinuations[0] = pendingContinuation{}
+			pendingContinuations = pendingContinuations[1:]
+		}
+		parentID := pending.parentID
 		if _, present := commentParents[parentID]; !present {
 			return stats, protocolError(EndpointContinuation, postID, errIncompleteTree)
 		}
@@ -430,7 +483,23 @@ func walkDecodedCompleteWithBudget(
 			return stats, resourceError(EndpointContinuation, postID, errContinuationRequestLimit)
 		}
 		stats.ContinuationRequests++
-		payload, fetchErr := fetchContinuation(ctx, parentID)
+		var response continuationResponse
+		var fetchErr error
+		if pending.replay != nil {
+			response.payload, fetchErr = pending.replay(ctx, errContinuationNoProgress)
+			response.replay = pending.replay
+			response.canReplay = pending.canReplay
+		} else {
+			response, fetchErr = fetchContinuation(ctx, parentID)
+		}
+		payload := response.payload.take()
+		if errors.Is(fetchErr, errContinuationNoProgress) {
+			payload.releaseNow()
+			if pending.replay != nil {
+				stats.ContinuationRequests--
+			}
+			return stats, protocolError(EndpointContinuation, postID, fetchErr)
+		}
 		if err := classifyFetchError(ctx, EndpointContinuation, postID, fetchErr); err != nil {
 			payload.releaseNow()
 			return stats, err
@@ -447,6 +516,12 @@ func walkDecodedCompleteWithBudget(
 		}
 		focal, err := decodeContinuationResponseContext(ctx, activeResponse.data, postID, parentID)
 		if err != nil {
+			if errors.Is(err, errContinuationNoProgress) && response.replay != nil &&
+				(response.canReplay == nil || response.canReplay()) {
+				activeResponse.releaseNow()
+				retryContinuation = &pendingContinuation{parentID: parentID, replay: response.replay, canReplay: response.canReplay}
+				continue
+			}
 			return stats, classifyTreeError(EndpointContinuation, postID, err)
 		}
 		// A focal response contains a freshly decoded t3 post thing in addition
@@ -464,6 +539,9 @@ func walkDecodedCompleteWithBudget(
 			comments:      stats.Comments,
 			uniqueMoreIDs: stats.UniqueMoreIDs,
 			continuations: len(seenContinuations),
+			parentID:      parentID,
+			replay:        response.replay,
+			canReplay:     response.canReplay,
 		}
 	}
 	activeResponse.releaseNow()
@@ -698,6 +776,7 @@ func processMore(
 	ctx context.Context,
 	data jsonObject,
 	expectedParent string,
+	endpoint Endpoint,
 	postID string,
 	limits ThingLimits,
 	allowContinuation bool,
@@ -705,7 +784,7 @@ func processMore(
 	moreParents map[string]string,
 	seenContinuations map[string]struct{},
 	pendingMore *[]string,
-	pendingContinuations *[]string,
+	pendingContinuations *[]pendingContinuation,
 	stats *WalkStats,
 	retained *retainedLease,
 ) error {
@@ -722,6 +801,9 @@ func processMore(
 		return errMalformedResponse
 	}
 	if count > 0 && len(children) == 0 {
+		if endpoint == EndpointContinuation {
+			return errContinuationChildrenGone
+		}
 		return errIncompleteTree
 	}
 	if count == 0 && len(children) == 0 {
@@ -733,6 +815,9 @@ func processMore(
 		if idErr == nil && nameErr == nil && id == "_" && name == "t1__" && strings.HasPrefix(parent, "t1_") {
 			parentID := strings.TrimPrefix(parent, "t1_")
 			if _, duplicate := seenContinuations[parentID]; duplicate {
+				if endpoint == EndpointContinuation {
+					return errContinuationRepeated
+				}
 				return errIncompleteTree
 			}
 			if !allowContinuation {
@@ -742,7 +827,7 @@ func processMore(
 				return err
 			}
 			seenContinuations[parentID] = struct{}{}
-			*pendingContinuations = append(*pendingContinuations, parentID)
+			*pendingContinuations = append(*pendingContinuations, pendingContinuation{parentID: parentID})
 			return nil
 		}
 		return errMalformedResponse
@@ -1130,8 +1215,11 @@ func decodeContinuationResponseContext(ctx context.Context, payload []byte, post
 		return nil, errMalformedResponse
 	}
 	replies, err := decodeReplies(repliesValue)
-	if err != nil || len(replies) == 0 {
-		return nil, errIncompleteTree
+	if err != nil {
+		return nil, err
+	}
+	if len(replies) == 0 {
+		return nil, errContinuationNoProgress
 	}
 	return comments[0], nil
 }

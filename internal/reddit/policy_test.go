@@ -208,6 +208,53 @@ func TestRequestPolicyRetriesWithRetryAfterAndSanitizedObserver(t *testing.T) {
 	}
 }
 
+func TestSemanticContinuationReplaySharesHTTPRetryAllowanceAndBudget(t *testing.T) {
+	t.Parallel()
+
+	clock := newPolicyTestClock()
+	var events []RetryEvent
+	policy := mustPolicyForTest(t, clock, RequestPolicyConfig{
+		RequestsPerSecond: maxRequestsPerSecond,
+		MaxRetries:        2,
+		MaxRetryElapsed:   10 * time.Second,
+		InitialBackoff:    100 * time.Millisecond,
+		MaxBackoff:        time.Second,
+		Observer:          func(event RetryEvent) { events = append(events, event) },
+	})
+	session := policy.newRetrySession()
+	httpAttempts := 0
+	attempt := func(context.Context) (policyAttemptResult, error) {
+		httpAttempts++
+		if httpAttempts == 1 {
+			return policyAttemptResult{attempted: true, statusCode: http.StatusServiceUnavailable},
+				newError(ErrorServer, EndpointContinuation, "post1", http.StatusServiceUnavailable, errUnexpectedHTTPStatus)
+		}
+		return policyAttemptResult{attempted: true, statusCode: http.StatusOK, payload: []byte("accepted")}, nil
+	}
+	first, err := session.doAfterPayload(context.Background(), EndpointContinuation, "post1", nil, nil, attempt)
+	if err != nil || string(first.data) != "accepted" {
+		t.Fatalf("initial logical request = %q, %v", first.data, err)
+	}
+	first.releaseNow()
+	replayed, err := session.retryAfterPayload(
+		context.Background(), EndpointContinuation, "post1", errContinuationNoProgress, nil, attempt,
+	)
+	if err != nil || string(replayed.data) != "accepted" {
+		t.Fatalf("semantic replay = %q, %v", replayed.data, err)
+	}
+	replayed.releaseNow()
+	if httpAttempts != 3 || policy.Snapshot().Retries != 2 {
+		t.Fatalf("attempts = %d, snapshot = %#v", httpAttempts, policy.Snapshot())
+	}
+	if len(events) != 2 || events[0].Class != ErrorServer || events[0].Attempt != 2 ||
+		events[1].Class != ErrorIncomplete || events[1].Attempt != 3 {
+		t.Fatalf("retry events = %#v", events)
+	}
+	if session.canRetry() {
+		t.Fatal("session retained retry allowance after HTTP and semantic retries consumed it")
+	}
+}
+
 func TestAttemptObserverPublishesBeforeLogicalRequestReturns(t *testing.T) {
 	t.Parallel()
 

@@ -393,6 +393,25 @@ func TestWalkDecodedCompleteContinuationFailures(t *testing.T) {
 			class:  ErrorProtocol, endpoint: EndpointContinuation,
 		},
 		{
+			name:   "malformed replies value",
+			limits: DefaultThingLimits(),
+			fetch: func(context.Context, string) ([]byte, error) {
+				return testInitial(t, postID, testComment("parent", "body", "t3_"+postID, 7)), nil
+			},
+			class: ErrorProtocol, endpoint: EndpointContinuation,
+		},
+		{
+			name:   "nested replies cursor",
+			limits: DefaultThingLimits(),
+			fetch: func(context.Context, string) ([]byte, error) {
+				replies := testListing(testComment("child", "body", "t1_parent", ""))
+				replies["data"].(map[string]any)["after"] = "next"
+				return testInitial(t, postID, testComment("parent", "body", "t3_"+postID, replies)), nil
+			},
+			class: ErrorIncomplete, endpoint: EndpointContinuation,
+			cause: errIncompleteTree,
+		},
+		{
 			name:   "no progress",
 			limits: DefaultThingLimits(),
 			fetch: func(context.Context, string) ([]byte, error) {

@@ -86,6 +86,14 @@ DuckWords rejects redirects, non-`200` responses, and non-JSON bodies. A 200-pos
 result is complete only when the process exits `0`; offline and synthetic output must
 never be presented as a live assignment result.
 
+Reviewed examples from the 2026-08-14 live assignment-data runs are available as
+[an unfiltered result](artifacts/captured-runs/2026-08-14/unfiltered/result.json) and
+[a `duck*`-filtered result](artifacts/captured-runs/2026-08-14/filter-duck/result.json).
+Both are explicitly **partial authenticated browser-session snapshots**: 179 posts
+completed, 20 unavailable posts were skipped, and `18gfvqs` remained incomplete.
+They demonstrate the stdout format and filter behavior, not a canonical complete
+submission. See the [capture notes](artifacts/captured-runs/2026-08-14/README.md).
+
 ```bash
 go run ./cmd/duckwords > result.json 2> application.log
 
@@ -232,7 +240,7 @@ log normalization; Docker for container parity and the secret-scan target.
 | `--rate-limit RATE` | 0.8 | Requests/second, 0.1–1.5. Reddit's own headers can lower it further. |
 | `--request-timeout D` | 20s | One HTTP attempt. |
 | `--timeout D` | 30m | Whole run. |
-| `--max-retries N` | 3 | Transient retries per request. |
+| `--max-retries N` | 3 | Transient HTTP retries and bounded no-progress continuation replays per logical request. |
 | `--retry-budget D` | 45s | HTTP-attempt and retry-backoff time per logical request; shared rate-limit queueing is bounded by `--timeout`. |
 | `--failure-mode MODE` | best-effort | `best-effort` keeps going; `strict` aborts on the first failed post. |
 | `--log-level LEVEL` | info | debug, info, warn, error. |
@@ -272,6 +280,7 @@ word bank URL ─┘          └──► words.LoadDictionary ─► normalize
                         │     GET /.../comments/{id}/.../.json         initial tree
                         │     GET same .json?comment={child}&context=0 expand `more`
                         │     GET same .json?comment={parent}&context=0 continue depth
+                        │       retry: /comments/{post}/_/{parent}/.json on proven zero progress
                         │        └─ streams each comment body exactly once
                         │
                         └─► words.Counter → post-local map[string]uint64
@@ -290,6 +299,37 @@ merged. HTTP/transport/protocol expansion errors are reported as `failed`; expli
 completeness or resource-limit exhaustion is `incomplete`. Best-effort mode keeps
 other complete posts and exits `3`, while strict mode cancels and exits `1`. A
 half-counted post is worse than a missing one.
+
+A continuation can return HTTP 200 while containing no new comments or unresolved
+child IDs. DuckWords treats that as a semantic failure, replays it within the same
+`--max-retries` count and `--retry-budget`, and uses Reddit's equivalent path-form
+focal URL on the replay to avoid a stale query-form cache entry. The replay is allowed
+only before the response has added any new graph state or invoked the visitor; it
+therefore cannot double-count a body. A persistently empty/duplicate response remains
+`incomplete` rather than being silently accepted as complete. Its retry is visible as
+`event=request_retry error_class=incomplete operation=continuation`.
+
+#### Reviewer note: observed `18gfvqs` continuation
+
+During the 2026-08-14 assignment-data run, post `18gfvqs` returned an initial
+depth-continuation marker. The initial focal request and all three configured replays
+then completed with HTTP 200, but none added a new comment, child ID, or continuation
+to the graph. The sanitized outcome reported 80 observed comment records and 51
+visited bodies as `incomplete`; those post-local counts were discarded and were not
+merged into the final ranking.
+
+This status does **not** mean that an HTTP request or the retry mechanism failed. It
+means DuckWords could not prove the all-comments completeness required by this
+implementation. A marker-free empty focal view can be normal when descendants were
+deleted, redacted, or are not visible to the current session, while a stale or repeated
+marker can represent a still-unresolved branch. Reddit's focal-comments response does
+not provide a general completeness guarantee that lets the captured run distinguish
+those cases safely ([API contract](https://www.reddit.com/dev/api/#GET_comments_{article});
+[historical builder behavior](https://github.com/reddit-archive/reddit/blob/master/r2/r2/models/builder.py#L1369-L1397)).
+DuckWords therefore fails closed instead of silently treating a potentially partial
+tree as complete. The post ID is not special-cased; the same rule applies to any
+non-progressing continuation, and a later run may differ because Reddit data is
+mutable.
 
 ### Packages
 

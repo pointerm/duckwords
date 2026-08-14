@@ -39,6 +39,32 @@ func TestAttemptObserverWritesSanitizedProgressImmediately(t *testing.T) {
 	}
 }
 
+func TestRetryObserverWritesSemanticContinuationReplay(t *testing.T) {
+	t.Parallel()
+
+	var output strings.Builder
+	observer := New(slog.New(slog.NewTextHandler(&output, nil))).RetryObserver(context.Background())
+	observer(reddit.RetryEvent{
+		Endpoint: reddit.EndpointContinuation, PostID: "duck123", Class: reddit.ErrorIncomplete,
+		Attempt: 2, Delay: 500 * time.Millisecond,
+	})
+
+	logged := output.String()
+	for _, want := range []string{
+		`msg="request retry scheduled"`, "event=request_retry", "operation=continuation",
+		"post_id=duck123", "error_class=incomplete", "attempt=2", "delay=500ms",
+	} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("semantic retry log does not contain %q: %s", want, logged)
+		}
+	}
+	for _, forbidden := range []string{"url=", "cookie=", "body=", "user_agent="} {
+		if strings.Contains(strings.ToLower(logged), forbidden) {
+			t.Fatalf("semantic retry log contains forbidden field %q: %s", forbidden, logged)
+		}
+	}
+}
+
 func TestExecutionInputProfileBindsExactAssignmentLocators(t *testing.T) {
 	t.Parallel()
 
