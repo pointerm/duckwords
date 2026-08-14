@@ -60,7 +60,7 @@ Once you have approval and a registered application:
 export REDDIT_API_ACCESS_APPROVED=true   # only after Reddit has approved your access
 export REDDIT_CLIENT_ID='<client-id>'
 export REDDIT_CLIENT_SECRET='<secret>'
-export REDDIT_USER_AGENT='cli:duckwords:1.0.0 (by /u/<your-reddit-name>)'
+export REDDIT_USER_AGENT='cli:duckwords:<version> (by /u/<your-reddit-name>)'
 
 go run ./cmd/duckwords > result.json 2> application.log
 ```
