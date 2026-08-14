@@ -1,3 +1,3 @@
-// Package runlog emits the stable, sanitized execution records consumed by the
-// offline evidence finalizer.
+// Package runlog emits stable, sanitized execution records for operators and the
+// assignment application log.
 package runlog

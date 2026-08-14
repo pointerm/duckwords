@@ -44,8 +44,7 @@ jobs:
 
       - name: Validate automation definitions
         run: |
-          bash -n scripts/capture-submission.sh
-          bash -n scripts/capture-submission_test.sh
+          bash -n scripts/run-assignment.sh
           bash -n scripts/package-release.sh
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
 

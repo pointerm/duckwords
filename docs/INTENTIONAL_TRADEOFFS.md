@@ -64,16 +64,15 @@ the same fixed Reddit origin, optionally with a small allowlist of matching brow
 headers. It is disabled by default and is not a general-purpose authenticated client.
 Local input files remain available for deterministic and offline use.
 
-The cookie-free public-JSON default and canonical capture follow the assignment
-owner's explicit direction and keep submission evidence reproducible and independent
-of a personal browser session. Current Reddit access policy may return `302` or `403`
-for that request profile, making a live capture impossible from some networks. A
-reviewer may opt into the browser-session fallback for local diagnosis, but that run
-is authenticated rather than anonymous and the canonical capture rejects it. The
-cookie is supplied directly through the process environment, is never logged or
+The cookie-free public-JSON default follows the assignment owner's explicit
+direction and remains independent of a personal browser session. Current Reddit
+access policy may return `302` or `403` for that request profile, making a live run
+impossible from some networks. A reviewer may opt into the browser-session fallback,
+but that run is authenticated rather than anonymous and must be labeled accordingly.
+The cookie is supplied directly through the process environment, is never logged or
 persisted, and response `Set-Cookie` values are ignored; the session may therefore
-expire without being refreshed. Synthetic and browser-session output must not be
-presented as cookie-free live evidence.
+expire without being refreshed. Synthetic output must not be presented as a live
+assignment result.
 
 ## 8. Rich-text interpretation
 

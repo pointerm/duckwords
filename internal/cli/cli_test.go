@@ -690,7 +690,7 @@ func TestRunOutputFailures(t *testing.T) {
 	}
 }
 
-func TestRunFailsWhenTerminalEvidenceLogCannotBeWritten(t *testing.T) {
+func TestRunFailsWhenTerminalApplicationLogCannotBeWritten(t *testing.T) {
 	t.Parallel()
 
 	stderr := &failOnWriteWriter{failAt: 2}
@@ -906,11 +906,9 @@ func TestConfigDiagnosticNamesTheDisallowedHost(t *testing.T) {
 	}
 }
 
-// TestSkippedOutcomeIsLoggedInTheEvidenceContract closes the runner → JSON log →
-// evidence-finalizer chain for a provably absent post. internal/evidence parses this
-// exact record shape, so a drift between the two would otherwise only surface after
-// the one approved live capture had already been spent.
-func TestSkippedOutcomeIsLoggedInTheEvidenceContract(t *testing.T) {
+// TestSkippedOutcomeIsLoggedWithStableFields proves a missing post remains
+// machine-readable in the application log without contributing counts.
+func TestSkippedOutcomeIsLoggedWithStableFields(t *testing.T) {
 	t.Parallel()
 
 	var stderr strings.Builder
@@ -947,8 +945,7 @@ func TestSkippedOutcomeIsLoggedInTheEvidenceContract(t *testing.T) {
 	if skipped == nil {
 		t.Fatalf("no skipped post_outcome record:\n%s", stderr.String())
 	}
-	// These are exactly the fields internal/evidence requires of a skipped record:
-	// absence proven by the comments endpoint, with no HTTP status of its own.
+	// The comments endpoint proves absence without a synthetic HTTP status.
 	if skipped["error_class"] != "not_found" || skipped["operation"] != "comments" {
 		t.Fatalf("skipped record = %#v, want not_found on the comments endpoint", skipped)
 	}

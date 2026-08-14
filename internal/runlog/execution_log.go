@@ -70,8 +70,8 @@ type AccessIdentity struct {
 	UserAgentSHA256 string
 }
 
-// Recorder writes the stable, sanitized lifecycle schema consumed by the evidence
-// finalizer. It owns only observation state; application decisions remain elsewhere.
+// Recorder writes the stable, sanitized lifecycle schema used in the application
+// log. It owns only observation state; application decisions remain elsewhere.
 type Recorder struct {
 	logger        *slog.Logger
 	sourceRetries *atomic.Uint64
@@ -381,10 +381,9 @@ func validLowerHex(value string, length int) bool {
 	return true
 }
 
-// executionInputProfile binds evidence to the two exact assignment locators
-// without putting full URLs or local paths in operational logs. Any override is
-// deliberately collapsed to "custom" and therefore cannot satisfy the final
-// assignment-evidence contract.
+// executionInputProfile identifies the two exact assignment locators without
+// putting full URLs or local paths in operational logs. Any override is deliberately
+// collapsed to "custom" so it cannot be mistaken for the assignment input pair.
 func executionInputProfile(cfg config.Config) string {
 	if cfg.Posts == (config.InputSource{Kind: config.SourceURL, Location: config.DefaultPostsURL}) &&
 		cfg.Dictionary == (config.InputSource{Kind: config.SourceURL, Location: config.DefaultDictionaryURL}) {

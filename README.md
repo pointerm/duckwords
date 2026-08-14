@@ -62,7 +62,7 @@ is not a substitute for the assignment's 200-post application log.
 
 ### 2. Attempt the live assignment run
 
-The assignment owner directed the canonical submission to use cookie-free `GET`
+The assignment owner directed the submission to use cookie-free `GET`
 requests to the fixed `https://old.reddit.com/.../.json` renderer rather than the
 OAuth Data API. DuckWords retains that narrow assignment-specific default; this is
 not a claim that anonymous JSON access is currently supported or available from
@@ -71,10 +71,10 @@ every network.
 On 2026-08-14 the candidate's cookie-free CLI received HTTP `302` redirects to
 `/login` or HTTP `403` HTML responses for the supplied URLs. An existing browser
 profile returned `200 application/json` only while sending Reddit session state, so
-that did not demonstrate anonymous access. The default and canonical capture paths
-do not send browser cookies, login credentials, or tokens. An explicitly enabled,
+that did not demonstrate anonymous access. The default path does not send browser
+cookies, login credentials, or tokens. An explicitly enabled,
 local-only browser-session fallback is documented below for a reviewer who wants to
-try their own temporary session; it is not canonical evidence.
+try their own temporary session; its output must be identified as authenticated.
 
 Reddit's current [Data API Wiki](https://support.reddithelp.com/hc/en-us/articles/16160319875092-Reddit-Data-API-Wiki)
 states that traffic without OAuth or login credentials will be blocked. Reddit has
@@ -82,9 +82,9 @@ also [announced the shutdown of unauthenticated `.json` endpoints](https://www.r
 The assignment owner was informed of the observed behavior and asked the candidate
 to choose and explain the implementation approach independently.
 
-DuckWords rejects redirects, non-`200` responses, and non-JSON bodies. No complete
-200-post live result is claimed unless the guarded capture exits `0`; offline and
-synthetic output must never be presented as live assignment evidence.
+DuckWords rejects redirects, non-`200` responses, and non-JSON bodies. A 200-post
+result is complete only when the process exits `0`; offline and synthetic output must
+never be presented as a live assignment result.
 
 ```bash
 go run ./cmd/duckwords > result.json 2> application.log
@@ -112,9 +112,8 @@ If cookie-free access is blocked, a reviewer may optionally retry the ordinary l
 CLI with their **own temporary Reddit browser session**. This fallback is disabled by
 default and is enabled only by a valid, non-empty `REDDIT_BROWSER_COOKIE`; an empty
 value is rejected. It is an authenticated browser-session request, not OAuth, not
-Reddit's public Data API, and not proof that anonymous `.json` access works.
-`make submission-capture` rejects this mode, so its output cannot be published as
-the canonical evidence bundle.
+Reddit's public Data API, and not proof that anonymous `.json` access works. Label
+any output from this mode accordingly.
 
 Avoid placing the cookie in a command, shell history, `.env` file, repository,
 application log, issue, or message. Build before introducing the cookie so the Go
@@ -135,7 +134,7 @@ export REDDIT_BROWSER_SEC_CH_UA='<your browser Sec-CH-UA header>'
 export REDDIT_BROWSER_SEC_CH_UA_MOBILE='?0' # only ?0 or ?1
 export REDDIT_BROWSER_SEC_CH_UA_PLATFORM='<your browser Sec-CH-UA-Platform header>'
 
-bin/duckwords > result.json 2> application.log
+scripts/run-assignment.sh
 
 unset REDDIT_BROWSER_COOKIE REDDIT_USER_AGENT REDDIT_BROWSER_ACCEPT_LANGUAGE
 unset REDDIT_BROWSER_SEC_CH_UA REDDIT_BROWSER_SEC_CH_UA_MOBILE
@@ -162,8 +161,8 @@ With no options it attempts to process the assignment inputs using the documente
 defaults. At 0.8 requests/second the 200 initial listings alone take about 4 minutes
 10 seconds after access succeeds. Every unresolved `more` child, continuation, and
 retry adds another paced request, so the actual duration depends on the live trees and
-is bounded by the 30-minute default (the guarded canonical capture deliberately
-allows up to 2 hours).
+is bounded by the 30-minute default unless a larger validated timeout is selected
+explicitly.
 
 ```bash
 # Only words starting with "duck".
@@ -185,25 +184,23 @@ The smoke is deliberately opt-in and never runs in CI. It uses one worker, 0.5
 requests/second, strict completeness, and writes only ignored output under
 `artifacts/review/reddit-smoke/`. It strips every `REDDIT_BROWSER_*` value so a stale
 session cannot make this cookie-free check look successful. If it returns `302` or
-`403`, stop: do not attempt the canonical capture. The optional personal-session
-fallback above may be used only as a local authenticated diagnostic; never present it
-as cookie-free canonical evidence and do not use a proxy or hidden endpoint override.
+`403`, the cookie-free path is unavailable from that environment. The optional
+personal-session fallback above may be used only as an authenticated run; never
+present it as cookie-free and do not use a proxy or hidden endpoint override.
 
-For the final candidate, build from a clean commit and run the guarded one-shot
-capture with the same metadata values in both commands:
+To create the three files requested for review, run the lightweight assignment
+helper. It invokes the main CLI once, forces JSON operational logs, and refuses to
+overwrite existing output files:
 
 ```bash
-version=0.2.0
-build_date="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-make submission-build VERSION="$version" BUILD_DATE="$build_date"
-make submission-capture VERSION="$version" BUILD_DATE="$build_date"
+make assignment-run ARGS='--failure-mode=strict --timeout=2h'
 ```
 
-The capture runs the fixed assignment profile in strict mode and publishes the
-five-file `artifacts/submission/` bundle only after a complete exit `0`. It refuses
-a dirty tree, a changed binary, a second writer, a partial result, or replacement of
-an existing bundle. Attach that directory separately; do not commit it to the SHA it
-attests.
+This writes `artifacts/run/result.json`, `application.log`, and
+`full-application.log`. The full log contains the application log followed by a
+fixed marker and the exact JSON output, as requested by the assignment. Submit these
+files only after checking that the command exited `0`; exit `3` is an explicitly
+partial result. The directory is local and ignored by Git.
 
 ### 3. Or via Docker
 
@@ -301,7 +298,7 @@ half-counted post is worse than a missing one.
 | [`cmd/duckwords`](cmd/duckwords) | Thin process entrypoint: signals and one CLI call |
 | [`internal/cli`](internal/cli) | Argument lifecycle, stdout/stderr contract, exit codes |
 | [`internal/production`](internal/production) | Environment, HTTP client, source/public-Reddit dependency wiring |
-| [`internal/runlog`](internal/runlog) | Stable sanitized lifecycle and evidence records |
+| [`internal/runlog`](internal/runlog) | Stable sanitized lifecycle and application-log records |
 | [`internal/config`](internal/config) | Flag parsing and complete validation before any I/O |
 | [`internal/acquire`](internal/acquire) | Bounded HTTPS/file download with provenance hashing |
 | [`internal/source`](internal/source) | Post-list parsing, URL → normalized post ID and public JSON path, deduplication |

@@ -88,7 +88,7 @@ func TestPhase2GoldenFixtureMakesMissingMoreChildExplicit(t *testing.T) {
 		t.Fatalf("walkDecoded() error = %v, want incomplete-tree cause", err)
 	}
 	if stats.ExpansionRequests != 1 || len(bodies) == 0 {
-		t.Fatalf("partial evidence = stats %#v, bodies %#v; fixture did not exercise discard boundary", stats, bodies)
+		t.Fatalf("partial traversal = stats %#v, bodies %#v; fixture did not exercise discard boundary", stats, bodies)
 	}
 }
 

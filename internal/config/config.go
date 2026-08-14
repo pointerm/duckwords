@@ -25,7 +25,7 @@ const (
 	DefaultDictionaryURL = "https://raw.githubusercontent.com/dwyl/english-words/master/words.txt"
 
 	// DefaultWorkers overlaps independent network waits while keeping the number of
-	// simultaneously retained comment trees conservative until live memory evidence
+	// simultaneously retained comment trees conservative until live memory measurements
 	// supports a higher value.
 	DefaultWorkers = 4
 	// MinWorkers is the smallest supported post worker pool.

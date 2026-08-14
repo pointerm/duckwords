@@ -1,13 +1,13 @@
-# NON-LIVE SYNTHETIC DEMO — NOT ASSIGNMENT EVIDENCE
+# NON-LIVE SYNTHETIC DEMO — NOT ASSIGNMENT OUTPUT
 
 This directory contains checked-in output from a deterministic, fully offline test
-fixture. It is deliberately separate from `artifacts/submission/` and must not be
+fixture. It is deliberately separate from live assignment output and must not be
 presented as the full application log or result requested by the assignment.
 
 The fixture makes no network request, downloads no Reddit user data, does not use
 real credentials, and does not prove current public Reddit JSON compatibility. It
 exists to make the implemented process-level behavior reviewable before a successful
-full assignment capture.
+full assignment run.
 
 ## Checked-in results
 
@@ -62,5 +62,5 @@ on this successful path. It does **not** demonstrate the company-provided 200-po
 the live dwyl word bank, real Reddit rate-limit behavior, or completeness of the
 final assignment result.
 
-Canonical evidence is created only by a complete live run. It is published separately
-as the five-file ignored `artifacts/submission/` bundle.
+The assignment result and full application log must come from a separate complete
+live run. This synthetic output must not be submitted as that result.

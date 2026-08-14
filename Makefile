@@ -13,7 +13,6 @@ RELEASE_GO_RUN := env $(BROWSER_ENV_UNSET) -u GOOS -u GOARCH -u GOAMD64 -u GOARM
 GOFMT = $(shell $(GO_RUN) env GOROOT)/bin/gofmt
 BINARY := bin/duckwords
 FIXTURE_BINARY := bin/duckwords-fixture
-EVIDENCE_BINARY := bin/duckwords-evidence
 MODULE := github.com/pointerm/duckwords
 BUILDINFO_PACKAGE := $(MODULE)/internal/buildinfo
 DOCKER ?= docker
@@ -23,7 +22,7 @@ REVIEW_DIR ?= artifacts/review
 SYNTHETIC_REVIEW_DIR ?= $(REVIEW_DIR)/synthetic-demo
 REDDIT_SMOKE_DIR ?= $(REVIEW_DIR)/reddit-smoke
 SYNTHETIC_DEMO_DIR ?= examples/synthetic-demo
-SUBMISSION_DIR ?= artifacts/submission
+ASSIGNMENT_OUTPUT_DIR ?= artifacts/run
 GOVULNCHECK_VERSION ?= v1.6.0
 STATICCHECK_VERSION ?= v0.7.0
 # v8.30.1 is intentionally not adopted while upstream issue #2170 reports
@@ -34,7 +33,6 @@ JQ ?= jq
 
 VERSION ?= dev
 COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
-CANDIDATE_SHA ?= $(shell git rev-parse --verify HEAD 2>/dev/null || printf unknown)
 BUILD_DATE ?= unknown
 SHUFFLE_COUNT ?= 5
 FUZZ_TIME ?= 2s
@@ -45,7 +43,7 @@ LDFLAGS = -X '$(BUILDINFO_PACKAGE).version=$(VERSION)' \
 
 .PHONY: help toolchain-check fmt fmt-check mod-tidy-check mod-verify vet lint vuln secret-scan test test-shuffle race fuzz-smoke bench bench-text \
 	build fixture-build fixture-native synthetic-demo synthetic-demo-verify synthetic-demo-docker-verify docker-build docker-fixture-build docker-smoke \
-	evidence-build submission-build submission-capture submission-capture-test fixture-verify docker-verify reddit-smoke run version verify
+	assignment-run fixture-verify docker-verify reddit-smoke run version verify
 
 help: ## Show available targets.
 	@awk 'BEGIN {FS = ":.*## "; printf "DuckWords development targets:\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-14s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -54,7 +52,7 @@ toolchain-check: ## Require the exact Go 1.26.6 toolchain.
 	@test "$$($(GO_RUN) env GOVERSION)" = "$(REQUIRED_GO_VERSION)"
 
 fmt fmt-check mod-tidy-check mod-verify vet lint vuln test test-shuffle race fuzz-smoke bench bench-text \
-	build fixture-build evidence-build submission-build run version: toolchain-check
+	build fixture-build run version: toolchain-check
 
 fmt: ## Format all Go packages.
 	$(GO_RUN) fmt ./...
@@ -119,8 +117,6 @@ fuzz-smoke: ## Run short bounded fuzz campaigns; override FUZZ_TIME as needed.
 	$(GO_RUN) test -run='^$$' -fuzz='^FuzzRateLimitHeaderNumbers$$' -fuzztime=$(FUZZ_TIME) ./internal/reddit
 	$(GO_RUN) test -run='^$$' -fuzz='^FuzzPreflightJSONMatchesEncodingJSON$$' -fuzztime=$(FUZZ_TIME) ./internal/reddit
 	$(GO_RUN) test -run='^$$' -fuzz='^FuzzWalkDecoded$$' -fuzztime=$(FUZZ_TIME) ./internal/reddit
-	$(GO_RUN) test -run='^$$' -fuzz='^FuzzParseResult$$' -fuzztime=$(FUZZ_TIME) ./internal/evidence
-	$(GO_RUN) test -run='^$$' -fuzz='^FuzzParseLog$$' -fuzztime=$(FUZZ_TIME) ./internal/evidence
 
 bench: ## Run core, application, source, and Reddit benchmarks with allocations.
 	$(GO_RUN) test -run='^$$' -bench=. -benchmem -count=$(BENCH_COUNT) ./internal/words ./internal/aggregate ./internal/source ./internal/reddit ./internal/app
@@ -133,24 +129,8 @@ build: ## Build a reproducible local CLI binary.
 	$(RELEASE_GO_RUN) build -mod=readonly -trimpath -buildvcs=false \
 		-ldflags "-s -w -buildid= $(LDFLAGS)" -o $(BINARY) ./cmd/duckwords
 
-evidence-build: ## Build the offline submission-evidence finalizer.
-	mkdir -p bin
-	$(RELEASE_GO_RUN) build -mod=readonly -trimpath -buildvcs=false \
-		-ldflags "-s -w -buildid=" -o $(EVIDENCE_BINARY) ./cmd/duckwords-evidence
-
-# A target-specific full commit flows into the ordinary reproducible build through
-# recursive LDFLAGS. The capture wrapper independently requires the same clean HEAD.
-submission-build: ## Build candidate CLI and evidence finalizer without changing tracked source.
-	@test "$(CANDIDATE_SHA)" != "unknown"
-	$(MAKE) build evidence-build \
-		VERSION="$(VERSION)" COMMIT="$(CANDIDATE_SHA)" BUILD_DATE="$(BUILD_DATE)"
-
-submission-capture: ## Run one canonical public-JSON invocation from an already built clean-SHA candidate.
-	DUCKWORDS_RELEASE_VERSION="$(VERSION)" DUCKWORDS_BUILD_DATE="$(BUILD_DATE)" \
-		SUBMISSION_DIR="$(SUBMISSION_DIR)" /bin/bash -p scripts/capture-submission.sh
-
-submission-capture-test: ## Test the capture wrapper offline with deterministic process fixtures.
-	bash scripts/capture-submission_test.sh
+assignment-run: build ## Run once and write result.json plus application/full-application logs.
+	ASSIGNMENT_OUTPUT_DIR="$(ASSIGNMENT_OUTPUT_DIR)" scripts/run-assignment.sh $(ARGS)
 
 fixture-build: ## Compile the test-only deterministic offline process fixture.
 	mkdir -p bin
@@ -265,4 +245,4 @@ run: build ## Build, then run the CLI; pass options with ARGS='...'.
 version: ## Print CLI build metadata.
 	$(GO_RUN) run ./cmd/duckwords --version
 
-verify: fmt-check mod-tidy-check mod-verify vet test test-shuffle race build evidence-build submission-capture-test ## Run offline submission-blocking quality gates.
+verify: fmt-check mod-tidy-check mod-verify vet test test-shuffle race build ## Run offline submission-blocking quality gates.

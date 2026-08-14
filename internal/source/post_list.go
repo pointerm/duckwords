@@ -116,8 +116,8 @@ type PostListStats struct {
 	Posts       int
 	SHA256      string
 	// PostsSHA256 hashes the canonical ordered sequence of unique normalized posts
-	// as `source-line:post-id\n`. It binds later per-post evidence to this parse
-	// without retaining or logging the original URLs.
+	// as `source-line:post-id\n`. It binds later per-post logs to this parse without
+	// retaining or logging the original URLs.
 	PostsSHA256 string
 }
 

@@ -20,7 +20,7 @@ const (
 	// RedditAccessProfile identifies the fixed public-page JSON access contract.
 	RedditAccessProfile = "old-reddit-public-json-v1"
 	// RedditBrowserSessionAccessProfile identifies the optional personal-session
-	// fallback. It is deliberately distinct from canonical anonymous evidence.
+	// fallback. It is deliberately distinct from anonymous access.
 	RedditBrowserSessionAccessProfile = "old-reddit-browser-session-json-v1"
 	// RedditOrigin is the only Reddit origin used by the production client.
 	RedditOrigin = "old.reddit.com"

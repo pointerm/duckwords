@@ -9,10 +9,9 @@
 /application.log
 /result.json
 
-# Local review evidence and the separately attached canonical live-run bundle.
+# Local review output and assignment-run results.
 /artifacts/review/
-/artifacts/submission/
-/artifacts/**/*.capture-lock/
+/artifacts/run/
 /artifacts/application.log
 /artifacts/result.json
 
