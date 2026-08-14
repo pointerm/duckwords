@@ -113,7 +113,7 @@ jobs:
         run: >-
           make docker-verify
           VERSION=ci
-          COMMIT=${GITHUB_SHA}
+          COMMIT="${GITHUB_SHA}"
           BUILD_DATE=unknown
           DOCKER_IMAGE=duckwords:ci
           DOCKER_FIXTURE_IMAGE=duckwords:fixture-ci
