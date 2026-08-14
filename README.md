@@ -142,7 +142,10 @@ Reviewers who cannot access Reddit can inspect an
 without running the CLI. Both are explicitly **partial authenticated browser-session
 snapshots**: 179 posts completed, 20 unavailable posts were skipped, and `18gfvqs`
 remained incomplete. They demonstrate the JSON shape and filter behavior, not a
-canonical complete submission. See the
+canonical complete submission. Their sanitized execution records are available as
+the [unfiltered application log](artifacts/captured-runs/2026-08-14/unfiltered/application.log)
+and [`duck*` application log](artifacts/captured-runs/2026-08-14/filter-duck/application.log).
+See the
 [capture notes](artifacts/captured-runs/2026-08-14/README.md).
 
 ### Reddit access note
