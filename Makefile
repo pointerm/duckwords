@@ -17,6 +17,8 @@ DOCKER ?= docker
 DOCKER_IMAGE ?= duckwords:review
 DOCKER_FIXTURE_IMAGE ?= duckwords:fixture-review
 REVIEW_DIR ?= artifacts/review
+SYNTHETIC_REVIEW_DIR ?= $(REVIEW_DIR)/synthetic-demo
+SYNTHETIC_DEMO_DIR ?= examples/synthetic-demo
 SUBMISSION_DIR ?= artifacts/submission
 GOVULNCHECK_VERSION ?= v1.6.0
 STATICCHECK_VERSION ?= v0.7.0
@@ -38,7 +40,7 @@ LDFLAGS = -X '$(BUILDINFO_PACKAGE).version=$(VERSION)' \
 	-X '$(BUILDINFO_PACKAGE).buildDate=$(BUILD_DATE)'
 
 .PHONY: help toolchain-check fmt fmt-check mod-tidy-check mod-verify vet lint vuln secret-scan test test-shuffle race fuzz-smoke bench bench-text \
-	build fixture-build fixture-native docker-build docker-fixture-build docker-smoke \
+	build fixture-build fixture-native synthetic-demo synthetic-demo-verify synthetic-demo-docker-verify docker-build docker-fixture-build docker-smoke \
 	evidence-build submission-build submission-capture submission-capture-test fixture-verify docker-verify run version verify
 
 help: ## Show available targets.
@@ -153,9 +155,42 @@ fixture-build: ## Compile the test-only deterministic offline process fixture.
 
 fixture-native: fixture-build ## Run the native offline fixture into ignored review artifacts.
 	mkdir -p $(REVIEW_DIR)
-	DUCKWORDS_OFFLINE_FIXTURE_PROCESS=1 $(FIXTURE_BINARY) \
+	DUCKWORDS_OFFLINE_FIXTURE_PROCESS=1 DUCKWORDS_OFFLINE_FIXTURE_PROFILE= $(FIXTURE_BINARY) \
 		> $(REVIEW_DIR)/native-result.json \
 		2> $(REVIEW_DIR)/native-stderr.log
+
+synthetic-demo: fixture-build ## Run the richer non-live synthetic E2E demo into ignored review artifacts.
+	mkdir -p $(SYNTHETIC_REVIEW_DIR)
+	DUCKWORDS_OFFLINE_FIXTURE_PROCESS=1 \
+		DUCKWORDS_OFFLINE_FIXTURE_PROFILE=synthetic-demo \
+		$(FIXTURE_BINARY) \
+		> $(SYNTHETIC_REVIEW_DIR)/raw-stdout.json \
+		2> $(SYNTHETIC_REVIEW_DIR)/raw-application.ndjson
+	$(JQ) -cS 'del(.time, .duration, .throttle_wait, .throttle_waits, .goos, .goarch)' \
+		$(SYNTHETIC_REVIEW_DIR)/raw-application.ndjson \
+		> $(SYNTHETIC_REVIEW_DIR)/normalized-application.ndjson
+
+synthetic-demo-verify: synthetic-demo ## Verify the checked-in synthetic output and normalized log.
+	cmp $(SYNTHETIC_DEMO_DIR)/synthetic-output.json \
+		$(SYNTHETIC_REVIEW_DIR)/raw-stdout.json
+	cmp $(SYNTHETIC_DEMO_DIR)/synthetic-log.normalized.ndjson \
+		$(SYNTHETIC_REVIEW_DIR)/normalized-application.ndjson
+
+synthetic-demo-docker-verify: docker-fixture-build ## Verify the richer synthetic demo in an isolated container.
+	mkdir -p $(SYNTHETIC_REVIEW_DIR)
+	$(DOCKER) run --rm --network=none --read-only --cap-drop=ALL \
+		--security-opt=no-new-privileges \
+		-e DUCKWORDS_OFFLINE_FIXTURE_PROFILE=synthetic-demo \
+		$(DOCKER_FIXTURE_IMAGE) \
+		> $(SYNTHETIC_REVIEW_DIR)/docker-stdout.json \
+		2> $(SYNTHETIC_REVIEW_DIR)/docker-application.ndjson
+	$(JQ) -cS 'del(.time, .duration, .throttle_wait, .throttle_waits, .goos, .goarch)' \
+		$(SYNTHETIC_REVIEW_DIR)/docker-application.ndjson \
+		> $(SYNTHETIC_REVIEW_DIR)/docker-application.normalized.ndjson
+	cmp $(SYNTHETIC_DEMO_DIR)/synthetic-output.json \
+		$(SYNTHETIC_REVIEW_DIR)/docker-stdout.json
+	cmp $(SYNTHETIC_DEMO_DIR)/synthetic-log.normalized.ndjson \
+		$(SYNTHETIC_REVIEW_DIR)/docker-application.normalized.ndjson
 
 docker-build: ## Build the pinned, non-root production image.
 	$(DOCKER) build $(DOCKER_BUILD_FLAGS) --target runtime \
@@ -195,7 +230,7 @@ fixture-verify: fixture-native docker-fixture-build ## Compare native and isolat
 	cmp testdata/phase5/expected.json $(REVIEW_DIR)/native-result.json
 	cmp $(REVIEW_DIR)/native-result.json $(REVIEW_DIR)/docker-result.json
 
-docker-verify: docker-smoke fixture-verify ## Run all Docker and native/container parity gates.
+docker-verify: docker-smoke fixture-verify synthetic-demo-docker-verify ## Run all Docker and native/container parity gates.
 
 run: ## Run the CLI; pass options with ARGS='...'.
 	$(GO_RUN) run ./cmd/duckwords $(ARGS)

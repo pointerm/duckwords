@@ -4,6 +4,8 @@ A Go CLI for the Firefly Backend Engineer assignment. It reads a list of `r/duck
 posts, walks every comment and reply in each post, counts the words that are in the
 supplied word bank, and prints the top ten as pretty JSON on stdout.
 
+Illustrative output shape (not a live assignment result):
+
 ```json
 [
   {
@@ -45,6 +47,17 @@ transport, and prints:
   }
 ]
 ```
+
+For the richer three-post synthetic scenario with nested replies, `morechildren`,
+continuation, deduplication, and a top-10 tie boundary:
+
+```bash
+make synthetic-demo-verify
+cat examples/synthetic-demo/synthetic-output.json
+```
+
+The checked-in [synthetic demo](examples/synthetic-demo) is explicitly non-live and
+is not a substitute for the assignment's approved 200-post application log.
 
 ### 2. Run it for real
 
@@ -188,7 +201,7 @@ counts are discarded rather than partially merged, the post is reported as
 
 A token is counted when **all** of the following hold:
 
-1. it is a maximal run of alphabetic characters (any other byte splits it);
+1. it is a maximal run of alphabetic characters (any non-letter code point splits it);
 2. it is at least 3 characters long;
 3. it is in the word bank, compared case-insensitively;
 4. it matches at least one `--filter` pattern, when filters are supplied.
@@ -202,8 +215,8 @@ a given input.
   assignment asks for comment text.
 - **Deleted and removed comments are skipped**, so `deleted` and `removed` never
   appear in the results.
-- **Deleted posts are not failures.** The supplied list contains 20 threads that no
-  longer exist. Absence is proven by the comments endpoint answering HTTP 404 or
+- **Deleted posts are not failures.** Some supplied threads may no longer exist.
+  Absence is proven by the comments endpoint answering HTTP 404 or
   returning a listing with no post; those are reported as `skipped` and do not make
   the run partial. A 403, or a 404 from a `more`-expansion request, stays a failure —
   the first may be restored, and the second means the tree is incomplete rather than

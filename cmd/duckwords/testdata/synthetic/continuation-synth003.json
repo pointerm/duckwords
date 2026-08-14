@@ -1,0 +1,48 @@
+[
+  {
+    "kind": "Listing",
+    "data": {
+      "children": [
+        {
+          "kind": "t3",
+          "data": {"id": "synth003", "name": "t3_synth003"}
+        }
+      ]
+    }
+  },
+  {
+    "kind": "Listing",
+    "data": {
+      "children": [
+        {
+          "kind": "t1",
+          "data": {
+            "id": "d1",
+            "name": "t1_d1",
+            "link_id": "t3_synth003",
+            "parent_id": "t3_synth003",
+            "body": "Marsh water duck.",
+            "replies": {
+              "kind": "Listing",
+              "data": {
+                "children": [
+                  {
+                    "kind": "t1",
+                    "data": {
+                      "id": "d2",
+                      "name": "t1_d2",
+                      "link_id": "t3_synth003",
+                      "parent_id": "t1_d1",
+                      "body": "Lake river duckling quack.",
+                      "replies": ""
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+]
