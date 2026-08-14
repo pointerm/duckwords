@@ -1,0 +1,104 @@
+name: Package release
+
+on:
+  push:
+    tags:
+      # GitHub ref filters use glob syntax, not regular expressions. The metadata
+      # step below remains the authoritative restricted version validator.
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to embed, without a leading v (for example, 1.2.3-rc.1)
+        required: true
+        type: string
+
+# Packaging creates a workflow artifact only. It cannot push code, publish a
+# GitHub release, write packages, or access deployment credentials.
+permissions:
+  contents: read
+
+concurrency:
+  group: package-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GOTOOLCHAIN: local
+  GOFIPS140: "off"
+  REDDIT_API_ACCESS_APPROVED: "false"
+
+jobs:
+  package:
+    name: Verify and package Go 1.26.6 binaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Resolve immutable release metadata
+        id: metadata
+        shell: bash
+        env:
+          MANUAL_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="${MANUAL_VERSION}"
+          fi
+
+          if [[ ! "${version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo "version must use the restricted release grammar: SemVer core, optional prerelease, no leading v/build metadata" >&2
+            exit 1
+          fi
+
+          commit="$(git rev-parse HEAD)"
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          build_date="$(date --utc --date="@${source_date_epoch}" '+%Y-%m-%dT%H:%M:%SZ')"
+
+          {
+            echo "version=${version}"
+            echo "commit=${commit}"
+            echo "source_date_epoch=${source_date_epoch}"
+            echo "build_date=${build_date}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Verify source before packaging
+        run: |
+          make verify
+          make lint STATICCHECK_VERSION=v0.7.0
+          make vuln GOVULNCHECK_VERSION=v1.6.0
+
+      - name: Build deterministic cross-platform archives
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+          COMMIT: ${{ steps.metadata.outputs.commit }}
+          BUILD_DATE: ${{ steps.metadata.outputs.build_date }}
+          SOURCE_DATE_EPOCH: ${{ steps.metadata.outputs.source_date_epoch }}
+        run: bash scripts/package-release.sh
+
+      - name: Verify packaged checksums
+        run: cd dist && sha256sum --check SHA256SUMS
+
+      - name: Upload checksummed release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: duckwords-${{ steps.metadata.outputs.version }}-${{ steps.metadata.outputs.commit }}
+          path: dist/
+          compression-level: 0
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 30

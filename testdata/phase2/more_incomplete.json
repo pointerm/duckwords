@@ -1,0 +1,20 @@
+{
+  "json": {
+    "errors": [],
+    "data": {
+      "things": [
+        {
+          "kind": "t1",
+          "data": {
+            "id": "c4",
+            "name": "t1_c4",
+            "link_id": "t3_duck123",
+            "parent_id": "t3_duck123",
+            "body": "Only one requested child was returned.",
+            "replies": ""
+          }
+        }
+      ]
+    }
+  }
+}

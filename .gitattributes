@@ -1,0 +1,3 @@
+# Keep scripts, fixtures, JSON evidence, and documentation byte-stable across
+# platforms. Git still detects and preserves binary files through text=auto.
+* text=auto eol=lf

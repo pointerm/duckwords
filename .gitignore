@@ -1,0 +1,23 @@
+# Build and test outputs.
+/bin/
+/dist/
+/coverage.out
+*.test
+*.prof
+/duckwords.test
+/tmp/
+
+# Local review evidence and the separately attached canonical live-run bundle.
+/artifacts/review/
+/artifacts/submission/
+/artifacts/**/*.capture-lock/
+
+# Local configuration and secrets.
+.env*
+!.env.example
+
+# Tool and editor state.
+/.cache/
+/.idea/
+/.vscode/
+.DS_Store

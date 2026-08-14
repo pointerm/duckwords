@@ -1,0 +1,69 @@
+{
+  "json": {
+    "errors": [],
+    "data": {
+      "things": [
+        {
+          "kind": "t1",
+          "data": {
+            "id": "c4",
+            "name": "t1_c4",
+            "link_id": "t3_duck123",
+            "parent_id": "t3_duck123",
+            "body": "[removed]",
+            "replies": {
+              "kind": "Listing",
+              "data": {
+                "children": [
+                  {
+                    "kind": "t1",
+                    "data": {
+                      "id": "c7",
+                      "name": "t1_c7",
+                      "link_id": "t3_duck123",
+                      "parent_id": "t1_c4",
+                      "body": "Nested expansion.",
+                      "replies": null
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "id": "c5",
+            "name": "t1_c5",
+            "link_id": "t3_duck123",
+            "parent_id": "t3_duck123",
+            "body": "Feather wing.",
+            "replies": ""
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "id": "c3",
+            "name": "t1_c3",
+            "link_id": "t3_duck123",
+            "parent_id": "t1_c2",
+            "body": "This duplicate must not be visited.",
+            "replies": ""
+          }
+        },
+        {
+          "kind": "more",
+          "data": {
+			"id": "c8",
+			"name": "t1_c8",
+            "count": 1,
+            "parent_id": "t1_c5",
+            "children": ["c8"]
+          }
+        }
+      ]
+    }
+  }
+}

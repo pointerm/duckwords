@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+# Pull requests, including forks, need source read access only. Reddit approval and
+# credentials are deliberately absent from every ordinary CI job.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+  GOFIPS140: "off"
+  REDDIT_API_ACCESS_APPROVED: "false"
+
+jobs:
+  verify:
+    name: Verify Go 1.26.6
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify selected toolchain
+        run: test "$(go env GOVERSION)" = "go1.26.6"
+
+      - name: Validate automation definitions
+        run: |
+          bash -n scripts/capture-submission.sh
+          bash -n scripts/capture-submission_test.sh
+          bash -n scripts/package-release.sh
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+
+      - name: Run deterministic quality gates
+        run: make verify
+
+      - name: Run bounded fuzz smoke
+        run: make fuzz-smoke FUZZ_TIME=1s
+
+      - name: Require a clean generated-file diff
+        run: |
+          git diff --exit-code
+          test -z "$(git ls-files --others --exclude-standard)"
+
+  analysis:
+    name: Static, secret, and vulnerability analysis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Scan current tree and complete Git history for secrets
+        run: make secret-scan
+
+      - name: Run pinned Staticcheck
+        run: make lint STATICCHECK_VERSION=v0.7.0
+
+      # Pin the scanner independently of application dependencies. The scanner
+      # queries the public Go vulnerability database but never executes the CLI.
+      - name: Scan reachable Go code
+        run: make vuln GOVULNCHECK_VERSION=v1.6.0
+
+  container:
+    name: Build and smoke-test container
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go for native fixture parity
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify production image and native/container fixture parity
+        run: >-
+          make docker-verify
+          VERSION=ci
+          COMMIT=${GITHUB_SHA}
+          BUILD_DATE=unknown
+          DOCKER_IMAGE=duckwords:ci
+          DOCKER_FIXTURE_IMAGE=duckwords:fixture-ci
+          DOCKER_BUILD_FLAGS=--pull

@@ -1,0 +1,20 @@
+{
+  "json": {
+    "errors": [],
+    "data": {
+      "things": [
+        {
+          "kind": "t1",
+          "data": {
+            "id": "c8",
+            "name": "t1_c8",
+            "link_id": "t3_duck123",
+            "parent_id": "t1_c5",
+            "body": "",
+            "replies": ""
+          }
+        }
+      ]
+    }
+  }
+}
