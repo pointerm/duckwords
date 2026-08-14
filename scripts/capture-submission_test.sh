@@ -667,6 +667,17 @@ privileged_bash_preserves_exported_function_environment() {
   )
 }
 
+privileged_bash_preserves_invalid_environment_name() {
+  env 'CAPTURE.TEST.INVALID=fixture-invalid-name' /bin/bash -p -c '
+    while IFS= read -r environment_name; do
+      if [[ "${environment_name}" == "CAPTURE.TEST.INVALID" ]]; then
+        exit 0
+      fi
+    done < <(compgen -e)
+    exit 1
+  '
+}
+
 test_success() {
   setup_case success 0
   run_wrapper 0
@@ -719,18 +730,27 @@ test_exported_function_boundary() {
 
 test_invalid_environment_name() {
   setup_case invalid-environment-name 0
-  run_wrapper 2 false false true
-  assert_path_absent "${case_repo}/artifacts/submission" \
-    'invalid environment name publication'
-  assert_capture_lock_absent
-  assert_event_count 0 "go-env:${expected_go_version}" \
-    'invalid environment name toolchain suppression'
-  assert_event_count 0 "live:arguments-verified" \
-    'invalid environment name live suppression'
-  assert_contains "${case_state}/wrapper.stderr" \
-    'ambient environment contains an unsupported variable name' \
-    'invalid environment name diagnostic'
-  printf '%s\n' 'ok - ambient names that Bash cannot scrub are rejected before helpers'
+  if privileged_bash_preserves_invalid_environment_name; then
+    run_wrapper 2 false false true
+    assert_path_absent "${case_repo}/artifacts/submission" \
+      'invalid environment name publication'
+    assert_capture_lock_absent
+    assert_event_count 0 "go-env:${expected_go_version}" \
+      'invalid environment name toolchain suppression'
+    assert_event_count 0 "live:arguments-verified" \
+      'invalid environment name live suppression'
+    assert_contains "${case_state}/wrapper.stderr" \
+      'ambient environment contains an unsupported variable name' \
+      'invalid environment name diagnostic'
+  else
+    run_wrapper 0 false false true
+    assert_verified_preflight
+    assert_published_bundle 0
+    assert_contains "${case_state}/wrapper.stderr" \
+      'published one-run evidence at artifacts/submission (application exit 0)' \
+      'invalid environment safe-publication diagnostic'
+  fi
+  printf '%s\n' 'ok - privileged Bash strips or rejects invalid environment names'
 }
 
 test_unprivileged_bash_rejected() {
