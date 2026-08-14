@@ -637,7 +637,10 @@ func TestInspectBinaryRejectsBoundedOutputOverflow(t *testing.T) {
 }
 
 func TestInspectBinaryBoundsDescendantHeldPipes(t *testing.T) {
-	t.Parallel()
+	// Keep this process-heavy fixture serial. The package has many parallel tests
+	// that execute version helpers; under the race detector, process pressure can
+	// make this shell fail before it creates the descendant this test is meant to
+	// exercise.
 	if runtime.GOOS == "windows" {
 		t.Skip("test fixture requires a POSIX shell and process signals")
 	}
@@ -675,8 +678,12 @@ func TestInspectBinaryBoundsDescendantHeldPipes(t *testing.T) {
 	if !errors.Is(err, ErrInvalidBinary) {
 		t.Fatalf("inspectBinary() error = %v, want ErrInvalidBinary", err)
 	}
-	if elapsed >= binaryInspectionWindow {
+	maximumElapsed := binaryInspectionWindow + binaryInspectionDrain + time.Second
+	if elapsed >= maximumElapsed {
 		t.Fatalf("inspectBinary() waited %s for descendant-held pipes", elapsed)
+	}
+	if elapsed < binaryInspectionDrain/2 {
+		t.Fatalf("inspectBinary() returned in %s before the descendant-pipe drain window", elapsed)
 	}
 	pidBytes, readErr := os.ReadFile(pidPath)
 	if readErr != nil {
