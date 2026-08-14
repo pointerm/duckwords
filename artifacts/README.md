@@ -19,7 +19,8 @@ ignored intentionally and must never be committed to the candidate branch: addin
 the evidence would create a different commit from the SHA that the evidence proves.
 Preserve the directory byte for byte and identify it by the full candidate SHA in its
 manifest and in the submission portal or cover note. No live bundle is present until
-the final candidate metadata and documented capture prerequisites exist.
+the final candidate metadata and documented capture prerequisites exist and the
+cookie-free endpoint returns `200 application/json`.
 
 A hard termination may leave `submission.capture-lock/` with a safe PID and candidate
 SHA. The wrapper deliberately refuses to guess that it is stale; inspect running

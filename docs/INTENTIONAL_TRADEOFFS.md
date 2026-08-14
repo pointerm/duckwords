@@ -61,6 +61,12 @@ support OAuth, browser cookies, user-login flows, arbitrary Reddit
 endpoints, arbitrary remote input origins, posting, moderation actions, or streaming.
 Local input files remain available for deterministic and offline use.
 
+The cookie-free public-JSON choice follows the assignment owner's explicit direction
+and keeps the run reproducible and independent of a personal browser session. Current
+Reddit access policy may return `302` or `403` for that request profile, making a live
+capture impossible from some networks. DuckWords reports that limitation instead of
+replaying browser cookies or presenting synthetic output as live evidence.
+
 ## 8. Rich-text interpretation
 
 Comment bodies are tokenized as the raw text returned by Reddit. Markdown rendering,

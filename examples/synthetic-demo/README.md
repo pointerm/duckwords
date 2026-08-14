@@ -6,7 +6,8 @@ presented as the full application log or result requested by the assignment.
 
 The fixture makes no network request, downloads no Reddit user data, does not use
 real credentials, and does not prove current public Reddit JSON compatibility. It
-exists to make the implemented process-level behavior reviewable before a live run.
+exists to make the implemented process-level behavior reviewable before a successful
+full assignment capture.
 
 ## Checked-in results
 

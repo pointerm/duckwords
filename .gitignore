@@ -6,6 +6,8 @@
 *.prof
 /duckwords.test
 /tmp/
+/application.log
+/result.json
 
 # Local review evidence and the separately attached canonical live-run bundle.
 /artifacts/review/

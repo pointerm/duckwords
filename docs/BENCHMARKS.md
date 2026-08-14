@@ -5,15 +5,15 @@ No Reddit request, credential, or assignment dataset is involved.
 
 ## Does this path matter?
 
-**For the measured sizes, no — and that is the useful conclusion.** A DuckWords run is
-normally bound by Reddit request pacing rather than word counting. At the default 0.8
-requests/second the 200-post list needs at least 250 seconds of network time before a
-single expansion, while the table below puts even a hypothetical 500 MB corpus at
-only a few seconds of text-processing time.
+**For the measured sizes, no — and that is the useful conclusion.** When the endpoint
+is accessible, a DuckWords run is bound by Reddit request pacing rather than word
+counting. At the default 0.8 requests/second the 200-post list needs at least 250
+seconds of network time before a single expansion, while the table below puts even a
+hypothetical 500 MB corpus at only a few seconds of text-processing time.
 
 Extrapolating the measurement below, **the comment corpus would have to reach roughly
 37 GB before the text path merely equalled that 250-second network floor.** No claim
-about the assignment corpus size is made until the live run records it.
+about the assignment corpus size is made until a successful full live run records it.
 
 This file exists to make that ratio explicit and to record what the counting path
 actually costs, so a future change to it can be compared against a known number. It is
@@ -88,8 +88,9 @@ lowercased runes into a `[]byte` scratch with `utf8.AppendRune`, then look up
 semantics would be unchanged.
 
 It has not been done because bodies containing only ASCII already take the fast path,
-while the live corpus's non-ASCII share is still unknown. It is an accepted,
-unoptimized branch whose impact is bracketed below, not a correctness constraint.
+while a successfully retrieved live corpus's non-ASCII share is still unknown. It is
+an accepted, unoptimized branch whose impact is bracketed below, not a correctness
+constraint.
 
 ## Scaling to real volumes
 
@@ -112,8 +113,8 @@ Blending the two measured throughputs by the share of bytes in non-ASCII bodies:
 
 Against the 250-second network floor for 200 posts, a hypothetical 50 MB corpus at a
 25% non-ASCII mix spends **0.135% of the run counting words**. The final ratio cannot
-be stated until a live run measures the real corpus, but the 5/50/500 MB table makes
-the cost transparent without assuming its size.
+be stated until a successful full live run measures the real corpus, but the
+5/50/500 MB table makes the cost transparent without assuming its size.
 
 Memory does not scale with corpus size. Each worker's post-local map is bounded by
 `MaxDistinctWordsPerPost` (50,000) and by the dictionary size, whichever is smaller, so
@@ -132,5 +133,6 @@ short-lived allocations, which is GC pressure rather than retained memory.
 - The 250-second network floor assumes one request per post at the default rate. A real
   run issues more: every unresolved `more` child and every depth-truncated branch adds
   a focal request, which widens the gap rather than narrowing it.
-- The non-ASCII share of a real r/duck corpus has not been measured, because no live run
-  has been made. The table brackets the plausible range instead of asserting a value.
+- The non-ASCII share of a real r/duck corpus has not been measured, because no
+  successful full live run has been made. The table brackets the plausible range
+  instead of asserting a value.

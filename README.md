@@ -60,12 +60,28 @@ cat examples/synthetic-demo/synthetic-output.json
 The checked-in [synthetic demo](examples/synthetic-demo) is explicitly non-live and
 is not a substitute for the assignment's 200-post application log.
 
-### 2. Run it for real
+### 2. Attempt the live assignment run
 
-The assignment owner confirmed that these supplied public `old.reddit.com` pages
-should be fetched without the official OAuth Data API. DuckWords therefore issues
-only unauthenticated `GET` requests to fixed `https://old.reddit.com` JSON URLs; it
-does not need an app registration, client ID, secret, token, cookie, or approval flag.
+The assignment owner directed this submission to use cookie-free `GET` requests to
+the fixed `https://old.reddit.com/.../.json` renderer rather than the OAuth Data API.
+DuckWords retains that narrow assignment-specific contract; this is not a claim that
+anonymous JSON access is currently supported or available from every network.
+
+On 2026-08-14 the candidate's cookie-free CLI received HTTP `302` redirects to
+`/login` or HTTP `403` HTML responses for the supplied URLs. An existing browser
+profile returned `200 application/json` only while sending Reddit session state, so
+that did not demonstrate anonymous access. DuckWords deliberately does not accept or
+replay browser cookies, login credentials, or tokens.
+
+Reddit's current [Data API Wiki](https://support.reddithelp.com/hc/en-us/articles/16160319875092-Reddit-Data-API-Wiki)
+states that traffic without OAuth or login credentials will be blocked. Reddit has
+also [announced the shutdown of unauthenticated `.json` endpoints](https://www.reddit.com/r/modnews/comments/1tq9vxo/protecting_communities_from_scrapers_and_platform/).
+The assignment owner was informed of the observed behavior and asked the candidate
+to choose and explain the implementation approach independently.
+
+DuckWords rejects redirects, non-`200` responses, and non-JSON bodies. No complete
+200-post live result is claimed unless the guarded capture exits `0`; offline and
+synthetic output must never be presented as live assignment evidence.
 
 ```bash
 go run ./cmd/duckwords > result.json 2> application.log
@@ -80,15 +96,17 @@ export REDDIT_USER_AGENT='duckwords/0.2.0 (+https://github.com/pointerm/duckword
 
 This `.json` renderer is the assignment's public-page access contract, not a claim
 that anonymous access is part of Reddit's current supported OAuth Data API. Reddit
-may redirect hosted/cloud IP ranges to a login page. DuckWords rejects every redirect
-and non-JSON response rather than following it or silently returning incomplete data;
-run the opt-in smoke from the same local network intended for the final capture.
+may return a login redirect or HTML denial based on current access policy, session
+state, IP range, or network. DuckWords rejects every redirect and non-JSON response
+rather than following it or silently returning incomplete data; run the opt-in smoke
+from the same local network intended for the final capture.
 
-With no options it processes the assignment inputs using the documented defaults.
-At 0.8 requests/second the 200 initial listings alone take about 4 minutes 10 seconds.
-Every unresolved `more` child, continuation, and retry adds another paced request, so
-the actual duration depends on the live trees and is bounded by the 30-minute default
-(the guarded canonical capture deliberately allows up to 2 hours).
+With no options it attempts to process the assignment inputs using the documented
+defaults. At 0.8 requests/second the 200 initial listings alone take about 4 minutes
+10 seconds after access succeeds. Every unresolved `more` child, continuation, and
+retry adds another paced request, so the actual duration depends on the live trees and
+is bounded by the 30-minute default (the guarded canonical capture deliberately
+allows up to 2 hours).
 
 ```bash
 # Only words starting with "duck".
@@ -108,8 +126,9 @@ make reddit-smoke LIVE_REDDIT_SMOKE=true LIVE_POSTS_FILE=/tmp/duckwords-one-post
 
 The smoke is deliberately opt-in and never runs in CI. It uses one worker, 0.5
 requests/second, strict completeness, and writes only ignored output under
-`artifacts/review/reddit-smoke/`. A `302` login redirect or `403` is reported as an
-access failure; do not work around it with a proxy or hidden endpoint override.
+`artifacts/review/reddit-smoke/`. If it returns `302` or `403`, stop: do not attempt
+the canonical capture and do not work around the restriction with browser
+credentials, a proxy, or a hidden endpoint override.
 
 For the final candidate, build from a clean commit and run the guarded one-shot
 capture with the same metadata values in both commands:
